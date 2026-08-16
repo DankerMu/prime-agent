@@ -89,6 +89,7 @@ Prime Agent is built for long-running work, especially for evaluations in resear
 
 ## Documentation
 
+- [Interactive source learning site](learning-site/index.html) — explore Prime Agent architecture, runtime flows, Harness, skills, and guided source-reading paths
 - [Quickstart](packages/coding-agent/docs/quickstart.md) — install, authenticate, and run a first session
 - [Usage and CLI reference](packages/coding-agent/docs/usage.md) — commands, sessions, autonomous limits, and output modes
 - [Long-running and background agents](packages/coding-agent/docs/long-running-agents.md) — detach and reattach, goals, heartbeats, and schedules

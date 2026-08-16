@@ -17,6 +17,8 @@ packages/*/dist-firefox/
 .zed/
 .idea/
 .claude/
+.agents/
+.codex/
 *.swp
 *.swo
 *~
@@ -40,6 +42,8 @@ plans/
 collect.sh
 .kernel-venv/
 .worktrees/
+/learning-site/
+/packages/coding-agent/docs/continual-harness-roadmap.md
 
 __pycache__/
 *.pyc
