@@ -120,6 +120,17 @@ export class DialogArbiter {
 		this.queue = [];
 	}
 
+	isBusy(): boolean {
+		return (
+			this.disposed ||
+			this.settling ||
+			this.current !== undefined ||
+			this.queue.length > 0 ||
+			this.handoffScheduled ||
+			this.surfaceCleared
+		);
+	}
+
 	private createEntry<T>(request: DialogRequest<T>): RequestEntry {
 		let resolve!: (value: unknown) => void;
 		let reject!: (error: unknown) => void;

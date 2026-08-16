@@ -3965,8 +3965,6 @@ export class InteractiveMode {
 		const currentEditor = this.editor;
 		const currentPromptStash = this.snapshotPromptStashFrom(currentEditor, currentEditor.getText());
 
-		this.editorContainer.clear();
-
 		if (factory) {
 			// Create the custom editor with tui, theme, and keybindings
 			const newEditor = factory(this.ui, getEditorTheme(), this.keybindings);
@@ -4049,6 +4047,10 @@ export class InteractiveMode {
 		}
 		this.latestEditorPromptStash = currentPromptStash;
 
+		// The dialog owns the editor surface while it is busy; leave it mounted.
+		if (this.dialogArbiter.isBusy()) return;
+
+		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor as Component);
 		this.ui.setFocus(this.editor as Component);
 		this.ui.requestRender();
