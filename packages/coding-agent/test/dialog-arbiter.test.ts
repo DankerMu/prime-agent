@@ -868,6 +868,91 @@ describe("DialogArbiter", () => {
 		expect(events.slice(-3)).toEqual(["replace:editor", "focus:editor", "render"]);
 		expect(events).not.toContain("focus:editor2");
 	});
+
+	it("reports not busy for a fresh, usable arbiter", () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+
+		expect(arbiter.isBusy()).toBe(false);
+	});
+
+	it("reports busy while an initial request constructs asynchronously and while it is mounted", async () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const initial = asyncRequest("app", "a");
+		const h = arbiter.present(initial.request);
+
+		expect(arbiter.isBusy()).toBe(true);
+
+		initial.resolve({ component: initial.component, focus: initial.component });
+		expect(arbiter.isBusy()).toBe(true);
+		await flush();
+		expect(arbiter.isBusy()).toBe(true);
+
+		h.settle("done");
+		expect(await h.result).toBe("done");
+	});
+
+	it("stays busy between a visible settlement and the microtask handoff", async () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const a = syncRequest("app", "a");
+		const ha = arbiter.present(a.request);
+
+		ha.settle("a");
+		expect(arbiter.isBusy()).toBe(true);
+
+		await flush();
+		expect(arbiter.isBusy()).toBe(false);
+	});
+
+	it("stays busy inside the reentrant host restoration callback until it completes", async () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const a = syncRequest("app", "a");
+		const ha = arbiter.present(a.request);
+		let busyDuringRestore: boolean | undefined;
+		const originalReplace = host.replaceEditorSurface;
+		host.replaceEditorSurface = (component?: Component) => {
+			busyDuringRestore = arbiter.isBusy();
+			originalReplace(component);
+		};
+
+		ha.settle("a");
+		await flush();
+
+		expect(busyDuringRestore).toBe(true);
+		expect(arbiter.isBusy()).toBe(false);
+	});
+
+	it("reports busy while a queued request owns the arbiter and idle again after final restoration", async () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const a = syncRequest("app", "a");
+		const b = syncRequest("app", "b");
+		const ha = arbiter.present(a.request);
+		const hb = arbiter.present(b.request);
+
+		expect(arbiter.isBusy()).toBe(true);
+
+		ha.settle("a");
+		await flush();
+		expect(arbiter.isBusy()).toBe(true);
+
+		hb.settle("b");
+		await flush();
+		expect(arbiter.isBusy()).toBe(false);
+		expect(await ha.result).toBe("a");
+		expect(await hb.result).toBe("b");
+	});
+
+	it("reports busy forever once disposed", () => {
+		const { host } = createHost();
+		const arbiter = new DialogArbiter(host);
+		arbiter.disposeAll();
+
+		expect(arbiter.isBusy()).toBe(true);
+	});
 });
 
 describe("InteractiveMode.stop ordering harness", () => {

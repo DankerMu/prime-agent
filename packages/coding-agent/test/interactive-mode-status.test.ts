@@ -787,6 +787,7 @@ describe("InteractiveMode submit handling", () => {
 				keybindings: {},
 				autocompleteProvider: undefined,
 				showStatus: vi.fn(),
+				dialogArbiter: { isBusy: () => false },
 			});
 			Object.defineProperty(fakeThis, "promptStash", {
 				configurable: true,

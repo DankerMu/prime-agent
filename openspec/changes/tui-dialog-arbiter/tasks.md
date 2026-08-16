@@ -69,10 +69,11 @@ Minimal mergeable slice: atomic - 新文件 + 实例化与 dispose 挂线 + `tes
 
 ## 2. `setCustomEditorComponent` 对话框感知
 
-- [ ] 2.1 在 `DialogArbiter` 暴露与内部状态一致的只读 busy 查询（不暴露队列），并改写 `setCustomEditorComponent`：arbiter 空闲时保持现有 `clear()+addChild()+setFocus()`；arbiter 忙时只更新 `this.editor`/`editorComponentFactory`/prompt stash，不触碰容器、不抢焦点（新编辑器由结算时的动态恢复目标装上）
-- [ ] 2.2 行为测试：busy 查询覆盖 queued/constructing/visible/交接/disposed 与 idle；对话框展示期间调用 `setEditorComponent(factory)` 与 `(undefined)`，断言容器 children 仍是对话框组件、焦点仍在对话框、其 `done` 仍可结算，结算后容器为替换后的编辑器；队列为空时替换立即生效（现有行为回归）
+- [x] 2.1 在 `DialogArbiter` 暴露与内部状态一致的只读 busy 查询（不暴露队列），并改写 `setCustomEditorComponent`：arbiter 空闲时保持现有 `clear()+addChild()+setFocus()`；arbiter 忙时只更新 `this.editor`/`editorComponentFactory`/prompt stash，不触碰容器、不抢焦点（新编辑器由结算时的动态恢复目标装上）
+- [x] 2.2 行为测试：busy 查询覆盖 queued/constructing/visible/交接/disposed 与 idle；对话框展示期间调用 `setEditorComponent(factory)` 与 `(undefined)`，断言容器 children 仍是对话框组件、焦点仍在对话框、其 `done` 仍可结算，结算后容器为替换后的编辑器；队列为空时替换立即生效（现有行为回归）；调用开始时 arbiter 空闲、但 extension factory 同步重入 `present()` 并挂载对话框时，busy 判断必须发生在 factory/editor/stash 更新之后，断言该对话框不被随后容器写入抹掉，结算后恢复 factory 创建的新编辑器。固定 seam 为 `test/dialog-arbiter.test.ts` 与 `test/interactive-mode-custom-editor.test.ts`；从 `packages/coding-agent` 运行 `npx tsx ../../node_modules/vitest/dist/cli.js --run test/dialog-arbiter.test.ts test/interactive-mode-custom-editor.test.ts`，期望退出 0 且所有状态、容器与焦点断言通过。
 
 Suggested fixture level: compact - 修复一条活跃的互踩路径（extension 可经 `setEditorComponent` API 随时触发），需专门场景验证
+Effective fixture level: expanded - `editorContainer` 与 focus 所有权命中项目 profile 的 domain expanded trigger；busy 查询还覆盖 constructing、handoff 与永久 disposed 状态，不能按单一同步条件分支降级。Selected risk packs: concurrency/shared state/ordering、legacy compatibility、TUI focus/render lifecycle；error/rollback 由任务 1 已交付的 settle/cleanup 状态机证据继承，本任务不新增错误通道。
 Minimal mergeable slice: atomic - 单函数条件化改写 + 配套测试；arbiter 尚无调用点时忙分支不可达，合并保绿
 
 ## 3. 迁移 extension select（含 confirm）
