@@ -1,0 +1,1 @@
+{"date":"2026-08-16","change":"tui-dialog-arbiter","grill_gate":"passed:branches=7,open=0","rounds":1,"gate_net_catch":0,"p0":{"in":1,"resolved":1,"residual":0},"p1":{"resolved":6},"regressions":0,"approx_subagent_calls":7,"verdict":"clean"}
