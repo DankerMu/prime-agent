@@ -762,6 +762,48 @@ describe("DialogArbiter", () => {
 		expect(await ha.result).toBe("cancel-a");
 	});
 
+	it("a reentrant present from onEvict during a pre-aborted settlement is enqueued and drained by a handoff", async () => {
+		const { host, events } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const controller = new AbortController();
+		controller.abort();
+		const b = syncRequest("app", "b");
+		const c = syncRequest("app", "c");
+		let hb: { settle: (value: unknown) => void; result: Promise<unknown> };
+		const a: TestDialogRequest<unknown> = {
+			show: () => ({ component: makeComponent("a").component, focus: makeComponent("f").component }),
+			kind: "app",
+			signal: controller.signal,
+			onEvict: () => {
+				hb = arbiter.present(b.request);
+			},
+		};
+		const ha = arbiter.present(a);
+
+		// Pre-aborted A settles immediately; B is enqueued, never shown recursively.
+		expect(b.show).not.toHaveBeenCalled();
+		expect(events).toEqual([]);
+
+		const hc = arbiter.present(c.request);
+		expect(c.show).not.toHaveBeenCalled();
+
+		await flush();
+		expect(b.show).toHaveBeenCalledTimes(1);
+		expect(events).toEqual(["replace:b", "focus:b", "render"]);
+		await expect(ha.result).rejects.toMatchObject({ name: "AbortError" });
+
+		hb!.settle("b");
+		await flush();
+		expect(c.show).toHaveBeenCalledTimes(1);
+		expect(await hb!.result).toBe("b");
+
+		hc.settle("c");
+		await flush();
+		expect(await hc.result).toBe("c");
+		expect(events).toContain("replace:editor");
+		expect(events).toContain("focus:editor");
+	});
+
 	it("keeps the surface empty and focus null while a queued successor constructs asynchronously", async () => {
 		const { host, events } = createHost();
 		const arbiter = new DialogArbiter(host);

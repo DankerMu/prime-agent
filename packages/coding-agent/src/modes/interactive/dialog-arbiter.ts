@@ -161,6 +161,11 @@ export class DialogArbiter {
 				const index = this.queue.indexOf(entry);
 				if (index !== -1) this.queue.splice(index, 1);
 				this.callOnEvict(entry);
+				// A reentrant present from the cleanup hook queued a request while
+				// the arbiter is idle; without a handoff it would stall forever.
+				if (!this.disposed && this.current === undefined && this.queue.length > 0 && !this.handoffScheduled) {
+					this.scheduleHandoff();
+				}
 			}
 		} finally {
 			this.settling = false;
