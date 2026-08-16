@@ -73,3 +73,7 @@ Public releases are currently installed from versioned release artifacts. The in
 - [Daemon Architecture](daemon.md) - supervisor, catalog, worker, lifecycle, and recovery details.
 - [Agent Connection Architecture](agent-connection.md) - client/runtime connection boundary.
 - [RLM Runtime Architecture](rlm-runtime.md) - ZeroMQ kernel transport and recursive subagent execution.
+- [Advisor Architecture](advisor-architecture.md) - read-only reviewer subruntime, severity routing, and bounded correction loops.
+- [Prompt Settlement Architecture](prompt-settlement.md) - session-level `PromptSettlementTracker` and structured `PromptOutcome` across all entry modes.
+- [ask_user Capability](ask-user.md) - universal user-question tool with live responders and persistent fallback queues.
+- [Continual Harness Ecosystem Roadmap](continual-harness-roadmap.md) - proposed project scope, managed-skill lifecycle, retrieval memory, typed subagents, and validation roadmap.
