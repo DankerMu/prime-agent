@@ -225,6 +225,7 @@ import {
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { DialogArbiter } from "./dialog-arbiter.js";
 import { FeatureHintDeck } from "./feature-hints.js";
 import { scopeHeartbeatsToSession } from "./heartbeat-scope.js";
 import {
@@ -861,6 +862,7 @@ export class InteractiveMode {
 	private footerSlot: Container;
 	private fullscreenEnabled = false;
 	private editorContainer: Container;
+	private readonly dialogArbiter: DialogArbiter;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
@@ -1121,6 +1123,17 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.statusContainer);
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
+		this.dialogArbiter = new DialogArbiter({
+			replaceEditorSurface: (component) => {
+				this.editorContainer.clear();
+				if (component) {
+					this.editorContainer.addChild(component);
+				}
+			},
+			setFocus: (component) => this.ui.setFocus(component),
+			requestRender: () => this.ui.requestRender(),
+			getCurrentEditor: () => this.editor,
+		});
 		this.subagentSummaryLine = new SubagentSummaryLine(
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
@@ -10013,6 +10026,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
+		this.dialogArbiter.disposeAll();
 		if (this.isInitialized) {
 			this.ui.stop({
 				preserveAltScreen: options.preserveAltScreen,
