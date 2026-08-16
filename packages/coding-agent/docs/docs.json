@@ -163,6 +163,22 @@
         {
           "title": "RLM Runtime Architecture",
           "path": "rlm-runtime.md"
+        },
+        {
+          "title": "Advisor Architecture",
+          "path": "advisor-architecture.md"
+        },
+        {
+          "title": "Prompt Settlement Architecture",
+          "path": "prompt-settlement.md"
+        },
+        {
+          "title": "ask_user Capability",
+          "path": "ask-user.md"
+        },
+        {
+          "title": "Continual Harness Ecosystem Roadmap",
+          "path": "continual-harness-roadmap.md"
         }
       ]
     }
