@@ -23,7 +23,7 @@
 
 ### Requirement: Settle-once 结算
 
-每个对话框请求 MUST 恰好结算一次；结算路径为回答、取消、abort、组件构造失败、展示前外部结算、强制关闭（`cancelKind`）或 session dispose（`disposeAll`）之一，后到的重复结算 MUST 为 no-op（不 throw、不二次 resolve）。
+每个对话框请求 MUST 恰好结算一次；结算路径为回答、取消、abort、组件构造失败、展示前外部结算、强制关闭（`cancelKind`）或 session dispose（`disposeAll`）之一，后到的重复结算 MUST 为 no-op（不 throw、不二次 resolve/reject）。signal abort MUST 以名称为 `AbortError` 的错误 reject；`cancelKind`/`disposeAll` MUST 使用请求级 cancel result factory 保持调用方取消值，未提供 factory 时 reject `AbortError`；cancel factory throw MUST 仅以原始 error reject 该请求并继续处理其他项。result MUST 保持原生 Promise 的 await/reject 语义，并被内部观察，未 await 的 fire-and-forget 请求不得产生 unhandled rejection。
 
 #### Scenario: 回答与 abort 竞争
 
@@ -50,15 +50,25 @@
 - WHEN 出队请求的 `show` Promise 尚未 resolve 时该请求已被 abort 或 dispose 结算，随后 Promise resolve 出组件
 - THEN 该组件不进入容器并被调用其 `dispose?.()`，不产生第二次结算，队列状态不受影响
 
-#### Scenario: session dispose 清空队列
+#### Scenario: session dispose 清空队列并进入终态
 
-- WHEN 存在一个展示中对话框与两个排队请求时执行 `disposeAll()`
-- THEN 展示中对话框按取消语义结算一次，两个排队请求各自以 evict 语义结算一次且从未展示，容器不再被 arbiter 触碰；重复 `disposeAll()` 与空队列 dispose 为幂等 no-op
+- WHEN 存在一个展示中对话框与两个排队请求时执行 `disposeAll()`，随后又调用 `present`
+- THEN 展示中对话框按自身 cancel 值结算一次并 dispose 组件，两个排队请求各按自身 cancel 值结算一次并各调用 `onEvict` 一次且从未展示；后续 `present` 立即按 cancel 语义结算且不入队、不触碰容器；重复 `disposeAll()` 与空队列 dispose 为幂等 no-op
 
-#### Scenario: dispose 先于 UI 停止
+#### Scenario: dispose 同步清理先于 UI 停止
 
 - WHEN session 拆卸路径（`stop()`）执行
-- THEN `disposeAll()` 在 `ui.stop()` 之前完成，所有结算回调作用在仍然存活的渲染器与容器上
+- THEN `disposeAll()` 在 `ui.stop()` 之前同步完成请求终态标记、abort listener 移除、`onEvict` 或组件 dispose，且此后 arbiter 不再调用 UI；原生 Promise reaction 保持 JavaScript 微任务语义，不要求同步执行
+
+#### Scenario: 展示组件与未展示资源按所有权清理
+
+- WHEN 一个已展示请求结算，另一个 queued 请求被移除，第三个异步 constructing 请求被移除后组件才迟到 resolve
+- THEN 已展示组件 `dispose?.()` 恰好一次且不调用 `onEvict`；queued 请求只调用 `onEvict` 一次；constructing 请求在移除时调用 `onEvict` 一次并在迟到组件到达后额外 dispose 该组件一次；任一清理钩子抛错都不改变请求结果或阻断队列推进
+
+#### Scenario: fire-and-forget rejection 被观察
+
+- WHEN 未 await result 的 app/placeholder 请求因构造失败、abort 或缺省 cancel 语义而 reject
+- THEN 进程不产生 unhandled rejection；调用方若 await 同一 result 仍观察到原始 rejection
 
 ### Requirement: 强制关闭（extension UI reset）
 
@@ -95,7 +105,7 @@
 
 #### Scenario: evict 时调用点清理恰好一次
 
-- WHEN 携带 `onEvict` 的请求在未展示状态下被移除（abort、settle、dispose 任一路径）
+- WHEN 携带 `onEvict` 的请求在未展示状态下被移除（abort、settle、cancelKind、dispose 任一路径）
 - THEN 其 `onEvict` 被调用恰好一次（调用点得以清理临时文件、事件监听等资源），且与结算合计各恰好发生一次
 
 ### Requirement: 焦点与编辑器恢复
@@ -107,10 +117,10 @@
 - WHEN 对话框 A 展示期间 `setCustomEditorComponent` 将默认编辑器替换为自定义编辑器
 - THEN A 结算后容器恢复为自定义编辑器且其获得焦点，旧默认编辑器不被塞回容器
 
-#### Scenario: 连续结算的焦点交接
+#### Scenario: 初始异步构造与连续结算的焦点交接
 
-- WHEN 队列 [A, B] 中 A 结算且 B 立即展示
-- THEN 焦点直接交给 B 的 focus 目标；B 结算后焦点回到当前编辑器
+- WHEN 初始异步请求 I 从空闲 editor 开始 constructing，或队列 [A, B] 中可见 A 结算而 B 同步 ready/仍在异步 constructing
+- THEN I ready 前 editor 保持挂载与焦点；A 结算时立即从 surface 移除并 dispose，B 同步 ready 时焦点直接交给 B，异步 constructing 时 surface 暂为空且焦点为 null，B ready 后再获得焦点；A/B 交接不短暂聚焦 editor，B 结算后焦点才回到当前编辑器
 
 #### Scenario: 文本快照只回写同一编辑器实例
 
@@ -147,7 +157,7 @@ extension `select`/`input`/`editor`（`confirm` 由 `select` 组合实现，随 
 
 ### Requirement: 单对话框行为保持不变
 
-迁移 MUST NOT 改变各对话框既有的单实例语义：abort 返回值形态、extension UI 的返回值契约与文本保存/恢复保持迁移前行为；仅 timeout 起算点与 reload 失败分支恢复目标两处按 proposal 声明收敛。
+迁移 MUST NOT 改变各对话框既有的单实例语义：abort 返回值形态、extension UI 的返回值契约与文本保存/恢复保持迁移前行为；仅 proposal 明确列出的四处行为按新契约收敛：timeout 自展示起算、reload 失败恢复动态当前编辑器、迟到异步组件 dispose、自定义 UI 文本快照取自展示时刻。
 
 #### Scenario: abort 返回值映射保持
 
@@ -161,7 +171,7 @@ extension `select`/`input`/`editor`（`confirm` 由 `select` 组合实现，随 
 
 ### Requirement: 队列排除项与编辑器替换感知
 
-overlay 通知、footer 状态展示 MUST NOT 进入对话框队列，也 MUST NOT 被队列阻塞。`setCustomEditorComponent` MUST NOT 进入队列，且 MUST 对话框感知：arbiter 忙时只更新编辑器引用与 prompt stash、不触碰容器、不抢焦点；arbiter 空闲时保持现有立即替换行为。
+overlay 通知、footer 状态展示 MUST NOT 进入对话框队列，也 MUST NOT 被队列阻塞。`setCustomEditorComponent` MUST NOT 进入队列，且 MUST 对话框感知：arbiter 忙时（queued、异步 constructing、visible、待微任务交接或永久 disposed）只更新编辑器引用与 prompt stash、不触碰容器、不抢焦点；arbiter 空闲时保持现有立即替换行为。busy 的只读查询 seam MUST 与 `setCustomEditorComponent` 的首个生产消费者在同一迁移任务引入，不在裸核心 PR 暴露零消费者 API。
 
 #### Scenario: overlay 不受阻塞
 

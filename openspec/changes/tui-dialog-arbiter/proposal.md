@@ -12,10 +12,10 @@
 - 迁移全部既有对话框调用点到 arbiter（7 类）：extension `select`/`input`/`editor`（`confirm` 由 `select` 组合实现、随其覆盖）、extension 自定义非 overlay UI、`showSelector` 系应用选择器、hot-reload box、gist export loader。迁移后 `interactive-mode.ts` 中不再存在绕过 arbiter 的对话框级 `editorContainer.clear()`/`addChild()` 路径。
 - `resetExtensionUI` 强制关闭路径改经 arbiter 的 `cancelKind("extension")`：只结算 extension 类对话框（修复该路径现状不 resolve 的 Promise 泄漏），非 extension 项保留在队列。
 - `setCustomEditorComponent` 改为对话框感知：不进入队列，但 arbiter 忙时只更新编辑器引用与 prompt stash、不再清空展示中的对话框；空闲时保持现有立即替换行为。
-- 既有单对话框行为保持不变：abort 返回值语义、extension UI 返回值契约与文本保存/恢复与迁移前一致（仅并发时序从"互踩"变为"排队"）。**四处已声明的行为收敛**：(1) per-dialog timeout 从"请求时刻起算"统一为"展示时刻起算，排队期间不计时"；(2) reload 失败分支的恢复目标从捕获的 `previousEditor` 收敛为结算时刻的当前编辑器；(3) 迟到的异步构造组件从"只丢弃不清理"收敛为丢弃并 `dispose?.()`（修组件泄漏）；(4) 自定义 UI 文本快照从请求时刻收敛为展示时刻（仅排队时可观测）。
+- 既有单对话框行为保持不变：abort 返回值语义、extension UI 返回值契约与文本保存/恢复与迁移前一致（仅并发时序从"互踩"变为"排队"）。**四处已声明的行为收敛**：(1) per-dialog timeout 从"请求时刻起算"统一为"展示时刻起算，排队期间不计时"；(2) reload 失败分支的恢复目标从捕获的 `previousEditor` 收敛为结算时刻的当前编辑器；(3) 迟到的异步构造组件从"只丢弃不清理"收敛为丢弃并 `dispose?.()`（修组件泄漏）；(4) 自定义 UI 文本快照从请求时刻收敛为展示时刻（仅排队时可观测）。请求通过自身的 cancel result factory 保持原有取消返回值；未提供 factory 的泛型请求以 `AbortError` reject。
 - 明确排除：overlay 通知与 footer 不进入队列、不被队列阻塞。
 
-无 BREAKING 变化：单对话框场景除上述两处声明的收敛外行为完全不变；并发场景由未定义行为（互踩丢 Promise）变为定义行为（FIFO）。
+无 BREAKING 变化：单对话框场景除上述四处明确声明的行为收敛外保持原有契约；并发场景由未定义行为（互踩丢 Promise）变为定义行为（FIFO）。
 
 ## Capabilities
 
@@ -29,7 +29,7 @@
 
 ## Impact
 
-- `packages/coding-agent/src/modes/interactive/interactive-mode.ts`：7 类对话框调用点迁移（行 3797/3809、3872/3884、3911/3922、4060/4107、7454-7460、8793/8800、8969/8976；8 类占用者中除 `setCustomEditorComponent` 外全部），外加两条非对话框容器写入路径的 arbiter 感知改造——`setCustomEditorComponent`（3933-4027，条件化容器写入）与 `resetExtensionUI`（3521-3541，改经 `cancelKind`，三处调用方 1068/5090/8780 语义保持）。
+- `packages/coding-agent/src/modes/interactive/interactive-mode.ts`：迁移 7 类对话框调用点（`showExtensionSelector`、`showExtensionInput`、`showExtensionEditor`、`showExtensionCustom` 的非 overlay 分支、`showSelector`、`handleReloadCommand` 的 reload box、`handleShareCommand` 的 gist loader），外加两条非对话框容器写入路径的 arbiter 感知改造——`setCustomEditorComponent` 条件化容器写入，以及 `resetExtensionUI` 改经 `cancelKind`；以符号为定位基线，不依赖易漂移的源码行号。
 - 新文件 `packages/coding-agent/src/modes/interactive/dialog-arbiter.ts`（或等价位置）。
 - 无 wire/协议/持久化变化；无配置变化；纯 TUI 进程内重构。
 - 下游依赖方：`ask-user.md` 切片 2 的 ask 对话框与 pending 重开请求将复用本 arbiter（本 change 不实现 ask）。
