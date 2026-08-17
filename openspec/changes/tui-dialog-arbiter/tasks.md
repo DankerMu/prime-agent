@@ -88,10 +88,12 @@ Minimal mergeable slice: atomic - 单调用点替换 + 其行为基线测试，�
 
 ## 4. 迁移 extension input
 
-- [ ] 4.1 将 `showExtensionInput`/`hideExtensionInput` 改写为 `arbiter.present`（kind: extension，`cancel: () => undefined`），沿用任务 3 的 signal/timeout/映射模式；`resetExtensionUI` 中对应 input hide 路径改为 `cancelKind` 覆盖
+- [x] 4.1 将 `showExtensionInput`/`hideExtensionInput` 改写为一次 `arbiter.present`（kind: extension，`cancel: () => undefined`）：signal 交给 arbiter，调用点只将实际 signal `AbortError` 映射为 `undefined`，其他构造/运行错误原样 reject；`ExtensionInputComponent` 在 `show` 内构造并逐字接收 title、placeholder 与 `{ tui, timeout }`，mounted ownership 归 arbiter；移除 `extensionInput` 字段与旧 hide 方法。`resetExtensionUI` 已无条件调用 `cancelKind("extension")`，删除 input legacy hide 分支，尚未迁移的 editor 仍保留。
+- [x] 4.2 caller-level 兼容证据：经真实 `createExtensionUIContext().input` 和宿主同一个 arbiter，在 app-kind blocker 后排队一个带 distinctive title/placeholder/timeout 的 input，断言 blocker 期间 input/CountdownTimer 不构造、不改容器/焦点，释放后展示；以真实组件 render 标题、共享 TUI 触发的 timer/render 和完整 timeout tick 证明 title/TUI/timeout 逐字透传，超时 resolve `undefined`、dispose 恰好一次并恢复 editor/focus；placeholder 在现有组件中是无可观察行为的 `_placeholder` 参数，因此以生产 callsite 的位置参数 wiring 审计证明，不为测试新增产品状态。另以独立 submit 场景输入文本并断言返回原字符串；覆盖 pre-aborted signal -> `undefined` 且无 component/timer/UI/queue residue、visible signal abort -> `undefined`、real reset 同时结算 visible+queued input 且 queued 从未构造；用窄 `present` rejection 注入普通 error 与无实际 signal abort 的同名 `AbortError`，断言均保持原始 rejection。固定 seam 为 `packages/coding-agent/test/interactive-mode-extension-input.test.ts`；从 `packages/coding-agent` 运行 `npx tsx ../../node_modules/vitest/dist/cli.js --run test/interactive-mode-extension-input.test.ts test/dialog-arbiter.test.ts`，期望退出 0 且全部值、timer/FIFO、pre/visible abort、reset、ownership、参数 wiring 与焦点断言通过。
 
 Suggested fixture level: none - 与任务 3 同模式的机械替换，行为由任务 3.2 建立的 timeout/abort 基线模式与组 1 单测覆盖
-Minimal mergeable slice: atomic - 单调用点替换，独立合并保绿
+Effective fixture level: expanded - 虽复用既有模式，但本 PR 把 input 的 AbortSignal/timeout/mounted cleanup 接入共享队列并删除 `resetExtensionUI` 的 raw container owner，命中 mandatory cancellation/shared-state trigger 与项目 `editorContainer`、focus、reset domain trigger。Selected risk packs: concurrency/shared state/ordering、error handling/rollback、legacy compatibility、TUI focus/render lifecycle、session/extension teardown lifecycle。
+Minimal mergeable slice: atomic - input show/hide 对 + reset input legacy 分支 + caller-level compatibility proof；其他 dialog 类不动
 
 ## 5. 迁移 extension editor
 

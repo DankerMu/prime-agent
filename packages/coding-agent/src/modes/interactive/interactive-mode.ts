@@ -1020,7 +1020,6 @@ export class InteractiveMode {
 	private shutdownRequested = false;
 
 	// Extension UI state
-	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
 	private activeConnectionExtensionUiRequests = new Map<string, { cancelLocal: () => void }>();
@@ -3549,9 +3548,6 @@ export class InteractiveMode {
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
 		this.dialogArbiter.cancelKind("extension");
-		if (this.extensionInput) {
-			this.hideExtensionInput();
-		}
 		if (this.extensionEditor) {
 			this.hideExtensionEditor();
 		}
@@ -3852,56 +3848,47 @@ export class InteractiveMode {
 	/**
 	 * Show a text input for extensions.
 	 */
-	private showExtensionInput(
+	private async showExtensionInput(
 		title: string,
 		placeholder?: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
-
-			const onAbort = () => {
-				this.hideExtensionInput();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			this.extensionInput = new ExtensionInputComponent(
-				title,
-				placeholder,
-				(value) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(value);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout },
-			);
-
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
-			this.ui.requestRender();
+		// A synchronous construction throw must outrank a same-tick signal abort:
+		// remember the exact error so the catch below cannot mistake it for an abort.
+		let constructionError: unknown;
+		const handle = this.dialogArbiter.present<string | undefined>({
+			kind: "extension",
+			signal: opts?.signal,
+			cancel: () => undefined,
+			show: (done) => {
+				try {
+					const input = new ExtensionInputComponent(
+						title,
+						placeholder,
+						(value) => done(value),
+						() => done(undefined),
+						{ tui: this.ui, timeout: opts?.timeout },
+					);
+					return { component: input, focus: input };
+				} catch (error) {
+					constructionError = error;
+					throw error;
+				}
+			},
 		});
-	}
-
-	/**
-	 * Hide the extension input.
-	 */
-	private hideExtensionInput(): void {
-		this.extensionInput?.dispose();
-		this.editorContainer.clear();
-		this.editorContainer.addChild(this.editor);
-		this.extensionInput = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		try {
+			return await handle.result;
+		} catch (error) {
+			if (
+				error instanceof Error &&
+				error.name === "AbortError" &&
+				opts?.signal?.aborted &&
+				error !== constructionError
+			) {
+				return undefined;
+			}
+			throw error;
+		}
 	}
 
 	/**
