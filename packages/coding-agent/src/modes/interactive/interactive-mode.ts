@@ -1020,7 +1020,6 @@ export class InteractiveMode {
 	private shutdownRequested = false;
 
 	// Extension UI state
-	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
 	private activeConnectionExtensionUiRequests = new Map<string, { cancelLocal: () => void }>();
 
@@ -3548,9 +3547,6 @@ export class InteractiveMode {
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
 		this.dialogArbiter.cancelKind("extension");
-		if (this.extensionEditor) {
-			this.hideExtensionEditor();
-		}
 		this.ui.hideOverlay();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
@@ -3895,38 +3891,22 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			this.extensionEditor = new ExtensionEditorComponent(
-				this.ui,
-				this.keybindings,
-				title,
-				prefill,
-				(value) => {
-					this.hideExtensionEditor();
-					resolve(value);
-				},
-				() => {
-					this.hideExtensionEditor();
-					resolve(undefined);
-				},
-			);
-
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
-			this.ui.requestRender();
+		const handle = this.dialogArbiter.present<string | undefined>({
+			kind: "extension",
+			cancel: () => undefined,
+			show: (done) => {
+				const editor = new ExtensionEditorComponent(
+					this.ui,
+					this.keybindings,
+					title,
+					prefill,
+					(value) => done(value),
+					() => done(undefined),
+				);
+				return { component: editor, focus: editor };
+			},
 		});
-	}
-
-	/**
-	 * Hide the extension editor.
-	 */
-	private hideExtensionEditor(): void {
-		this.editorContainer.clear();
-		this.editorContainer.addChild(this.editor);
-		this.extensionEditor = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		return handle.result;
 	}
 
 	/**
