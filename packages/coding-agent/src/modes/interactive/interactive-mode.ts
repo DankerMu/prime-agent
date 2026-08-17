@@ -8830,6 +8830,14 @@ export class InteractiveMode {
 
 		this.resetExtensionUI();
 
+		// When a dialog was cancelled, the arbiter's restore runs on a queued
+		// microtask; the continuation below must run after it so the restore
+		// cannot overwrite the reload box. An idle arbiter mounts synchronously
+		// to keep the immediate paint timing.
+		if (this.dialogArbiter.isBusy()) {
+			await Promise.resolve();
+		}
+
 		const reloadBox = new Container();
 		const borderColor = (s: string) => theme.fg("border", s);
 		reloadBox.addChild(new DynamicBorder(borderColor));

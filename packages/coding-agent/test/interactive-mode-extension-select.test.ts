@@ -43,6 +43,14 @@ const showExtensionSelector = (
 	}
 ).showExtensionSelector;
 
+// Typed access to the private handleReloadCommand so the REAL reload runs
+// against own-property stubs prepared by the test.
+const handleReloadCommand = (
+	InteractiveMode.prototype as unknown as {
+		handleReloadCommand(this: unknown): Promise<void>;
+	}
+).handleReloadCommand;
+
 interface Harness {
 	target: InteractiveMode;
 	arbiter: DialogArbiter;
@@ -105,6 +113,51 @@ function presentAppBlocker(
 
 function flush(): Promise<void> {
 	return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+// Stub the unrelated reload/reset dependencies so the REAL reset and reload run
+// against a held-in-flight agentConnection.reload.
+function prepareReloadTarget(h: Harness, reloadPending: Promise<never>): void {
+	const ownUi = (
+		h.target as unknown as {
+			ui: { setFocus: unknown; requestRender: unknown; terminal: unknown };
+		}
+	).ui;
+	const uiWithOverlay = {
+		setFocus: ownUi.setFocus,
+		requestRender: ownUi.requestRender,
+		terminal: ownUi.terminal,
+		hideOverlay: vi.fn(),
+	};
+	(h.target as unknown as { ui: typeof uiWithOverlay }).ui = uiWithOverlay;
+	Object.assign(h.target as unknown as Record<string, unknown>, {
+		connectionState: { isStreaming: false, isCompacting: false },
+		activeConnectionExtensionUiRequests: new Map<string, { cancelLocal: () => void }>(),
+		agentConnection: {
+			respondToExtensionUiRequest: vi.fn(async () => undefined),
+			reload: vi.fn(() => reloadPending),
+		},
+		closeHeartbeatManager: vi.fn(),
+		showError: vi.fn(),
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn() },
+		autocompleteProviderWrappers: [],
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: h.editor,
+		updateTerminalTitle: vi.fn(),
+		workingMessage: undefined,
+		workingVisible: true,
+		setWorkingIndicator: vi.fn(),
+		loadingAnimation: undefined,
+		setHiddenThinkingLabel: vi.fn(),
+		extensionInput: undefined,
+		extensionEditor: undefined,
+	});
 }
 
 interface FakeInterval {
@@ -694,5 +747,100 @@ describe("interactive mode extension select ownership", () => {
 		expect(h.editorContainer.children).toEqual([h.editor]);
 		expect(h.setFocus).not.toHaveBeenCalled();
 		expect(h.requestRender).not.toHaveBeenCalled();
+	});
+
+	test("reload after a visible selector: reset's arbiter handoff finishes before the reload box mounts", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const select = createExtensionUIContext.call(h.target).select;
+		const selectPromise = select("Reload race", ["Alpha"]);
+		const selector = h.editorContainer.children[0];
+		expect(selector).toBeInstanceOf(ExtensionSelectorComponent);
+		expect(h.setFocus).toHaveBeenLastCalledWith(selector);
+
+		// Hold the reload in flight so the box stays mounted while the arbiter's
+		// queued restore microtask and the reload continuation race to completion.
+		let rejectReload!: (error: Error) => void;
+		const reloadPending = new Promise<never>((_, reject) => {
+			rejectReload = reject;
+		});
+		prepareReloadTarget(h, reloadPending);
+
+		const reload = handleReloadCommand.call(h.target);
+		let reloadDone = false;
+		void reload.finally(() => {
+			reloadDone = true;
+		});
+
+		// One turn lets the reset arbiter handoff settle; the reload box must then
+		// own the surface, so the selector's stale restore must not have run.
+		await flush();
+		const reloadBox = h.editorContainer.children[0];
+		expect(reloadBox).not.toBe(h.editor);
+		expect(reloadBox).not.toBe(selector);
+		expect(h.editorContainer.children).toEqual([reloadBox]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadBox);
+
+		// Further microtask and process.nextTick turns must not displace the reload
+		// box either; it stays the sole owner and focus until reload settles.
+		await flush();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await flush();
+
+		expect(h.editorContainer.children).toEqual([reloadBox]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadBox);
+		expect(reloadDone).toBe(false);
+
+		rejectReload(new Error("reload failed"));
+		await expect(reload).resolves.toBeUndefined();
+		await flush();
+
+		expect(h.editorContainer.children).toEqual([h.editor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+		expect(await selectPromise).toBeUndefined();
+		expect(h.arbiter.isBusy()).toBe(false);
+	});
+
+	test("idle reload mounts its box synchronously before the returned promise is awaited", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		let rejectReload!: (error: Error) => void;
+		const reloadPending = new Promise<never>((_, reject) => {
+			rejectReload = reject;
+		});
+		prepareReloadTarget(h, reloadPending);
+
+		// An idle arbiter must not defer the mount: the box owns the surface and
+		// focus immediately on return, before the handler's promise is awaited.
+		const reload = handleReloadCommand.call(h.target);
+		let reloadDone = false;
+		void reload.finally(() => {
+			reloadDone = true;
+		});
+		const reloadBox = h.editorContainer.children[0];
+		expect(reloadBox).not.toBe(h.editor);
+		expect(h.editorContainer.children).toEqual([reloadBox]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadBox);
+		expect(h.requestRender).toHaveBeenLastCalledWith(true);
+
+		await flush();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await flush();
+
+		expect(h.editorContainer.children).toEqual([reloadBox]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadBox);
+		expect(reloadDone).toBe(false);
+
+		rejectReload(new Error("reload failed"));
+		await expect(reload).resolves.toBeUndefined();
+		await flush();
+
+		expect(h.editorContainer.children).toEqual([h.editor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+		expect(h.arbiter.isBusy()).toBe(false);
 	});
 });
