@@ -233,7 +233,9 @@ describe("interactive mode extension input ownership", () => {
 			const [timer] = [...intervals.values()];
 			expect(timer).toBeDefined();
 			expect(timer!.ms).toBe(1000);
+			const renderBeforeTick = h.requestRender.mock.calls.length;
 			timer!.fn();
+			expect(h.requestRender.mock.calls.length).toBe(renderBeforeTick + 1);
 			expect(settled).toBe(false);
 			timer!.fn();
 			expect(settled).toBe(false);
@@ -269,6 +271,28 @@ describe("interactive mode extension input ownership", () => {
 		await expect(promise).resolves.toBe("hello world");
 		await flush();
 
+		expect(h.editorContainer.children).toEqual([h.editor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+		expect(h.arbiter.isBusy()).toBe(false);
+	});
+
+	test("configured cancel key resolves undefined, disposes input, restores editor/focus, and becomes idle", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager({ "tui.select.cancel": "x" }));
+		const h = makeHarness();
+
+		const input = createExtensionUIContext.call(h.target).input;
+		const promise = input("Cancel visible", "hint");
+		const mounted = h.editorContainer.children[0];
+		expect(mounted).toBeInstanceOf(ExtensionInputComponent);
+		const disposeSpy = vi.spyOn(mounted as ExtensionInputComponent, "dispose");
+
+		(mounted as ExtensionInputComponent).handleInput("x");
+
+		await expect(promise).resolves.toBeUndefined();
+		await flush();
+
+		expect(disposeSpy).toHaveBeenCalledTimes(1);
 		expect(h.editorContainer.children).toEqual([h.editor]);
 		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
 		expect(h.arbiter.isBusy()).toBe(false);
