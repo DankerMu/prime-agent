@@ -1020,7 +1020,6 @@ export class InteractiveMode {
 	private shutdownRequested = false;
 
 	// Extension UI state
-	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -3549,9 +3548,7 @@ export class InteractiveMode {
 	private resetExtensionUI(): void {
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
-		if (this.extensionSelector) {
-			this.hideExtensionSelector();
-		}
+		this.dialogArbiter.cancelKind("extension");
 		if (this.extensionInput) {
 			this.hideExtensionInput();
 		}
@@ -3789,56 +3786,47 @@ export class InteractiveMode {
 	/**
 	 * Show a selector for extensions.
 	 */
-	private showExtensionSelector(
+	private async showExtensionSelector(
 		title: string,
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
-			if (opts?.signal?.aborted) {
-				resolve(undefined);
-				return;
-			}
-
-			const onAbort = () => {
-				this.hideExtensionSelector();
-				resolve(undefined);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			this.extensionSelector = new ExtensionSelectorComponent(
-				title,
-				options,
-				(option) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(option);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout },
-			);
-
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
-			this.ui.requestRender();
+		// A synchronous construction throw must outrank a same-tick signal abort:
+		// remember the exact error so the catch below cannot mistake it for an abort.
+		let constructionError: unknown;
+		const handle = this.dialogArbiter.present<string | undefined>({
+			kind: "extension",
+			signal: opts?.signal,
+			cancel: () => undefined,
+			show: (done) => {
+				try {
+					const selector = new ExtensionSelectorComponent(
+						title,
+						options,
+						(option) => done(option),
+						() => done(undefined),
+						{ tui: this.ui, timeout: opts?.timeout },
+					);
+					return { component: selector, focus: selector };
+				} catch (error) {
+					constructionError = error;
+					throw error;
+				}
+			},
 		});
-	}
-
-	/**
-	 * Hide the extension selector.
-	 */
-	private hideExtensionSelector(): void {
-		this.extensionSelector?.dispose();
-		this.editorContainer.clear();
-		this.editorContainer.addChild(this.editor);
-		this.extensionSelector = undefined;
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
+		try {
+			return await handle.result;
+		} catch (error) {
+			if (
+				error instanceof Error &&
+				error.name === "AbortError" &&
+				opts?.signal?.aborted &&
+				error !== constructionError
+			) {
+				return undefined;
+			}
+			throw error;
+		}
 	}
 
 	/**
