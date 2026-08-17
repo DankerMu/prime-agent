@@ -5,7 +5,7 @@ import { type KeybindingsConfig, KeybindingsManager } from "../src/core/keybindi
 import { ExtensionEditorComponent } from "../src/modes/interactive/components/extension-editor.js";
 import { DialogArbiter } from "../src/modes/interactive/dialog-arbiter.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import * as themeModule from "../src/modes/interactive/theme/theme.js";
 
 type UIContextStub = {
 	editor(title: string, prefill?: string): Promise<string | undefined>;
@@ -139,7 +139,7 @@ function prepareResetTarget(h: Harness): void {
 
 describe("interactive mode extension editor ownership", () => {
 	test("queues behind the shared app blocker and submits the prefilled multiline text after release", async () => {
-		initTheme("dark");
+		themeModule.initTheme("dark");
 		const h = makeHarness();
 		setKeybindings(h.keybindings);
 		const blockerComponent = new Container();
@@ -186,7 +186,7 @@ describe("interactive mode extension editor ownership", () => {
 	});
 
 	test("configured cancel key resolves undefined, restores editor focus, and becomes idle", async () => {
-		initTheme("dark");
+		themeModule.initTheme("dark");
 		const h = makeHarness(24, { "tui.select.cancel": "x" });
 		setKeybindings(h.keybindings);
 
@@ -206,53 +206,62 @@ describe("interactive mode extension editor ownership", () => {
 	});
 
 	test("reset settles the visible and queued editors once as undefined without flashing the queued editor", async () => {
-		initTheme("dark");
-		const h = makeHarness();
-		setKeybindings(h.keybindings);
-		const ctx = createExtensionUIContext.call(h.target);
+		themeModule.initTheme("dark");
+		const getEditorThemeSpy = vi.spyOn(themeModule, "getEditorTheme");
+		try {
+			const h = makeHarness();
+			setKeybindings(h.keybindings);
+			const ctx = createExtensionUIContext.call(h.target);
 
-		const first = ctx.editor("First reset");
-		const firstMounted = h.editorContainer.children[0];
-		expect(firstMounted).toBeInstanceOf(ExtensionEditorComponent);
-		const focusBeforeSecond = h.setFocus.mock.calls.length;
-		const renderBeforeSecond = h.requestRender.mock.calls.length;
-		let firstSettlementCallbacks = 0;
-		let secondSettlementCallbacks = 0;
-		let firstValue: string | undefined;
-		let secondValue: string | undefined;
-		void first.then((value) => {
-			firstSettlementCallbacks += 1;
-			firstValue = value;
-		});
+			const first = ctx.editor("First reset");
+			const firstMounted = h.editorContainer.children[0];
+			expect(firstMounted).toBeInstanceOf(ExtensionEditorComponent);
+			const getEditorThemeCallsAfterFirst = getEditorThemeSpy.mock.calls.length;
+			expect(getEditorThemeCallsAfterFirst).toBeGreaterThan(0);
+			const focusBeforeSecond = h.setFocus.mock.calls.length;
+			const renderBeforeSecond = h.requestRender.mock.calls.length;
+			let firstSettlementCallbacks = 0;
+			let secondSettlementCallbacks = 0;
+			let firstValue: string | undefined;
+			let secondValue: string | undefined;
+			void first.then((value) => {
+				firstSettlementCallbacks += 1;
+				firstValue = value;
+			});
 
-		const second = ctx.editor("Second reset");
-		void second.then((value) => {
-			secondSettlementCallbacks += 1;
-			secondValue = value;
-		});
+			const second = ctx.editor("Second reset");
+			void second.then((value) => {
+				secondSettlementCallbacks += 1;
+				secondValue = value;
+			});
 
-		expect(h.editorContainer.children[0]).toBe(firstMounted);
-		expect(h.surfaceChanges).toEqual([firstMounted]);
-		expect(h.setFocus.mock.calls.length).toBe(focusBeforeSecond);
-		expect(h.requestRender.mock.calls.length).toBe(renderBeforeSecond);
+			expect(getEditorThemeSpy.mock.calls.length).toBe(getEditorThemeCallsAfterFirst);
+			expect(h.editorContainer.children[0]).toBe(firstMounted);
+			expect(h.surfaceChanges).toEqual([firstMounted]);
+			expect(h.setFocus.mock.calls.length).toBe(focusBeforeSecond);
+			expect(h.requestRender.mock.calls.length).toBe(renderBeforeSecond);
 
-		prepareResetTarget(h);
-		resetExtensionUI.call(h.target);
+			prepareResetTarget(h);
+			resetExtensionUI.call(h.target);
 
-		await expect(first).resolves.toBeUndefined();
-		await expect(second).resolves.toBeUndefined();
-		await flush();
+			await expect(first).resolves.toBeUndefined();
+			await expect(second).resolves.toBeUndefined();
+			await flush();
 
-		expect(firstSettlementCallbacks).toBe(1);
-		expect(secondSettlementCallbacks).toBe(1);
-		expect(firstValue).toBeUndefined();
-		expect(secondValue).toBeUndefined();
-		expect(h.surfaceChanges).toEqual([firstMounted, undefined, h.editor]);
-		expect(h.setFocus.mock.calls.map(([component]) => component)).toEqual([firstMounted, null, h.editor]);
-		expect(h.requestRender).toHaveBeenCalledTimes(3);
-		expect(h.editorContainer.children).toEqual([h.editor]);
-		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
-		expect(h.arbiter.isBusy()).toBe(false);
+			expect(getEditorThemeSpy.mock.calls.length).toBe(getEditorThemeCallsAfterFirst);
+			expect(firstSettlementCallbacks).toBe(1);
+			expect(secondSettlementCallbacks).toBe(1);
+			expect(firstValue).toBeUndefined();
+			expect(secondValue).toBeUndefined();
+			expect(h.surfaceChanges).toEqual([firstMounted, undefined, h.editor]);
+			expect(h.setFocus.mock.calls.map(([component]) => component)).toEqual([firstMounted, null, h.editor]);
+			expect(h.requestRender).toHaveBeenCalledTimes(3);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			getEditorThemeSpy.mockRestore();
+		}
 	});
 
 	test.each([
@@ -262,7 +271,7 @@ describe("interactive mode extension editor ownership", () => {
 			error: Object.assign(new Error("aborted"), { name: "AbortError" }),
 		},
 	])("propagates the $label from the arbiter without touching UI", async ({ error }) => {
-		initTheme("dark");
+		themeModule.initTheme("dark");
 		const h = makeHarness();
 		setKeybindings(h.keybindings);
 		const present = vi.fn((_request: unknown) => ({
@@ -281,7 +290,7 @@ describe("interactive mode extension editor ownership", () => {
 	});
 
 	test("propagates the real theme construction error by identity without touching UI", async () => {
-		initTheme("dark");
+		themeModule.initTheme("dark");
 		const h = makeHarness();
 		setKeybindings(h.keybindings);
 		const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
