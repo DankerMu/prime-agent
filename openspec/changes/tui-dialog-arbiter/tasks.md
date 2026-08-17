@@ -97,10 +97,12 @@ Minimal mergeable slice: atomic - input show/hide 对 + reset input legacy 分�
 
 ## 5. 迁移 extension editor
 
-- [ ] 5.1 将 `showExtensionEditor`/`hideExtensionEditor` 改写为 `arbiter.present`（kind: extension，`cancel: () => undefined`，无 signal/timeout）；`resetExtensionUI` 中对应 editor hide 路径改为 `cancelKind` 覆盖（修复该路径现状不 resolve 的 Promise 泄漏）
+- [x] 5.1 将 `showExtensionEditor`/`hideExtensionEditor` 改写为一次 `arbiter.present`（kind: extension，`cancel: () => undefined`，无 signal/timeout）：`ExtensionEditorComponent` 只在 `show` 内构造并逐字接收 `this.ui`、`this.keybindings`、title、prefill 与 submit/cancel callbacks，mounted ownership/focus/restore 归 arbiter；移除 `extensionEditor` 字段与旧 hide 方法。`resetExtensionUI` 已无条件调用 `cancelKind("extension")`，删除 editor legacy hide 分支，使 visible/queued editor 的 Promise 均以 `undefined` 恰好结算一次，不再泄漏；构造/运行错误保持原始 rejection。
+- [x] 5.2 caller-level 行为证据：经真实 `createExtensionUIContext().editor` 和宿主同一个 arbiter，在 app-kind blocker 后排队 editor，断言 blocker 期间 editor 不构造、不改容器/焦点，释放后展示；用 distinctive title/prefill 和真实组件 submit 路径断言返回完整多行字符串并恢复 editor/focus。另用自定义 `tui.select.cancel` binding 驱动真实 user cancel -> `undefined`；以真实 `resetExtensionUI` 同时结算 visible+queued editor，断言两项各 resolve `undefined`、queued 从未构造/闪现、最终恢复 editor/focus/idle；用窄 `present` rejection 注入普通 error 与同名 `AbortError`（editor 无 signal），断言均保持原始 rejection。固定 seam 为 `packages/coding-agent/test/interactive-mode-extension-editor.test.ts`；从 `packages/coding-agent` 运行 `npx tsx ../../node_modules/vitest/dist/cli.js --run test/interactive-mode-extension-editor.test.ts test/dialog-arbiter.test.ts`，期望退出 0 且值、FIFO、user cancel、强制关闭 settle-once、error、ownership 与焦点断言全部通过。
 
 Suggested fixture level: none - 同模式机械替换且参数面更小；强制关闭结算语义由组 1 的 `cancelKind` 单测与组 10 的集成场景覆盖
-Minimal mergeable slice: atomic - 单调用点替换，独立合并保绿
+Effective fixture level: expanded - editor 无 AbortSignal/timeout，`resetExtensionUI` 是唯一强制结算入口；本 PR 修复真实 Promise 泄漏并转移共享 surface/focus ownership，命中 mandatory cancellation/shared-state trigger 与项目 `editorContainer`、focus、reset domain trigger。Selected risk packs: concurrency/shared state/ordering、error handling/rollback、legacy compatibility、TUI focus/render lifecycle、session/extension teardown lifecycle。
+Minimal mergeable slice: atomic - editor show/hide 对 + reset editor legacy 分支 + caller-level leak/compatibility proof；其他 dialog 类不动
 
 ## 6. 迁移 extension 自定义非 overlay UI
 
