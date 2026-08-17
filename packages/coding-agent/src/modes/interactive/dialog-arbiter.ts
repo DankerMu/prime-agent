@@ -62,6 +62,11 @@ export class DialogArbiter {
 	private current: RequestEntry | undefined;
 	private mounted: DialogComponent | undefined;
 	private surfaceCleared = false;
+	// Editor identity the surface still holds while the arbiter owns it with no
+	// dialog component mounted. Used only to detect at handoff time that the
+	// preserved surface became stale; the restore target is always read
+	// dynamically from getCurrentEditor(), never from this identity.
+	private preservedEditor: Component | undefined;
 	private handoffScheduled = false;
 	private settling = false;
 	private disposed = false;
@@ -89,6 +94,7 @@ export class DialogArbiter {
 			this.queue.push(entry);
 		} else {
 			this.current = entry;
+			this.preservedEditor = this.host.getCurrentEditor();
 			this.startConstructing(entry);
 		}
 		return handle;
@@ -109,6 +115,7 @@ export class DialogArbiter {
 	disposeAll(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.preservedEditor = undefined;
 		if (this.current && !this.current.settled) {
 			this.settleEntry(this.current, this.cancelOutcome(this.current));
 		}
@@ -195,6 +202,10 @@ export class DialogArbiter {
 			this.surfaceCleared = true;
 		} else {
 			this.callOnEvict(entry);
+			// The preserved editor surface stays in place until the handoff decides
+			// whether it is still the current editor; the identity comparison runs
+			// at handoff time so an editor replacement during the handoff window is
+			// still detected.
 		}
 	}
 
@@ -230,18 +241,39 @@ export class DialogArbiter {
 			if (this.disposed) return;
 			const next = this.queue.find((entry) => !entry.settled);
 			if (next) {
+				// A no-mounted constructing request may have left the preserved
+				// editor surface stale (the current editor changed while busy).
+				// Close that stale surface before the successor constructs so the
+				// stale editor never receives input while the successor builds.
+				const preserved = this.preservedEditor;
+				if (preserved && preserved !== this.host.getCurrentEditor()) {
+					this.preservedEditor = undefined;
+					this.host.replaceEditorSurface(undefined);
+					this.host.setFocus(null);
+					this.host.requestRender();
+					this.surfaceCleared = true;
+				}
 				const index = this.queue.indexOf(next);
 				this.queue.splice(index, 1);
 				this.current = next;
 				this.startConstructing(next);
 			} else if (this.surfaceCleared) {
 				this.restoreEditor();
+			} else {
+				const preserved = this.preservedEditor;
+				this.preservedEditor = undefined;
+				if (preserved && preserved !== this.host.getCurrentEditor()) {
+					// The preserved editor surface is stale: restore the current
+					// editor dynamically and avoid any work when identity is unchanged.
+					this.restoreEditor();
+				}
 			}
 		});
 	}
 
 	private restoreEditor(): void {
 		const editor = this.host.getCurrentEditor();
+		this.preservedEditor = undefined;
 		this.host.replaceEditorSurface(editor);
 		this.host.setFocus(editor);
 		this.host.requestRender();
@@ -282,6 +314,7 @@ export class DialogArbiter {
 	private mount(mounted: Mounted): void {
 		this.mounted = mounted.component;
 		this.surfaceCleared = false;
+		this.preservedEditor = undefined;
 		this.host.replaceEditorSurface(mounted.component);
 		this.host.setFocus(mounted.focus);
 		this.host.requestRender();

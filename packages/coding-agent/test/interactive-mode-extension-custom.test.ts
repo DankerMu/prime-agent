@@ -654,6 +654,390 @@ describe("interactive mode extension custom ownership", () => {
 		}
 	});
 
+	test("real reset during async construction after a real editor replacement restores the default editor as sole surface", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		let resolveComponent: ((component: Component) => void) | undefined;
+		let capturedDone: ((result: string) => void) | undefined;
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, done: (result: string) => void) => {
+			capturedDone = done;
+			return new Promise<CustomComponentResult>((resolve) => {
+				resolveComponent = resolve;
+			});
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		const lateComponent = makeCustomComponent();
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			// Constructing keeps the current editor mounted.
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// The editor is replaced while the request constructs with no mounted
+			// component. The real setter updates the editor reference but cannot
+			// touch the surface while the arbiter is busy.
+			const newEditor = makeEditor("");
+			const replacementFactory = vi.fn(() => newEditor);
+			setCustomEditorComponent.call(h.target, replacementFactory);
+			expect(currentEditor(h.target)).toBe(newEditor);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// Prepare the reset harness, then un-stub the editor setter so the REAL
+			// reset restores the default editor through the real replacement path.
+			prepareResetTarget(h);
+			delete (h.target as unknown as Record<string, unknown>).setCustomEditorComponent;
+			resetExtensionUI.call(h.target);
+			await flush();
+
+			expect(outcome).toBeInstanceOf(Error);
+			expect((outcome as Error).name).toBe("AbortError");
+			expect(currentEditor(h.target)).toBe(h.defaultEditor);
+
+			// The default editor is the sole surface child and focus target; the
+			// old editor is never remounted and the interim replacement is gone.
+			expect(h.editorContainer.children).toEqual([h.defaultEditor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(h.defaultEditor);
+			expect(h.editorContainer.children).not.toContain(h.editor);
+
+			// The late component resolves: it never mounts and is disposed once.
+			resolveComponent!(lateComponent);
+			await flush();
+			expect(lateComponent.dispose).toHaveBeenCalledTimes(1);
+			expect(h.editorContainer.children).toEqual([h.defaultEditor]);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			// Settle any request still pending after a failed assertion.
+			h.arbiter.cancelKind("extension");
+			capturedDone?.("cleanup");
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("real reset during async construction after a factory rejection restores the replacement editor and focus", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const uniqueError = new Error("unique-replacement-factory-failure");
+		let rejectFactory!: (error: unknown) => void;
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, _done: (result: string) => void) => {
+			return new Promise<CustomComponentResult>((_resolve, reject) => {
+				rejectFactory = reject;
+			});
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// Replace the editor while constructing; the real setter keeps the old
+			// surface mounted.
+			const newEditor = makeEditor("");
+			const replacementFactory = vi.fn(() => newEditor);
+			setCustomEditorComponent.call(h.target, replacementFactory);
+			expect(currentEditor(h.target)).toBe(newEditor);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// The factory rejects with its exact error: the replacement editor must
+			// become the sole surface child and focus target, and the old editor is
+			// never restored.
+			rejectFactory(uniqueError);
+			await expect(custom).rejects.toBe(uniqueError);
+			await flush();
+
+			expect(outcome).toBe(uniqueError);
+			expect(h.editorContainer.children).toEqual([newEditor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(newEditor);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			rejectFactory?.(uniqueError);
+			h.arbiter.cancelKind("extension");
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("synchronous first done restores a replacement editor replaced during handoff and disposes the late component once", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		let resolveComponent!: (component: Component) => void;
+		const customComponent = makeCustomComponent();
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, done: (result: string) => void) => {
+			done("first");
+			return new Promise<CustomComponentResult>((resolve) => {
+				resolveComponent = resolve;
+			});
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+
+		try {
+			// The sync done settles the result before the component promise resolves,
+			// leaving the arbiter busy with the handoff still scheduled.
+			expect(h.arbiter.isBusy()).toBe(true);
+
+			// Replace the editor through the real setter while the arbiter is still
+			// busy: the setter updates the reference but must not touch the surface.
+			const newEditor = makeEditor("");
+			const replacementFactory = vi.fn(() => newEditor);
+			setCustomEditorComponent.call(h.target, replacementFactory);
+			expect(currentEditor(h.target)).toBe(newEditor);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// The handoff runs and must dynamically restore the replacement editor.
+			await expect(custom).resolves.toBe("first");
+			await flush();
+			expect(h.editorContainer.children).toEqual([newEditor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(newEditor);
+			expect(h.arbiter.isBusy()).toBe(false);
+
+			// The late component is disposed exactly once and never mounts.
+			resolveComponent(customComponent);
+			await flush();
+			expect(customComponent.dispose).toHaveBeenCalledTimes(1);
+			expect(h.editorContainer.children).toEqual([newEditor]);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			// Settle any request still pending after a failed assertion.
+			h.arbiter.cancelKind("extension");
+			resolveComponent?.(customComponent);
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("sync factory throw preserves the exact error, restores the display-time text and stays surface/idle without UI events", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const displayTimeText = "display-time-sync-throw-text";
+		h.editor.setText(displayTimeText);
+
+		const uniqueError = new Error("unique-sync-factory-throw");
+		const factory = vi.fn(() => {
+			throw uniqueError;
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			// Sync factory throw rejects with the exact error identity.
+			await expect(custom).rejects.toBe(uniqueError);
+			expect(outcome).toBe(uniqueError);
+			expect(factory).toHaveBeenCalledTimes(1);
+
+			// The display-time text is restored; the editor never left the surface
+			// and no restore UI events are emitted when the editor identity is
+			// unchanged.
+			expect(h.editor.getText()).toBe(displayTimeText);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).not.toHaveBeenCalled();
+			expect(h.requestRender).not.toHaveBeenCalled();
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			// Settle any request still pending after a failed assertion.
+			h.arbiter.cancelKind("extension");
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("async factory rejection after post-display editor mutation restores the display-time text and stays surface/idle without UI events", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const displayTimeText = "display-time-async-reject-text";
+		h.editor.setText(displayTimeText);
+
+		const uniqueError = new Error("unique-async-reject-after-mutation");
+		let rejectFactory!: (error: unknown) => void;
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, _done: (result: string) => void) => {
+			return new Promise<CustomComponentResult>((_resolve, reject) => {
+				rejectFactory = reject;
+			});
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			// Mutate the editor text while the factory is constructing.
+			h.editor.setText("mutated-during-constructing-text");
+
+			rejectFactory(uniqueError);
+			await expect(custom).rejects.toBe(uniqueError);
+			await flush();
+
+			expect(outcome).toBe(uniqueError);
+			// The display-time text is restored, not the mutation. The editor never
+			// left the surface and no restore UI events are emitted when the editor
+			// identity is unchanged.
+			expect(h.editor.getText()).toBe(displayTimeText);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).not.toHaveBeenCalled();
+			expect(h.requestRender).not.toHaveBeenCalled();
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			rejectFactory?.(uniqueError);
+			h.arbiter.cancelKind("extension");
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("cancel after post-display editor mutation rejects with AbortError and restores the display-time text, surface, focus and idle state", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const displayTimeText = "display-time-cancel-text";
+		h.editor.setText(displayTimeText);
+
+		let capturedDone: ((result: string) => void) | undefined;
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, done: (result: string) => void) => {
+			capturedDone = done;
+			return makeCustomComponent();
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			// The custom mounts, then the editor text mutates while it is visible.
+			await flush();
+			expect(h.editorContainer.children[0]).not.toBe(h.editor);
+			h.editor.setText("mutated-while-visible-text");
+
+			prepareResetTarget(h);
+			resetExtensionUI.call(h.target);
+			await flush();
+
+			expect(outcome).toBeInstanceOf(Error);
+			expect((outcome as Error).name).toBe("AbortError");
+			expect(h.editor.getText()).toBe(displayTimeText);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			capturedDone?.("cleanup");
+			await flush();
+			await Promise.allSettled([custom]);
+		}
+	});
+
+	test("an ignored public custom rejection after a real reset never emits unhandledRejection while an awaited request still sees AbortError", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const ctx = createExtensionUIContext.call(h.target);
+
+		// A fire-and-forget non-overlay request whose result is deliberately
+		// ignored, exactly as a documented extension usage would.
+		let ignoredDone: ((result: string) => void) | undefined;
+		const ignoredFactory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, done: (result: string) => void) => {
+			ignoredDone = done;
+			return makeCustomComponent();
+		});
+		void ctx.custom(ignoredFactory);
+
+		// A comparable request that is explicitly awaited and must observe the
+		// original AbortError rejection.
+		let awaitedDone: ((result: string) => void) | undefined;
+		const awaitedFactory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, done: (result: string) => void) => {
+			awaitedDone = done;
+			return makeCustomComponent();
+		});
+		const awaited = ctx.custom(awaitedFactory);
+
+		const unhandled: unknown[] = [];
+		const handler = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", handler);
+
+		try {
+			await flush();
+
+			prepareResetTarget(h);
+			resetExtensionUI.call(h.target);
+
+			// Drain every microtask and a macrotask turn so any leaked rejection
+			// would surface under the listener.
+			await flush();
+			await flush();
+
+			expect(unhandled).toEqual([]);
+
+			// The awaited request still observes the exact AbortError.
+			await expect(awaited).rejects.toMatchObject({ name: "AbortError" });
+			await flush();
+
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			process.removeListener("unhandledRejection", handler);
+			// Settle any request still pending after a failed assertion so no
+			// deferred promise is left unobserved.
+			ignoredDone?.("cleanup");
+			awaitedDone?.("cleanup");
+			await flush();
+			await Promise.allSettled([awaited]);
+		}
+	});
+
 	test("a synchronous first done is first-wins: duplicate done and a late factory rejection preserve post-settlement editor text", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());

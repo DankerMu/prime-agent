@@ -847,6 +847,163 @@ describe("DialogArbiter", () => {
 		expect(await h.result).toBe("done");
 	});
 
+	it("restores the replaced current editor when an initial async constructing request rejects without mounting", async () => {
+		const { host, events, setCurrentEditor } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const boom = new Error("boom");
+		const initial = asyncRequest("app", "a");
+		const h = arbiter.present(initial.request);
+
+		expect(events).toEqual([]);
+
+		// The host replaces the current editor while the request constructs with
+		// no mounted component and the old editor still owns the surface.
+		const replacement = makeComponent("replacement-editor").component;
+		setCurrentEditor(replacement);
+
+		initial.reject(boom);
+		await expect(h.result).rejects.toBe(boom);
+		await flush();
+
+		expect(events).toContain("replace:replacement-editor");
+		expect(events).toContain("focus:replacement-editor");
+		expect(events).not.toContain("replace:editor");
+		expect(initial.component.dispose).not.toHaveBeenCalled();
+		expect(arbiter.isBusy()).toBe(false);
+	});
+
+	it("keeps the editor surface untouched when an initial async constructing request rejects without an editor replacement", async () => {
+		const { host, events } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const boom = new Error("boom");
+		const initial = asyncRequest("app", "a");
+		const h = arbiter.present(initial.request);
+
+		expect(events).toEqual([]);
+
+		initial.reject(boom);
+		await expect(h.result).rejects.toBe(boom);
+		await flush();
+		await flush();
+
+		expect(events).toEqual([]);
+		expect(arbiter.isBusy()).toBe(false);
+	});
+
+	it("disposeAll on an initial async constructing request after an editor replacement settles with AbortError, disposes the late component once and never touches the UI", async () => {
+		const { host, events, setCurrentEditor } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const initial = asyncRequest("app", "a");
+		const h = arbiter.present(initial.request);
+
+		expect(events).toEqual([]);
+
+		// The host replaces the current editor while the request constructs with
+		// no mounted component and the old editor still owns the surface.
+		const replacement = makeComponent("replacement-editor").component;
+		setCurrentEditor(replacement);
+
+		// disposeAll is terminal: the no-mounted request settles via the default
+		// cancel semantics (AbortError) and the preserved editor identity must not
+		// resurface as any UI action after dispose.
+		arbiter.disposeAll();
+		arbiter.disposeAll();
+
+		await expect(h.result).rejects.toMatchObject({ name: "AbortError" });
+		expect(initial.component.dispose).not.toHaveBeenCalled();
+		expect(events).toEqual([]);
+		expect(arbiter.isBusy()).toBe(true);
+
+		// A late component resolution is disposed exactly once and never mounts or
+		// drives any UI call after the terminal dispose.
+		initial.resolve({ component: initial.component, focus: initial.component });
+		await flush();
+		await flush();
+		expect(initial.component.dispose).toHaveBeenCalledTimes(1);
+		expect(events).toEqual([]);
+		expect(arbiter.isBusy()).toBe(true);
+
+		// A present after dispose settles immediately without touching the UI.
+		const late = syncRequest("app", "late");
+		const hLate = arbiter.present(late.request);
+		await expect(hLate.result).rejects.toMatchObject({ name: "AbortError" });
+		expect(late.show).not.toHaveBeenCalled();
+		expect(events).toEqual([]);
+	});
+
+	it("clears a stale editor surface before a successor constructs when the current editor changed during an initial async construction", async () => {
+		const { host, events, setCurrentEditor } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const a = asyncRequest("app", "a");
+		const b = asyncRequest("app", "b");
+		const ha = arbiter.present(a.request);
+		const hb = arbiter.present(b.request);
+
+		expect(events).toEqual([]);
+
+		const replacement = makeComponent("replacement-editor").component;
+		setCurrentEditor(replacement);
+
+		ha.settle("a");
+		expect(await ha.result).toBe("a");
+		await flush();
+
+		expect(b.show).toHaveBeenCalledTimes(1);
+		// The stale old editor is cleared before the successor constructs; the
+		// replacement editor is never focused between dialogs.
+		expect(events).toContain("replace:clear");
+		expect(events).toContain("focus:null");
+		expect(events).not.toContain("focus:replacement-editor");
+		expect(events).not.toContain("focus:editor");
+		expect(events).not.toContain("replace:b");
+
+		b.resolve({ component: b.component, focus: b.component });
+		await flush();
+		expect(events).toContain("replace:b");
+		expect(events).toContain("focus:b");
+		expect(events).not.toContain("focus:replacement-editor");
+		expect(events.indexOf("replace:clear")).toBeLessThan(events.indexOf("replace:b"));
+
+		hb.settle("b");
+		await flush();
+		expect(events).toContain("replace:replacement-editor");
+		expect(events).toContain("focus:replacement-editor");
+	});
+
+	it("restores the replaced current editor after a sync done before the async component resolves and disposes the late component once", async () => {
+		const { host, events, setCurrentEditor } = createHost();
+		const arbiter = new DialogArbiter(host);
+		const { component } = makeComponent("a");
+		let resolveComponent!: (mounted: { component: TestDialogComponent; focus: Component }) => void;
+		const componentPromise = new Promise<{ component: TestDialogComponent; focus: Component }>((resolve) => {
+			resolveComponent = resolve;
+		});
+		const a: TestDialogRequest<unknown> = {
+			show: (done) => {
+				done("first");
+				return componentPromise;
+			},
+			kind: "app",
+		};
+		const ha = arbiter.present(a);
+
+		const replacement = makeComponent("replacement-editor").component;
+		setCurrentEditor(replacement);
+
+		expect(await ha.result).toBe("first");
+		await flush();
+
+		expect(events).toContain("replace:replacement-editor");
+		expect(events).toContain("focus:replacement-editor");
+		expect(arbiter.isBusy()).toBe(false);
+
+		resolveComponent({ component, focus: component });
+		await flush();
+		expect(component.dispose).toHaveBeenCalledTimes(1);
+		expect(events).not.toContain("replace:a");
+		expect(events).not.toContain("focus:a");
+	});
+
 	it("emits render and focus in the expected order across a visible settlement and handoff", async () => {
 		const { host, events } = createHost();
 		const arbiter = new DialogArbiter(host);

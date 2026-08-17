@@ -4025,7 +4025,7 @@ export class InteractiveMode {
 	}
 
 	/** Show a custom component with keyboard focus. Overlay mode renders on top of existing content. */
-	private async showExtensionCustom<T>(
+	private showExtensionCustom<T>(
 		factory: (
 			tui: TUI,
 			theme: Theme,
