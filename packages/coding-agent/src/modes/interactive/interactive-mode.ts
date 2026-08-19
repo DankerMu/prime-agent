@@ -4025,7 +4025,7 @@ export class InteractiveMode {
 	}
 
 	/** Show a custom component with keyboard focus. Overlay mode renders on top of existing content. */
-	private async showExtensionCustom<T>(
+	private showExtensionCustom<T>(
 		factory: (
 			tui: TUI,
 			theme: Theme,
@@ -4038,40 +4038,28 @@ export class InteractiveMode {
 			onHandle?: (handle: OverlayHandle) => void;
 		},
 	): Promise<T> {
-		const savedText = this.editor.getText();
-		const isOverlay = options?.overlay ?? false;
+		if (options?.overlay ?? false) {
+			return new Promise((resolve, reject) => {
+				let component: Component & { dispose?(): void };
+				let closed = false;
 
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.editor.setText(savedText);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
-
-		return new Promise((resolve, reject) => {
-			let component: Component & { dispose?(): void };
-			let closed = false;
-
-			const close = (result: T) => {
-				if (closed) return;
-				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
-				// Note: both branches above already call requestRender
-				resolve(result);
-				try {
-					component?.dispose?.();
-				} catch {
-					/* ignore dispose errors */
-				}
-			};
-
-			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
-				.then((c) => {
+				const close = (result: T) => {
 					if (closed) return;
-					component = c;
-					if (isOverlay) {
+					closed = true;
+					this.ui.hideOverlay();
+					// hideOverlay already requests a render
+					resolve(result);
+					try {
+						component?.dispose?.();
+					} catch {
+						/* ignore dispose errors */
+					}
+				};
+
+				Promise.resolve(factory(this.ui, theme, this.keybindings, close))
+					.then((c) => {
+						if (closed) return;
+						component = c;
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
 							if (options?.overlayOptions) {
@@ -4088,19 +4076,57 @@ export class InteractiveMode {
 						const handle = this.ui.showOverlay(component, resolveOptions());
 						// Expose handle to caller for visibility control
 						options?.onHandle?.(handle);
-					} else {
-						this.editorContainer.clear();
-						this.editorContainer.addChild(component);
-						this.ui.setFocus(component);
-						this.ui.requestRender();
-					}
-				})
-				.catch((err) => {
-					if (closed) return;
-					if (!isOverlay) restoreEditor();
-					reject(err);
-				});
+					})
+					.catch((err) => {
+						if (closed) return;
+						reject(err);
+					});
+			});
+		}
+
+		// Finalize text (restore) before the arbiter handoff and only once for the
+		// display-time editor instance.
+		let captured: { editor: EditorComponent; snapshot: string } | undefined;
+		let textFinalized = false;
+		const restoreText = () => {
+			if (textFinalized) return;
+			textFinalized = true;
+			if (captured && this.editor === captured.editor) {
+				captured.editor.setText(captured.snapshot);
+				// Editor.setText only updates the model and onChange; the still-mounted
+				// editor must be repainted so the restored snapshot becomes visible.
+				this.ui.requestRender();
+			}
+		};
+		const handle = this.dialogArbiter.present<T>({
+			kind: "extension",
+			cancel: () => {
+				restoreText();
+				const error = new Error("The operation was aborted");
+				error.name = "AbortError";
+				throw error;
+			},
+			show: (done) => {
+				captured = { editor: this.editor, snapshot: this.editor.getText() };
+				const close = (value: T) => {
+					restoreText();
+					done(value);
+				};
+				try {
+					return Promise.resolve(factory(this.ui, theme, this.keybindings, close)).then(
+						(c) => ({ component: c, focus: c }),
+						(error) => {
+							restoreText();
+							throw error;
+						},
+					);
+				} catch (error) {
+					restoreText();
+					throw error;
+				}
+			},
 		});
+		return handle.result;
 	}
 
 	/**

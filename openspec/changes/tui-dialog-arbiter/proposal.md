@@ -13,6 +13,7 @@
 - `resetExtensionUI` 强制关闭路径改经 arbiter 的 `cancelKind("extension")`：只结算 extension 类对话框（修复该路径现状不 resolve 的 Promise 泄漏），非 extension 项保留在队列。
 - `setCustomEditorComponent` 改为对话框感知：不进入队列，但 arbiter 忙时只更新编辑器引用与 prompt stash、不再清空展示中的对话框；空闲时保持现有立即替换行为。
 - 既有单对话框行为保持不变：abort 返回值语义、extension UI 返回值契约与文本保存/恢复与迁移前一致（仅并发时序从"互踩"变为"排队"）。**四处已声明的行为收敛**：(1) per-dialog timeout 从"请求时刻起算"统一为"展示时刻起算，排队期间不计时"；(2) reload 失败分支的恢复目标从捕获的 `previousEditor` 收敛为结算时刻的当前编辑器；(3) 迟到的异步构造组件从"只丢弃不清理"收敛为丢弃并 `dispose?.()`（修组件泄漏）；(4) 自定义 UI 文本快照从请求时刻收敛为展示时刻（仅排队时可观测）。请求通过自身的 cancel result factory 保持原有取消返回值；未提供 factory 的泛型请求以 `AbortError` reject。
+- editor 恢复是 arbiter-owned 的有界收敛过程：同步 host callback 内再次替换 editor 时，后续微任务重读动态当前 editor 并保持 busy 直至 surface/focus/identity 一致；连续 8 次仍不收敛则清空 surface、聚焦 null 并保持 busy，停止重试直到 `disposeAll()`，避免 stale input owner 与微任务风暴。
 - 明确排除：overlay 通知与 footer 不进入队列、不被队列阻塞。
 
 无 BREAKING 变化：单对话框场景除上述四处明确声明的行为收敛外保持原有契约；并发场景由未定义行为（互踩丢 Promise）变为定义行为（FIFO）。
