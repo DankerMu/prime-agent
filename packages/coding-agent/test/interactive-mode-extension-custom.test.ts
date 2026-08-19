@@ -614,10 +614,13 @@ describe("interactive mode extension custom ownership", () => {
 		}
 	});
 
-	test("real reset during async construction rejects once with AbortError; the late component never mounts and disposes once", async () => {
+	test("real reset during async construction after a text mutation restores the display-time text, paints it and stays surface/idle; the late component never mounts and disposes once", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 		const h = makeHarness();
+
+		const displayTimeText = "display-time-constructing-reset-text";
+		h.editor.setText(displayTimeText);
 
 		let resolveComponent: ((component: Component) => void) | undefined;
 		let capturedDone: ((result: string) => void) | undefined;
@@ -646,12 +649,19 @@ describe("interactive mode extension custom ownership", () => {
 			// Constructing keeps the editor mounted.
 			expect(h.editorContainer.children).toEqual([h.editor]);
 
+			// Mutate the still-mounted editor while constructing: the never-mounted
+			// reset restore must write the display-time snapshot back and paint it.
+			h.editor.setText("mutated-before-constructing-reset-text");
+			const renderBeforeReset = h.requestRender.mock.calls.length;
+
 			prepareResetTarget(h);
 			resetExtensionUI.call(h.target);
 			await flush();
 
 			expect(outcome).toBeInstanceOf(Error);
 			expect((outcome as Error).name).toBe("AbortError");
+			expect(h.editor.getText()).toBe(displayTimeText);
+			expect(h.requestRender.mock.calls.length).toBeGreaterThan(renderBeforeReset);
 
 			// Resolve the factory later: the late component never mounts or focuses
 			// and is disposed exactly once, with no second settlement.
@@ -846,7 +856,7 @@ describe("interactive mode extension custom ownership", () => {
 		}
 	});
 
-	test("sync factory throw preserves the exact error, restores the display-time text and stays surface/idle without UI events", async () => {
+	test("sync factory throw preserves the exact error, restores the display-time text and stays surface/idle", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 		const h = makeHarness();
@@ -876,13 +886,12 @@ describe("interactive mode extension custom ownership", () => {
 			expect(outcome).toBe(uniqueError);
 			expect(factory).toHaveBeenCalledTimes(1);
 
-			// The display-time text is restored; the editor never left the surface
-			// and no restore UI events are emitted when the editor identity is
-			// unchanged.
+			// The display-time text is restored; the editor never left the surface.
+			// When the snapshot already equals the current text a paint is not
+			// required, so no render assertion is made here (zero-or-more).
 			expect(h.editor.getText()).toBe(displayTimeText);
 			expect(h.editorContainer.children).toEqual([h.editor]);
 			expect(h.setFocus).not.toHaveBeenCalled();
-			expect(h.requestRender).not.toHaveBeenCalled();
 			expect(h.arbiter.isBusy()).toBe(false);
 		} finally {
 			// Settle any request still pending after a failed assertion.
@@ -892,7 +901,7 @@ describe("interactive mode extension custom ownership", () => {
 		}
 	});
 
-	test("async factory rejection after post-display editor mutation restores the display-time text and stays surface/idle without UI events", async () => {
+	test("async factory rejection after post-display editor mutation restores the display-time text, paints it and stays surface/idle", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 		const h = makeHarness();
@@ -920,8 +929,10 @@ describe("interactive mode extension custom ownership", () => {
 		);
 
 		try {
-			// Mutate the editor text while the factory is constructing.
+			// Mutate the editor text while the factory is constructing: the editor
+			// stays mounted, so the never-mounted restore must paint the snapshot.
 			h.editor.setText("mutated-during-constructing-text");
+			const renderBeforeReject = h.requestRender.mock.calls.length;
 
 			rejectFactory(uniqueError);
 			await expect(custom).rejects.toBe(uniqueError);
@@ -929,12 +940,13 @@ describe("interactive mode extension custom ownership", () => {
 
 			expect(outcome).toBe(uniqueError);
 			// The display-time text is restored, not the mutation. The editor never
-			// left the surface and no restore UI events are emitted when the editor
-			// identity is unchanged.
+			// left the surface so no surface/focus events are emitted, but the
+			// restore wrote the snapshot into the still-mounted editor, which must
+			// request a render to paint it.
 			expect(h.editor.getText()).toBe(displayTimeText);
 			expect(h.editorContainer.children).toEqual([h.editor]);
 			expect(h.setFocus).not.toHaveBeenCalled();
-			expect(h.requestRender).not.toHaveBeenCalled();
+			expect(h.requestRender.mock.calls.length).toBeGreaterThan(renderBeforeReject);
 			expect(h.arbiter.isBusy()).toBe(false);
 		} finally {
 			rejectFactory?.(uniqueError);

@@ -4093,6 +4093,9 @@ export class InteractiveMode {
 			textFinalized = true;
 			if (captured && this.editor === captured.editor) {
 				captured.editor.setText(captured.snapshot);
+				// Editor.setText only updates the model and onChange; the still-mounted
+				// editor must be repainted so the restored snapshot becomes visible.
+				this.ui.requestRender();
 			}
 		};
 		const handle = this.dialogArbiter.present<T>({
