@@ -7470,16 +7470,15 @@ export class InteractiveMode {
 	 * @param create Factory that receives a `done` callback and returns the component and focus target
 	 */
 	private showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
-		const done = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-		};
-		const { component, focus } = create(done);
-		this.editorContainer.clear();
-		this.editorContainer.addChild(component);
-		this.ui.setFocus(focus);
-		this.ui.requestRender();
+		// The arbiter owns mount, cleanup, and editor restoration; a second done()
+		// is a no-op via settle-once. The request rejects with the original error
+		// if create throws, and the queue advances (fire-and-forget: the arbiter
+		// internally observes the result, so no unhandled rejection).
+		this.dialogArbiter.present<void>({
+			kind: "app",
+			cancel: () => undefined,
+			show: (done) => create(() => done(undefined)),
+		});
 	}
 
 	private showFullPaneOverlay(component: Component, options: number | FullPaneOverlayOptions = 80): OverlayHandle {
