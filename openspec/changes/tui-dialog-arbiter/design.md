@@ -61,8 +61,8 @@ present<T>(request: {
 - `signal` abort 一律以名称为 `AbortError` 的 `Error` reject；调用点按既有契约映射（extension select/input 为 `undefined`）。`cancelKind`/`disposeAll` 调用请求的 `cancel()` 生成该请求的取消值；缺少 `cancel` 时同样以 `AbortError` reject。arbiter 不猜泛型 `T`。`cancel()` throw 时以该原始 error reject 当前请求并继续处理其他项；构造失败同样保留原始 error。
 - `result` 是原生 Promise。arbiter 必须在返回前附加内部 rejection observer，避免 fire-and-forget 的 app/placeholder 请求在 teardown 或构造失败时产生进程级 unhandled rejection；这不改变调用方 `await result` 时观察到的 rejection。
 - `onEvict` 仅用于**从未挂载**的项被 abort、外部 settle、cancelKind 或 dispose 移除时的调用方资源清理，并恰好调用一次；已挂载组件由其 `dispose?.()` 清理，正常情况下二者互斥。例外是异步 constructing 项先被 evict、组件随后迟到 resolve：evict 时先调用 `onEvict`，迟到组件到达后仍须单独 `dispose?.()`，因为它不是 eviction 当下可清理的同一资源句柄。清理钩子抛错不得改变请求结果或阻断后继。
-- arbiter 内部 busy 语义覆盖 queued、constructing、visible、待微任务交接与永久 disposed；只有 current/queue/交接均空且 arbiter 仍可用时为空闲。D6 所需的只读查询方法在任务 2 与首个生产消费者 `setCustomEditorComponent` 同 PR 暴露并测试，不在任务 1 先交付零消费者 API；查询不得暴露队列本体。
-- arbiter 通过宿主注入的 `replaceEditorSurface(component?: Component)`、`setFocus(component: Component | null)`、`requestRender()` 与 `getCurrentEditor()` 四个操作成为唯一对话框展示 owner；`undefined` 表示清空 surface。初始请求从空闲 editor 进入异步 constructing 时保留 editor 与焦点直到组件 ready，保持既有 custom UI 行为。A 已可见并结算而 B 尚在 queued/async constructing 时，则先清空 A 并聚焦 `null`，不得留下已 dispose 的 A 接收输入，也不得短暂恢复/聚焦 editor；B ready 后再挂载并 render。挂载可见对话框和最终恢复 editor 后各请求一次 render。`replaceEditorSurface` 注入闭包是迁移完成后唯一允许执行对话框级 `editorContainer.clear()/addChild()` 的路径。
+- arbiter 内部 busy 语义覆盖 queued、constructing、visible、待微任务交接、完整 editor 恢复 episode 与永久 disposed；只有 current/queue/交接/恢复均空且 arbiter 仍可用时为空闲。D6 所需的只读查询方法在任务 2 与首个生产消费者 `setCustomEditorComponent` 同 PR 暴露并测试，不在任务 1 先交付零消费者 API；查询不得暴露队列本体。
+- arbiter 通过宿主注入的 `replaceEditorSurface(component?: Component)`、`setFocus(component: Component | null)`、`requestRender()` 与 `getCurrentEditor()` 四个操作成为唯一对话框展示 owner；`undefined` 表示清空 surface。初始请求从空闲 editor 进入异步 constructing 时保留 editor 与焦点直到组件 ready，保持既有 custom UI 行为。A 已可见并结算而 B 尚在 queued/async constructing 时，则先清空 A 并聚焦 `null`，不得留下已 dispose 的 A 接收输入，也不得短暂恢复/聚焦 editor；B ready 后再挂载并 render。挂载可见对话框和最终恢复 editor 后各请求一次 render。恢复期间每轮在全部同步 host callbacks 后重读动态 `getCurrentEditor()`；identity 改变则仅在下一微任务重试（不递归且先于 timer），最多 8 轮。第 8 轮仍不收敛时 fail closed：clear surface、focus null、render 一次，保持 busy 且不再安排微任务，直到 terminal `disposeAll()`。host callback error 按 ownership 处理：mounted cleanup error 被隔离且不改变已选 outcome，剩余 phase 继续；mount error 以原始 identity reject owning request 并进入正常 cleanup；stale-clear / restore / failClosed 的 replace/focus/render 同样按 cleanup 隔离（每 phase 捕获、不改已选 outcome、剩余 phase 继续：stale-clear 后仍构造后继，restore 后仍按 identity 重读/重试，failClosed 后保持 busy）。不允许绕过 settleResult、产生未观察 continuation，或因 handoff 微任务 throw 卡住 `handoffPending`。`replaceEditorSurface` 注入闭包是迁移完成后唯一允许执行对话框级 `editorContainer.clear()/addChild()` 的路径。
 
 状态与所有权表（请求终态统一为 `settled`，arbiter 生命周期终态为 `disposed`）：
 
@@ -79,12 +79,15 @@ present<T>(request: {
 | constructing | component ready 且请求仍 active | visible | component/focus 所有权转给 arbiter | replace(component)、focus、render |
 | settled-after-constructing | component 或 rejection 迟到 | settled | 迟到 component `dispose?.()` 一次；迟到 rejection 已观察 | 无 |
 | visible | done / settle / abort / cancelKind | settled + handoff | 先到结果；移除 listener；已挂载 component `dispose?.()` 一次，不调用 onEvict | replace(undefined)、focus(null)、render；禁止中间 editor focus |
-| visible | disposeAll | settled + disposed | 请求级 cancel；移除 listener；component dispose 一次 | replace(undefined)、focus(null)；不得安排恢复/后继 |
+| visible | disposeAll | settled + disposed | 请求级 cancel；移除 listener；component dispose 一次 | replace(undefined)、focus(null)、render；不得安排恢复/后继 |
 | handoff | 活跃后继存在 | constructing | FIFO 取下一项；跳过已 settled 项 | 保持 surface 空/focus=null，直至 ready |
-| handoff | 无后继且未 disposed | idle | 动态读取当前 editor | replace(editor)、focus(editor)、render |
-| any non-disposed | disposeAll | disposed | current 与 queue 同步逐项 cancel/清理；取消 handoff；幂等 | 只清除 arbiter 已挂载的 dialog；之后永不触碰 UI |
+| handoff | 无后继且未 disposed | restoring | 动态读取当前 editor | replace(editor)、focus(editor)、render；全部同步 callback 后重读 identity |
+| restoring | identity 一致且无重入请求 | idle | 清除恢复状态 | 无额外 UI 操作 |
+| restoring | identity 改变且未达 8 轮 | restoring | 保存实际 surface identity 仅用于 stale 比较 | 下一微任务用动态当前 editor 重试，不同步递归 |
+| restoring | 第 8 轮仍不一致 | fail-closed busy | 清除保存 identity、停止调度 | replace(undefined)、focus(null)、render；保持 busy 直到 disposeAll |
+| any non-disposed | disposeAll | disposed | current 与 queue 同步逐项 cancel/清理；mounted cleanup phase 在每个外部 callback 前推进，使重入 disposeAll 返回前完成 component dispose、surface clear、focus null、render；取消 handoff/restore；幂等 | 只清除 arbiter 已挂载的 dialog；之后永不触碰 UI |
 
-同一请求只允许表中第一条终止边生效；后到 done/settle/abort/cancel/dispose 都是 no-op。`onEvict` 与已挂载 component dispose 由挂载所有权区分；constructing 被 evict 后迟到的 component 是新到达句柄，仍单独 dispose。每条表中 transition 都由 `packages/coding-agent/test/dialog-arbiter.test.ts` 在 Seam 1 断言。
+同一请求只允许表中第一条终止边生效；后到 done/settle/abort/cancel/dispose 都是 no-op。`onEvict` 与已挂载 component dispose 由挂载所有权区分；constructing 被 evict 后迟到的 component 是新到达句柄，仍单独 dispose。恢复 target 永远动态读取；保存的 editor identity 只判断当前 surface 是否 stale。每条表中 transition 都由 `packages/coding-agent/test/dialog-arbiter.test.ts` 在 Seam 1 断言。
 
 备选：(a) 在 `InteractiveMode` 内联队列字段——被否：该类已近万行，且 arbiter 需要独立单测；(b) 每类对话框自持锁——被否：两两组合的互踩矩阵测不完，正是现状的成因。
 

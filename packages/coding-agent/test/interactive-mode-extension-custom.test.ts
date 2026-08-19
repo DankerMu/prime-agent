@@ -136,12 +136,28 @@ function makeHarness(): Harness {
 		pastedImages: new Map(),
 		dialogArbiter: null as unknown as DialogArbiter,
 	});
+	let focusedComponent: Component | undefined;
 	const arbiter = new DialogArbiter({
 		replaceEditorSurface: (component) => {
 			editorContainer.clear();
 			if (component) editorContainer.addChild(component);
 		},
-		setFocus: (component) => setFocus(component),
+		// Faithfully mirror the real TUI setFocus: clear the old component's
+		// `focused` flag whenever it has one (regardless of identity), track the
+		// focused component always, and set `focused` on the new component only
+		// when it already has the property (never add it to arbitrary components).
+		// A focusable editor's synchronous `focused` setter can then reenter on
+		// focus.
+		setFocus: (component) => {
+			if (focusedComponent && "focused" in focusedComponent) {
+				(focusedComponent as Component & { focused?: boolean }).focused = false;
+			}
+			focusedComponent = component ?? undefined;
+			if (component && "focused" in component) {
+				(component as Component & { focused?: boolean }).focused = true;
+			}
+			setFocus(component);
+		},
 		requestRender: () => requestRender(),
 		getCurrentEditor: () => currentEditor(target),
 	});
@@ -1135,6 +1151,80 @@ describe("interactive mode extension custom ownership", () => {
 			rejectFactory?.(uniqueError);
 			await flush();
 			await Promise.allSettled([custom, factoryPromise]);
+		}
+	});
+
+	test("a focusable replacement editor reenters a second real replacement during stale restore and converges to the second editor", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		const uniqueError = new Error("unique-focusable-factory-failure");
+		let rejectFactory!: (error: unknown) => void;
+		const factory = vi.fn((_tui: unknown, _theme: unknown, _keys: unknown, _done: (result: string) => void) => {
+			return new Promise<CustomComponentResult>((_resolve, reject) => {
+				rejectFactory = reject;
+			});
+		});
+
+		const custom = createExtensionUIContext.call(h.target).custom(factory);
+		let outcome: unknown = "pending";
+		void custom.then(
+			(value) => {
+				outcome = value;
+			},
+			(error) => {
+				outcome = error;
+			},
+		);
+
+		try {
+			// Editor C is a plain editor. Editor B carries a synchronous focusable
+			// `focused` setter that, when focused, reenters the REAL public editor
+			// setter once to install C.
+			const cEditor = makeEditor("c-text");
+			let bFocused = false;
+			const bEditor = makeEditor("b-text") as StructuralEditor & { focused?: boolean };
+			Object.defineProperty(bEditor, "focused", {
+				configurable: true,
+				enumerable: true,
+				get: () => bFocused,
+				set: (value: boolean) => {
+					if (value && !bFocused) {
+						bFocused = true;
+						setCustomEditorComponent.call(h.target, () => cEditor);
+					} else if (!value && bFocused) {
+						bFocused = false;
+					}
+				},
+			});
+
+			// Replace the editor while the custom constructs with no mounted
+			// component: the real setter updates the reference only while busy.
+			setCustomEditorComponent.call(h.target, () => bEditor);
+			expect(currentEditor(h.target)).toBe(bEditor);
+			expect(h.editorContainer.children).toEqual([h.editor]);
+
+			// The factory rejection triggers the stale no-successor restoration of
+			// B. Focusing B synchronously reenters the real setter to C.
+			rejectFactory(uniqueError);
+			await expect(custom).rejects.toBe(uniqueError);
+			await flush();
+
+			// The exact factory error is preserved and the arbiter converges to C
+			// as the sole surface child and focus target; B is never final.
+			expect(outcome).toBe(uniqueError);
+			expect(currentEditor(h.target)).toBe(cEditor);
+			expect(h.editorContainer.children).toEqual([cEditor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(cEditor);
+			expect(h.editorContainer.children).not.toContain(bEditor);
+			expect(bFocused).toBe(false);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			rejectFactory?.(uniqueError);
+			h.arbiter.cancelKind("extension");
+			await flush();
+			await Promise.allSettled([custom]);
 		}
 	});
 

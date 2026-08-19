@@ -122,6 +122,31 @@
 - WHEN 初始异步请求 I 从空闲 editor 开始 constructing，或队列 [A, B] 中可见 A 结算而 B 同步 ready/仍在异步 constructing
 - THEN I ready 前 editor 保持挂载与焦点；A 结算时立即从 surface 移除并 dispose，B 同步 ready 时焦点直接交给 B，异步 constructing 时 surface 暂为空且焦点为 null，B ready 后再获得焦点；A/B 交接不短暂聚焦 editor，B 结算后焦点才回到当前编辑器
 
+#### Scenario: 恢复期间同步替换 editor 后有界收敛
+
+- WHEN arbiter 恢复动态当前 editor 的 `replaceEditorSurface`、`setFocus` 或 `requestRender` 同步 callback 再次替换 editor
+- THEN arbiter 在全部 callback 返回后重读当前 editor，保持 busy 并仅在后续微任务重试，直至 surface、focus 与当前 editor identity 一致；不得同步递归，也不得把旧 identity 作为恢复 target
+
+#### Scenario: 持续替换无法收敛时 fail closed
+
+- WHEN 每一轮恢复 callback 都再次替换当前 editor，连续 8 轮仍无法使 surface、focus 与当前 identity 一致
+- THEN arbiter 清空 surface、聚焦 null、请求一次 render 并保持 busy，停止安排后续恢复微任务；新请求只排队不展示，直到 `disposeAll()` 同步结算队列并进入终态
+
+#### Scenario: mounted cleanup 重入 terminal dispose
+
+- WHEN 已挂载组件的 dispose、surface clear、focus-null 或 render callback 同步调用 `disposeAll()`
+- THEN 同一 mounted cleanup phase 在该次 `disposeAll()` 返回前按 dispose → clear → focus-null → render 恰好完成一次；外层 cleanup 恢复后不重复 callback，之后不再触碰 UI
+
+#### Scenario: cleanup callback 内嵌套结算与新请求仍保持串行
+
+- WHEN mounted cleanup 或 never-mounted `onEvict` callback 同步结算另一个 queued 请求，并在同一 callback 内发起新请求
+- THEN 嵌套结算不得释放外层 settlement ownership；新请求保持 queued 且不得递归构造/挂载，直到外层 cleanup 完成并在后续微任务经正常 handoff 出队
+
+#### Scenario: host callback 异常不得泄漏 Promise 或阻断清理
+
+- WHEN mounted cleanup 的 dispose/clear/focus/render callback 抛错，或组件挂载的 replace/focus/render callback 抛错，或 stale-clear / restore / failClosed 的 replace/focus/render callback 抛错
+- THEN cleanup callback error 不改变请求已选定的结算结果且其余 cleanup phase 继续；mount callback 的首个 error 以原始 identity reject owning request 并进入正常 cleanup；stale-clear / restore / failClosed 的 host error 被隔离且剩余 phase 继续（stale-clear 后仍构造后继，restore 后仍按 identity 重读/重试，failClosed 后保持 busy）；三类错误都不得留下 pending result、阻断后继、产生 unhandled rejection、卡住 `handoffPending` 或跳过 terminal queue 结算
+
 #### Scenario: 文本快照只回写同一编辑器实例
 
 - WHEN extension 自定义非 overlay UI 在展示时刻从当前编辑器快照文本，结算前编辑器被替换为新实例
