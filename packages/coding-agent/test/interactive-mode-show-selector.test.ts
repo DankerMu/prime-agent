@@ -56,6 +56,14 @@ const handleEffortCommand = (
 	}
 ).handleEffortCommand;
 
+// Typed access to the private handleReloadCommand so the REAL reload runs
+// against own-property stubs prepared by the test.
+const handleReloadCommand = (
+	InteractiveMode.prototype as unknown as {
+		handleReloadCommand(this: unknown): Promise<void>;
+	}
+).handleReloadCommand;
+
 // The REAL applyThinkingLevel implementation, invoked by the thin own-property
 // wrapper so the select callback runs the genuine level-application path.
 const applyThinkingLevelImpl = (
@@ -177,6 +185,166 @@ function prepareResetTarget(h: Harness): void {
 		loadingAnimation: undefined,
 		setHiddenThinkingLabel: vi.fn(),
 	});
+}
+
+// A minimal editor double that satisfies the reload success path's direct
+// defaultEditor calls (setPaddingX / setAutocompleteMaxVisible / onExtensionShortcut).
+function makeReloadEditor(): Component {
+	const editor = {
+		children: [] as Component[],
+		addChild: vi.fn(),
+		removeChild: vi.fn(),
+		clear: vi.fn(),
+		invalidate: vi.fn(),
+		render: () => [] as string[],
+		getSelectionRegions: () => [],
+		setPaddingX: vi.fn(),
+		setAutocompleteMaxVisible: vi.fn(),
+		setAutocompleteProvider: vi.fn(),
+		getPaddingX: () => 0,
+		getText: () => "",
+		setText: vi.fn(),
+		handleInput: vi.fn(),
+		addToHistory: vi.fn(),
+		getHistory: () => [],
+		clearHistory: vi.fn(),
+		insertTextAtCursor: vi.fn(),
+		getExpandedText: () => "",
+		getPasteSnapshot: () => undefined,
+		restorePasteSnapshot: vi.fn(),
+		onExtensionShortcut: undefined,
+		borderColor: (s: string) => s,
+		actionHandlers: new Map<string, () => void>(),
+	};
+	return editor as unknown as Component;
+}
+
+// Stub the unrelated reload/reset dependencies so the REAL reload runs to
+// completion against own-property stubs (reload resolves immediately), while
+// the REAL arbiter, dialogArbiter, and handleReloadCommand stay in charge.
+function prepareReloadTarget(h: Harness): Component {
+	const ownUi = (
+		h.target as unknown as {
+			ui: { setFocus: unknown; requestRender: unknown; terminal: unknown };
+		}
+	).ui;
+	const uiWithOverlay = {
+		setFocus: ownUi.setFocus,
+		requestRender: ownUi.requestRender,
+		terminal: ownUi.terminal,
+		hideOverlay: vi.fn(),
+		setShowHardwareCursor: vi.fn(),
+		setClearOnShrink: vi.fn(),
+	};
+	(h.target as unknown as { ui: typeof uiWithOverlay }).ui = uiWithOverlay;
+
+	const reloadEditor = makeReloadEditor();
+	const state = {
+		cwd: "/test",
+		sessionId: "test-session",
+		thinkingLevel: "off" as const,
+		availableThinkingLevels: [],
+		isStreaming: false,
+		isCompacting: false,
+		isBashRunning: false,
+		retryAttempt: 0,
+		steeringMode: "all" as const,
+		followUpMode: "all" as const,
+		leafId: null,
+		autoCompactionEnabled: false,
+		messageCount: 0,
+		compactionCount: 0,
+		scopedModels: [],
+		activeToolNames: [],
+		contextUsage: { tokens: 0, contextWindow: 0, percent: 0 },
+	};
+	Object.assign(h.target as unknown as Record<string, unknown>, {
+		connectionState: { isStreaming: false, isCompacting: false },
+		options: { verbose: false },
+		activeConnectionExtensionUiRequests: new Map<string, { cancelLocal: () => void }>(),
+		agentConnection: {
+			respondToExtensionUiRequest: vi.fn(async () => undefined),
+			reload: vi.fn(async () => undefined),
+			getState: vi.fn(async () => state),
+			getCommands: vi.fn(async () => []),
+			getModelCatalog: vi.fn(async () => ({ models: [], configuredProviders: [] })),
+			getResourceSnapshot: vi.fn(async () => undefined),
+			getSessionContext: vi.fn(async () => ({
+				messages: [],
+				thinkingLevel: "off",
+				serviceTier: null,
+				model: null,
+			})),
+			setThinkingLevel: vi.fn(async () => {}),
+		},
+		closeHeartbeatManager: vi.fn(),
+		showError: vi.fn(),
+		clearExtensionTerminalInputListeners: vi.fn(),
+		setExtensionFooter: vi.fn(),
+		setExtensionHeader: vi.fn(),
+		clearExtensionWidgets: vi.fn(),
+		footerDataProvider: { clearExtensionStatuses: vi.fn() },
+		footer: { invalidate: vi.fn(), setAutoCompactEnabled: vi.fn() },
+		autocompleteProviderWrappers: [],
+		setCustomEditorComponent: vi.fn(),
+		setupAutocompleteProvider: vi.fn(),
+		defaultEditor: reloadEditor,
+		editor: reloadEditor,
+		updateTerminalTitle: vi.fn(),
+		workingMessage: undefined,
+		workingVisible: true,
+		setWorkingIndicator: vi.fn(),
+		loadingAnimation: undefined,
+		setHiddenThinkingLabel: vi.fn(),
+		toolDefinitionCache: new Map(),
+		keybindings: { reload: vi.fn() },
+		uiServices: {
+			getThemes: vi.fn(() => []),
+			getInitialCwd: vi.fn(() => "/test"),
+			settingsManager: {
+				getHideThinkingBlock: vi.fn(() => false),
+				getTheme: vi.fn(() => ""),
+				getEditorPaddingX: vi.fn(() => 0),
+				getAutocompleteMaxVisible: vi.fn(() => 0),
+				getShowHardwareCursor: vi.fn(() => false),
+				getClearOnShrink: vi.fn(() => false),
+			},
+			modelRegistry: { getError: vi.fn(() => undefined) },
+		},
+		heartbeatCatalog: [],
+		heartbeats: [],
+		subagentSnapshots: new Map(),
+		pulseTimer: undefined,
+		connectionModelsRefreshVersion: 0,
+		connectionModelsRefreshInFlight: undefined,
+		connectionModelCatalog: [],
+		connectionConfiguredProviders: new Set(),
+		connectionModels: [],
+		connectionModelsFetchedAt: 0,
+		connectionResourceSnapshot: undefined,
+		connectionCommands: [],
+		bindLocalSessionExtensions: false,
+		customHeader: undefined,
+		builtInHeader: undefined,
+		hideThinkingBlock: false,
+		toolOutputExpanded: false,
+		pendingTools: new Map(),
+		pendingToolCreations: new Set(),
+		startedToolCalls: new Set(),
+		pendingToolGeneration: 0,
+		ipythonToolComponents: new Map(),
+		lateIpythonSentAgentMessages: new Map(),
+		chatContainer: new Container(),
+		promptStashStore: undefined,
+		promptStashSessionId: undefined,
+		sessionRecap: undefined,
+		recapContainer: undefined,
+		featureHintComponent: undefined,
+		agentRunFileChanges: new Map(),
+		lastStatusSpacer: undefined,
+		lastStatusText: undefined,
+	});
+	return reloadEditor;
 }
 
 describe("interactive mode showSelector arbiter migration", () => {
@@ -366,5 +534,35 @@ describe("interactive mode showSelector arbiter migration", () => {
 		expect(h.editorContainer.children).toEqual([h.editor]);
 		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
 		expect(h.arbiter.isBusy()).toBe(false);
+	});
+
+	test("reload while a thinking selector is visible: cancelKind('app') settles it, reload completes, later selectors mount immediately", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		handleEffortCommand.call(h.target, "");
+		const thinkingSurface = h.editorContainer.children[0];
+		expect(thinkingSurface).toBeInstanceOf(ThinkingSelectorComponent);
+		expect(h.arbiter.isBusy()).toBe(true);
+
+		// Stub the unrelated reload dependencies; the REAL handleReloadCommand
+		// runs with agentConnection.reload resolving immediately.
+		const reloadEditor = prepareReloadTarget(h);
+		const reload = handleReloadCommand.call(h.target);
+		await reload;
+		await flush();
+
+		// The reload must settle the visible app request; the arbiter must be
+		// idle with the editor restored (the reload box dismisses to the editor).
+		expect(h.arbiter.isBusy()).toBe(false);
+		expect(h.editorContainer.children).toEqual([reloadEditor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadEditor);
+
+		// A subsequent thinking selector must mount immediately.
+		showThinkingSelector.call(h.target, THINKING_LEVELS);
+		const nextSurface = h.editorContainer.children[0];
+		expect(nextSurface).toBeInstanceOf(ThinkingSelectorComponent);
+		expect(h.arbiter.isBusy()).toBe(true);
 	});
 });

@@ -8822,6 +8822,12 @@ export class InteractiveMode {
 
 		this.resetExtensionUI();
 
+		// Settle any current/queued app selector (thinking, settings, model,
+		// effort, custom) so the reload box owns the surface and the arbiter can
+		// return to idle. The selectors' request-level cancel resolves undefined;
+		// resetExtensionUI intentionally keeps app requests alive.
+		this.dialogArbiter.cancelKind("app");
+
 		// When a dialog was cancelled, the arbiter's restore runs on a queued
 		// microtask; the continuation below must run after it so the restore
 		// cannot overwrite the reload box. An idle arbiter mounts synchronously
