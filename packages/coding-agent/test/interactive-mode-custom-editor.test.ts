@@ -79,7 +79,7 @@ function makeHarness(options: { initialEditor?: StructuralEditor; initialFactory
 	const arbiter = new DialogArbiter({
 		replaceEditorSurface: hostReplaceEditorSurface,
 		setFocus: (component) => setFocus(component),
-		requestRender: () => requestRender(),
+		requestRender: (force?: boolean) => requestRender(force),
 		getCurrentEditor: () => fakeThis.editor,
 	});
 	fakeThis.dialogArbiter = arbiter;

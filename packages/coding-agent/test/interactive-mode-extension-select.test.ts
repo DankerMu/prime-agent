@@ -77,7 +77,7 @@ function makeHarness(rows = 24): Harness {
 			if (component) editorContainer.addChild(component);
 		},
 		setFocus: (component) => setFocus(component),
-		requestRender: () => requestRender(),
+		requestRender: (force?: boolean) => requestRender(force),
 		getCurrentEditor: () => editor,
 	});
 	const target = Object.assign(Object.create(InteractiveMode.prototype) as InteractiveMode, {
@@ -774,6 +774,9 @@ describe("interactive mode extension select ownership", () => {
 			reloadDone = true;
 		});
 
+		// The reset's cancelKind("extension") settles the visible selector via its
+		// cancel contract; the placeholder is queued behind the reset handoff.
+		await expect(selectPromise).resolves.toBeUndefined();
 		// One turn lets the reset arbiter handoff settle; the reload box must then
 		// own the surface, so the selector's stale restore must not have run.
 		await flush();
@@ -799,7 +802,6 @@ describe("interactive mode extension select ownership", () => {
 
 		expect(h.editorContainer.children).toEqual([h.editor]);
 		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
-		expect(await selectPromise).toBeUndefined();
 		expect(h.arbiter.isBusy()).toBe(false);
 	});
 

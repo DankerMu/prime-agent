@@ -19,7 +19,7 @@ interface TestDialogRequest<T> {
 type TestDialogArbiterHost = {
 	replaceEditorSurface(component?: Component): void;
 	setFocus(component: Component | null): void;
-	requestRender(): void;
+	requestRender(force?: boolean): void;
 	getCurrentEditor(): Component;
 };
 
@@ -951,7 +951,7 @@ describe("DialogArbiter", () => {
 					originalFocus(component);
 				};
 			} else {
-				host.requestRender = () => {
+				host.requestRender = (_force?: boolean) => {
 					busyDuringRestore = arbiter.isBusy();
 					if (!changed) {
 						changed = true;
@@ -1222,7 +1222,7 @@ describe("DialogArbiter", () => {
 					}
 				};
 			} else {
-				host.requestRender = () => {
+				host.requestRender = (_force?: boolean) => {
 					// Change the current editor before disposing so an omitted
 					// post-render guard would schedule another restore pass.
 					originalRender();
@@ -1312,7 +1312,7 @@ describe("DialogArbiter", () => {
 					}
 				};
 			} else {
-				host.requestRender = () => {
+				host.requestRender = (_force?: boolean) => {
 					originalRender();
 					if (!disposed) {
 						disposed = true;
@@ -1397,7 +1397,7 @@ describe("DialogArbiter", () => {
 				};
 			}
 			if (disposeIn === "render") {
-				host.requestRender = () => {
+				host.requestRender = (_force?: boolean) => {
 					originalRender();
 					if (failingClosed) {
 						arbiter.disposeAll();
@@ -1547,7 +1547,7 @@ describe("DialogArbiter", () => {
 					}
 				};
 			} else {
-				host.requestRender = () => {
+				host.requestRender = (_force?: boolean) => {
 					originalRender();
 					arbiter.disposeAll();
 					events.push("render:return");
@@ -1624,7 +1624,7 @@ describe("DialogArbiter", () => {
 				events.push("focus:return");
 			}
 		};
-		host.requestRender = () => {
+		host.requestRender = (_force?: boolean) => {
 			originalRender();
 			arbiter.disposeAll();
 			events.push("render:return");
@@ -2125,8 +2125,8 @@ describe("DialogArbiter", () => {
 			let renderCalls = 0;
 			let threw = false;
 			const originalRender = host.requestRender;
-			host.requestRender = () => {
-				originalRender();
+			host.requestRender = (force?: boolean) => {
+				originalRender(force);
 				renderCalls += 1;
 				if (!threw && renderCalls === 1) {
 					threw = true;
@@ -2211,7 +2211,7 @@ describe("DialogArbiter", () => {
 						}
 					};
 				} else {
-					host.requestRender = () => {
+					host.requestRender = (_force?: boolean) => {
 						originalRender();
 						if (!threw) {
 							threw = true;
@@ -2298,7 +2298,7 @@ describe("DialogArbiter", () => {
 						}
 					};
 				} else {
-					host.requestRender = () => {
+					host.requestRender = (_force?: boolean) => {
 						originalRender();
 						if (!threw) {
 							threw = true;
@@ -2383,8 +2383,8 @@ describe("DialogArbiter", () => {
 					};
 				}
 				if (throwIn === "render") {
-					host.requestRender = () => {
-						originalRender();
+					host.requestRender = (force?: boolean) => {
+						originalRender(force);
 						renderCalls += 1;
 						// The ninth render is the failClosed render: eight restore
 						// passes each rendered once before fail closed ran.
@@ -2554,8 +2554,8 @@ describe("DialogArbiter", () => {
 				// throw or they would hit the contained cleanup/restore policy
 				// and be swallowed rather than rejecting A.
 				let renderCalls = 0;
-				host.requestRender = () => {
-					originalRender();
+				host.requestRender = (force?: boolean) => {
+					originalRender(force);
 					renderCalls += 1;
 					if (renderCalls === 1) throw boom;
 				};

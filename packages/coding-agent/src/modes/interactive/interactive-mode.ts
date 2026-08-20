@@ -1128,7 +1128,7 @@ export class InteractiveMode {
 				}
 			},
 			setFocus: (component) => this.ui.setFocus(component),
-			requestRender: () => this.ui.requestRender(),
+			requestRender: (force) => this.ui.requestRender(force),
 			getCurrentEditor: () => this.editor,
 		});
 		this.subagentSummaryLine = new SubagentSummaryLine(
@@ -8820,45 +8820,37 @@ export class InteractiveMode {
 			return;
 		}
 
+		// Cancels extension-only dialogs; app selectors and placeholders stay
+		// queued and the reload box simply joins the FIFO behind them (D3).
 		this.resetExtensionUI();
 
-		// Settle any current/queued app selector (thinking, settings, model,
-		// effort, custom) so the reload box owns the surface and the arbiter can
-		// return to idle. The selectors' request-level cancel resolves undefined;
-		// resetExtensionUI intentionally keeps app requests alive.
-		this.dialogArbiter.cancelKind("app");
+		// The placeholder is presented through the arbiter. On an idle arbiter
+		// `show` runs synchronously inside `present`, so the box is mounted and
+		// force-painted before this command returns (paint-then-work); on a busy
+		// arbiter the box queues and the reload work below runs without waiting
+		// for the current dialog to settle. The handle is fire-and-forget except
+		// for the `settle` call; the arbiter already observes the result.
+		const handle = this.dialogArbiter.present<void>({
+			kind: "placeholder",
+			cancel: () => undefined,
+			forceRender: true,
+			show: () => {
+				const reloadBox = new Container();
+				const borderColor = (s: string) => theme.fg("border", s);
+				reloadBox.addChild(new DynamicBorder(borderColor));
+				reloadBox.addChild(new Spacer(1));
+				reloadBox.addChild(
+					new Text(theme.fg("muted", "Reloading keybindings, extensions, skills, prompts, themes..."), 1, 0),
+				);
+				reloadBox.addChild(new Spacer(1));
+				reloadBox.addChild(new DynamicBorder(borderColor));
+				return { component: reloadBox, focus: reloadBox };
+			},
+		});
 
-		// When a dialog was cancelled, the arbiter's restore runs on a queued
-		// microtask; the continuation below must run after it so the restore
-		// cannot overwrite the reload box. An idle arbiter mounts synchronously
-		// to keep the immediate paint timing.
-		if (this.dialogArbiter.isBusy()) {
-			await Promise.resolve();
-		}
-
-		const reloadBox = new Container();
-		const borderColor = (s: string) => theme.fg("border", s);
-		reloadBox.addChild(new DynamicBorder(borderColor));
-		reloadBox.addChild(new Spacer(1));
-		reloadBox.addChild(
-			new Text(theme.fg("muted", "Reloading keybindings, extensions, skills, prompts, themes..."), 1, 0),
-		);
-		reloadBox.addChild(new Spacer(1));
-		reloadBox.addChild(new DynamicBorder(borderColor));
-
-		const previousEditor = this.editor;
-		this.editorContainer.clear();
-		this.editorContainer.addChild(reloadBox);
-		this.ui.setFocus(reloadBox);
-		this.ui.requestRender(true);
+		// After the forced paint the reload work still runs; the reload flow must
+		// never wait for the placeholder to be shown or settled.
 		await new Promise((resolve) => process.nextTick(resolve));
-
-		const dismissReloadBox = (editor: Component) => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(editor);
-			this.ui.setFocus(editor);
-			this.ui.requestRender();
-		};
 
 		try {
 			await this.agentConnection.reload();
@@ -8892,7 +8884,9 @@ export class InteractiveMode {
 				this.setupExtensionShortcuts(runner);
 			}
 			await this.rebuildChatFromMessages();
-			dismissReloadBox(this.editor as Component);
+			// Success settles the placeholder; the arbiter restores the current
+			// editor (dynamic) and returns the surface/focus to it.
+			handle.settle(undefined);
 			this.showLoadedResources({
 				force: false,
 				showDiagnosticsWhenQuiet: true,
@@ -8903,7 +8897,9 @@ export class InteractiveMode {
 			}
 			this.showStatus("Reloaded keybindings, extensions, skills, prompts, themes");
 		} catch (error) {
-			dismissReloadBox(previousEditor as Component);
+			// Failure settles the placeholder the same way; the arbiter restores
+			// the current editor dynamically (D7(2)) — no captured reference.
+			handle.settle(undefined);
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}

@@ -158,7 +158,7 @@ function makeHarness(): Harness {
 			}
 			setFocus(component);
 		},
-		requestRender: () => requestRender(),
+		requestRender: (force?: boolean) => requestRender(force),
 		getCurrentEditor: () => currentEditor(target),
 	});
 	(target as unknown as { dialogArbiter: DialogArbiter }).dialogArbiter = arbiter;

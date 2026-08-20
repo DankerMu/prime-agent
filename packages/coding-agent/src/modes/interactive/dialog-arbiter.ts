@@ -12,6 +12,10 @@ interface DialogRequest<T> {
 	signal?: AbortSignal;
 	cancel?(): T;
 	onEvict?(): void;
+	// Force a full repaint on mount. The hot-reload placeholder uses this to
+	// preserve the paint-then-work timing (requestRender(true) + nextTick); all
+	// other dialogs mount with the default non-forced render.
+	forceRender?: boolean;
 }
 
 interface DialogHandle<T> {
@@ -22,7 +26,10 @@ interface DialogHandle<T> {
 interface DialogArbiterHost {
 	replaceEditorSurface(component?: Component): void;
 	setFocus(component: Component | null): void;
-	requestRender(): void;
+	// `force` is threaded through to the host so the hot-reload placeholder can
+	// force a full repaint before the reload work starts; every other dialog
+	// mount and every restore keeps the default non-forced render.
+	requestRender(force?: boolean): void;
 	getCurrentEditor(): Component;
 }
 
@@ -500,7 +507,9 @@ export class DialogArbiter {
 		if (this.disposed || entry.settled) return;
 		if (!this.runMountCallback(entry, () => this.host.setFocus(mounted.focus))) return;
 		if (this.disposed || entry.settled) return;
-		this.runMountCallback(entry, () => this.host.requestRender());
+		// The reload placeholder force-paints its mount (requestRender(true));
+		// every other dialog keeps the default non-forced render.
+		this.runMountCallback(entry, () => this.host.requestRender(entry.request.forceRender));
 	}
 
 	// Runs one host mount callback. Returns false on the first thrown host error;

@@ -125,7 +125,7 @@ function makeHarness(rows = 24): Harness {
 			}
 			setFocus(component);
 		},
-		requestRender: () => requestRender(),
+		requestRender: (force?: boolean) => requestRender(force),
 		getCurrentEditor: () => editor,
 	});
 	(target as unknown as { dialogArbiter: DialogArbiter }).dialogArbiter = arbiter;
@@ -536,7 +536,7 @@ describe("interactive mode showSelector arbiter migration", () => {
 		expect(h.arbiter.isBusy()).toBe(false);
 	});
 
-	test("reload while a thinking selector is visible: cancelKind('app') settles it, reload completes, later selectors mount immediately", async () => {
+	test("reload while a thinking selector is visible: thinking stays until settled; the placeholder settles without being shown; later selectors mount", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 		const h = makeHarness();
@@ -548,16 +548,32 @@ describe("interactive mode showSelector arbiter migration", () => {
 
 		// Stub the unrelated reload dependencies; the REAL handleReloadCommand
 		// runs with agentConnection.reload resolving immediately.
-		const reloadEditor = prepareReloadTarget(h);
+		prepareReloadTarget(h);
 		const reload = handleReloadCommand.call(h.target);
+		let reloadDone = false;
+		void reload.finally(() => {
+			reloadDone = true;
+		});
 		await reload;
 		await flush();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await flush();
 
-		// The reload must settle the visible app request; the arbiter must be
-		// idle with the editor restored (the reload box dismisses to the editor).
+		// The reload must NOT cancel the thinking selector: it keeps the surface
+		// until the user settles it, and the reload command itself completes.
+		expect(reloadDone).toBe(true);
+		expect(h.editorContainer.children).toEqual([thinkingSurface]);
+		expect(h.editorContainer.children[0]).toBeInstanceOf(ThinkingSelectorComponent);
+		expect(h.arbiter.isBusy()).toBe(true);
+
+		// The arbiter is not wedged: the thinking selector still settles normally.
+		const list = (thinkingSurface as ThinkingSelectorComponent).getSelectList();
+		list.setSelectedIndex(3);
+		list.onSelect?.(list.getSelectedItem()!);
+		await flush();
+		expect(h.editorContainer.children).toEqual([h.editor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
 		expect(h.arbiter.isBusy()).toBe(false);
-		expect(h.editorContainer.children).toEqual([reloadEditor]);
-		expect(h.setFocus).toHaveBeenLastCalledWith(reloadEditor);
 
 		// A subsequent thinking selector must mount immediately.
 		showThinkingSelector.call(h.target, THINKING_LEVELS);
