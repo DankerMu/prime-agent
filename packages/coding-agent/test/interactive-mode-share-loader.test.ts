@@ -172,26 +172,130 @@ function tmpFile(): string {
 	return calls[calls.length - 1][0]!;
 }
 
-// Real-loader construction oracle. The real BorderedLoader constructor builds
-// a real pi-tui Loader, whose constructor immediately calls `start()`: that
-// runs the real immediate render (`ui.requestRender`) and starts the real
-// spinner interval. Counting `Loader.prototype.start` therefore proves whether
-// the real loader was ever constructed, while keeping every real render/timer
-// behavior intact. It is a public class method, so a prototype spy is
-// installable; no fake component bypasses the real loader semantics. A loader
-// preconstructed before `present` (whose interval would otherwise leak unseen)
-// fails the oracle red.
-function countLoaderStartCalls(): () => number {
-	const proto = Loader.prototype as { start: () => void };
-	const original = proto.start;
-	let calls = 0;
+// Scoped real-loader lifecycle spy. The real BorderedLoader constructor builds
+// a real pi-tui Loader (or CancellableLoader), whose constructor immediately
+// calls `start()`: that runs the real immediate render (`ui.requestRender`)
+// and starts the real spinner interval. Counting the real `Loader.prototype.start`
+// therefore proves whether the real loader was ever constructed while keeping
+// every real render/timer behavior intact. A loader preconstructed before
+// `present` (whose interval would otherwise leak unseen) fails the oracle red.
+//
+// The spy keeps its count/restore lifecycle explicit: `restore()` is idempotent,
+// `peek()` never restores, and the same spy stays armed through every terminal
+// and late-event assertion of the test that owns it.
+interface LoaderLifecycleSpy {
+	startCalls(): number;
+	stopCalls(): number;
+	restore(): void;
+}
+
+const loaderLifecycleSpies: LoaderLifecycleSpy[] = [];
+
+function installLoaderLifecycleSpy(): LoaderLifecycleSpy {
+	const proto = Loader.prototype as { start: () => void; stop: () => void };
+	const originalStart = proto.start;
+	const originalStop = proto.stop;
+	let startCalls = 0;
+	let stopCalls = 0;
+	let restored = false;
 	proto.start = function (this: unknown) {
-		calls += 1;
-		return original.call(this);
+		startCalls += 1;
+		return originalStart.call(this);
 	};
-	return () => {
-		proto.start = original;
-		return calls;
+	proto.stop = function (this: unknown) {
+		stopCalls += 1;
+		return originalStop.call(this);
+	};
+	const spy: LoaderLifecycleSpy = {
+		startCalls: () => startCalls,
+		stopCalls: () => stopCalls,
+		restore: () => {
+			if (restored) return;
+			restored = true;
+			proto.start = originalStart;
+			proto.stop = originalStop;
+		},
+	};
+	loaderLifecycleSpies.push(spy);
+	return spy;
+}
+
+// Safety restore: a mount-error row reentrantly disposes the arbiter, whose
+// cleanup phase can late-dispose the loader after the spy's own finally has
+// run. The afterEach registry guarantee leaves the real prototypes clean even
+// if an assertion throws before the owning try/finally executes.
+afterEach(() => {
+	for (const spy of loaderLifecycleSpies.splice(0)) {
+		spy.restore();
+	}
+});
+
+// Faithful mount-error host recorder. Mirrors the production host behavior
+// (InteractiveMode's replaceEditorSurface/setFocus/requestRender/getCurrentEditor)
+// while recording the exact surface/focus identities it is asked to install:
+// - `replaceEditorSurface` replaces the tracked surface unless the selected
+//   mount stage is `replace`;
+// - `setFocus` records the target and updates the tracked focus unless the
+//   selected stage is `focus`;
+// - `requestRender` records the force flag unless the selected stage is
+//   `render`.
+// Exactly the selected mount call throws (one-shot, matching the arbiter's
+// one-shot host-throw matrix); every cleanup/restore callback that runs after
+// the throw mutates/records state faithfully, so the assertions can prove the
+// exact surface/focus identity after the episode.
+interface MountStageOption {
+	stage: "replace" | "focus" | "render";
+}
+
+interface MountErrorHostRecorder {
+	host: TestDialogArbiterHost;
+	getSurface(): Component | undefined;
+	getFocus(): Component | null;
+	replaceCalls: Array<{ index: number; component: Component | undefined }>;
+	focusCalls: Array<{ index: number; component: Component | null }>;
+	renderCalls: Array<{ index: number; force: boolean | undefined }>;
+}
+
+function makeMountErrorHostRecorder(option: MountStageOption, stableEditor: Component): MountErrorHostRecorder {
+	const calls = { count: 0 };
+	const threw = { value: false };
+	const surface: { value: Component | undefined } = { value: stableEditor };
+	const focus: { value: Component | null } = { value: stableEditor };
+	const replaceCalls: Array<{ index: number; component: Component | undefined }> = [];
+	const focusCalls: Array<{ index: number; component: Component | null }> = [];
+	const renderCalls: Array<{ index: number; force: boolean | undefined }> = [];
+	const throwOnce = (current: MountStageOption["stage"]): boolean => {
+		if (option.stage !== current || threw.value) return false;
+		threw.value = true;
+		return true;
+	};
+	const host: TestDialogArbiterHost = {
+		replaceEditorSurface: (component?: Component) => {
+			calls.count += 1;
+			if (throwOnce("replace")) throw new Error("mount boom");
+			surface.value = component;
+			replaceCalls.push({ index: calls.count, component });
+		},
+		setFocus: (component: Component | null) => {
+			calls.count += 1;
+			if (throwOnce("focus")) throw new Error("mount boom");
+			focus.value = component;
+			focusCalls.push({ index: calls.count, component });
+		},
+		requestRender: (force?: boolean) => {
+			calls.count += 1;
+			if (throwOnce("render")) throw new Error("mount boom");
+			renderCalls.push({ index: calls.count, force });
+		},
+		getCurrentEditor: () => stableEditor,
+	};
+	return {
+		host,
+		getSurface: () => surface.value,
+		getFocus: () => focus.value,
+		replaceCalls,
+		focusCalls,
+		renderCalls,
 	};
 }
 
@@ -304,102 +408,117 @@ describe("interactive mode share gist loader arbiter migration", () => {
 	});
 
 	test("2. app blocker + fast gist completion: settle before show; loader never constructs; onEvict/delete once", async () => {
-		const h = makeHarness();
-		exportWritesFile();
-		mocks.spawnSync.mockReturnValue({ status: 0 });
-		const proc = makeProc();
-		mocks.spawn.mockReturnValue(proc.proc);
+		// The scoped real-loader lifecycle spy is installed before the share
+		// command runs and stays armed through the complete invocation (every
+		// terminal and late-event assertion below), then restores idempotently.
+		const spy = installLoaderLifecycleSpy();
+		try {
+			const h = makeHarness();
+			exportWritesFile();
+			mocks.spawnSync.mockReturnValue({ status: 0 });
+			const proc = makeProc();
+			mocks.spawn.mockReturnValue(proc.proc);
 
-		// The real-loader construction oracle is armed before the share command
-		// runs: it counts the immediate renders the real Loader performs inside
-		// the BorderedLoader constructor. It must stay at zero for the whole
-		// queued invocation.
-		const loaderStarts = countLoaderStartCalls();
+			const blocker = presentBlocker(h.arbiter);
+			expect(h.editorContainer.children).toEqual([blocker.blocker]);
+			expect(h.arbiter.isBusy()).toBe(true);
 
-		const blocker = presentBlocker(h.arbiter);
-		expect(h.editorContainer.children).toEqual([blocker.blocker]);
-		expect(h.arbiter.isBusy()).toBe(true);
+			const share = handleShareCommand.call(h.target);
+			await flush();
 
-		const share = handleShareCommand.call(h.target);
-		await flush();
+			// The gist process completes while the loader is still queued.
+			proc.writeStdout("https://gist.github.com/octocat/xyz789\n");
+			proc.close(0);
+			await share;
+			await flush();
 
-		// The gist process completes while the loader is still queued.
-		proc.writeStdout("https://gist.github.com/octocat/xyz789\n");
-		proc.close(0);
-		await share;
-		await flush();
+			// The placeholder settled before it could ever be shown: the blocker
+			// still owns the surface, and the real loader was never constructed.
+			// The start counter observes a real constructor side effect (the real
+			// Loader immediately renders and starts its spinner interval), not a
+			// fake: preconstructing the real loader before `present` fails this
+			// oracle red. The count is asserted only after the whole invocation
+			// and its cleanup (settle before show, onEvict) completed.
+			expect(spy.startCalls()).toBe(0);
+			expect(spy.stopCalls()).toBe(0);
+			expect(h.editorContainer.children).toEqual([blocker.blocker]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(blocker.blocker);
+			// The never-mounted request's onEvict is the sole cleanup owner: the
+			// temp file is deleted once and the mounted-dispose path never ran.
+			expect(mocks.unlinkCalls).toEqual([tmpFile()]);
+			expect(fs.existsSync(tmpFile())).toBe(false);
+			expect(h.showStatus).toHaveBeenCalledTimes(1);
+			expect(h.showStatus).toHaveBeenCalledWith(expect.stringContaining("https://pi.dev/session/#xyz789"));
+			expect(h.showError).not.toHaveBeenCalled();
 
-		// The placeholder settled before it could ever be shown: the blocker
-		// still owns the surface, and the real loader was never constructed.
-		// The start counter observes a real constructor side effect (the real
-		// Loader immediately renders and starts its spinner interval), not a
-		// fake: preconstructing the real loader before `present` fails this
-		// oracle red.
-		expect(loaderStarts()).toBe(0);
-		expect(h.editorContainer.children).toEqual([blocker.blocker]);
-		expect(h.setFocus).toHaveBeenLastCalledWith(blocker.blocker);
-		// The never-mounted request's onEvict is the sole cleanup owner: the
-		// temp file is deleted once and the mounted-dispose path never ran.
-		expect(mocks.unlinkCalls).toEqual([tmpFile()]);
-		expect(fs.existsSync(tmpFile())).toBe(false);
-		expect(h.showStatus).toHaveBeenCalledTimes(1);
-		expect(h.showStatus).toHaveBeenCalledWith(expect.stringContaining("https://pi.dev/session/#xyz789"));
-		expect(h.showError).not.toHaveBeenCalled();
-
-		// Settling the blocker restores the current editor.
-		blocker.done("ok");
-		await flush();
-		expect(h.editorContainer.children).toEqual([h.editor]);
-		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
-		expect(h.arbiter.isBusy()).toBe(false);
+			// Settling the blocker restores the current editor.
+			blocker.done("ok");
+			await flush();
+			expect(h.editorContainer.children).toEqual([h.editor]);
+			expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+			expect(h.arbiter.isBusy()).toBe(false);
+		} finally {
+			spy.restore();
+		}
 	});
 
 	test("3. queued loader + pending child + repeated disposeAll: kill/cancel/onEvict/delete once; late close is inert", async () => {
-		const h = makeHarness();
-		exportWritesFile();
-		mocks.spawnSync.mockReturnValue({ status: 0 });
-		const proc = makeProc();
-		mocks.spawn.mockReturnValue(proc.proc);
+		// The scoped spy is installed before the share command and must stay
+		// armed through the repeated disposeAll teardown and the late close, so a
+		// real loader constructed during the queued cancel/onEvict episode (the
+		// old oracle read-and-restored before disposeAll and went stale) is
+		// observed. The zero start-count assertion runs only at the very end.
+		const spy = installLoaderLifecycleSpy();
+		try {
+			const h = makeHarness();
+			exportWritesFile();
+			mocks.spawnSync.mockReturnValue({ status: 0 });
+			const proc = makeProc();
+			mocks.spawn.mockReturnValue(proc.proc);
 
-		const blocker = presentBlocker(h.arbiter);
-		// The real-loader construction oracle is armed before the share command
-		// runs and must stay at zero for the whole queued invocation.
-		const loaderStarts = countLoaderStartCalls();
-		const share = handleShareCommand.call(h.target);
-		await flush();
+			const blocker = presentBlocker(h.arbiter);
+			const share = handleShareCommand.call(h.target);
+			await flush();
 
-		// The loader is queued behind the blocker and was never mounted.
-		expect(h.editorContainer.children).toEqual([blocker.blocker]);
-		// The real loader was never constructed while queued: the oracle counts
-		// the real Loader constructor's immediate start (render + spinner
-		// interval), which a preconstructed loader would leak.
-		expect(loaderStarts()).toBe(0);
+			// The loader is queued behind the blocker and was never mounted.
+			expect(h.editorContainer.children).toEqual([blocker.blocker]);
 
-		// Repeated teardown: the queued request cancels once (killing the owned
-		// child process) and onEvict deletes the temp file once. The mounted
-		// component-dispose path never ran, so onEvict is the sole owner.
-		h.arbiter.disposeAll();
-		h.arbiter.disposeAll();
-		await settleWithin(share);
-		await flush();
+			// Repeated teardown: the queued request cancels once (killing the owned
+			// child process) and onEvict deletes the temp file once. The mounted
+			// component-dispose path never ran, so onEvict is the sole owner. The
+			// spy stays armed across both disposeAll calls and the settle.
+			h.arbiter.disposeAll();
+			h.arbiter.disposeAll();
+			await settleWithin(share);
+			await flush();
 
-		expect(proc.kill).toHaveBeenCalledTimes(1);
-		expect(loaderStarts()).toBe(0);
-		expect(mocks.unlinkCalls).toEqual([tmpFile()]);
-		expect(fs.existsSync(tmpFile())).toBe(false);
-		expect(h.showStatus).not.toHaveBeenCalled();
-		expect(h.showError).not.toHaveBeenCalled();
-		expect(h.editorContainer.children).not.toContain(h.editor);
+			expect(proc.kill).toHaveBeenCalledTimes(1);
+			expect(mocks.unlinkCalls).toEqual([tmpFile()]);
+			expect(fs.existsSync(tmpFile())).toBe(false);
+			expect(h.showStatus).not.toHaveBeenCalled();
+			expect(h.showError).not.toHaveBeenCalled();
+			expect(h.editorContainer.children).not.toContain(h.editor);
 
-		// Late close produces no status/error, cleanup, or UI.
-		const uiCallsAfter = h.setFocus.mock.calls.length + h.requestRender.mock.calls.length;
-		proc.writeStderr("late\n");
-		proc.close(0);
-		await flush();
-		expect(h.setFocus.mock.calls.length + h.requestRender.mock.calls.length).toBe(uiCallsAfter);
-		expect(mocks.unlinkCalls).toEqual([tmpFile()]);
-		expect(h.showStatus).not.toHaveBeenCalled();
-		expect(h.showError).not.toHaveBeenCalled();
+			// Late close produces no status/error, cleanup, or UI.
+			const uiCallsAfter = h.setFocus.mock.calls.length + h.requestRender.mock.calls.length;
+			proc.writeStderr("late\n");
+			proc.close(0);
+			await flush();
+			expect(h.setFocus.mock.calls.length + h.requestRender.mock.calls.length).toBe(uiCallsAfter);
+			expect(mocks.unlinkCalls).toEqual([tmpFile()]);
+			expect(h.showStatus).not.toHaveBeenCalled();
+			expect(h.showError).not.toHaveBeenCalled();
+
+			// The real loader was never constructed across the whole episode: the
+			// oracle counts the real Loader constructor's immediate start (render +
+			// spinner interval), which a preconstructed loader would leak. Asserted
+			// only now, after every terminal and late-event assertion, so the spy
+			// covers construction during disposeAll/onEvict and the late close.
+			expect(spy.startCalls()).toBe(0);
+			expect(spy.stopCalls()).toBe(0);
+		} finally {
+			spy.restore();
+		}
 	});
 
 	test("4. visible loader + pending child + repeated disposeAll + UI stop: kill/dispose/delete once; editor not restored; late close inert", async () => {
@@ -658,75 +777,101 @@ describe("interactive mode share gist loader arbiter migration", () => {
 	});
 
 	test.each([
-		{ stage: "replace", name: "replaceEditorSurface", hostMethod: "replaceEditorSurface" as const },
-		{ stage: "focus", name: "setFocus", hostMethod: "setFocus" as const },
-		{ stage: "render", name: "requestRender", hostMethod: "requestRender" as const },
-	])(
-		"10m. idle sync %s mount throw: rejection before any child start, cleanup once, zero spawn, no gist/cancel/error, no loader residue, arbiter recovers to the stable editor",
-		async ({ hostMethod }) => {
+		{ stage: "replace", name: "replaceEditorSurface" },
+		{ stage: "focus", name: "setFocus" },
+		{ stage: "render", name: "requestRender" },
+	] as const)(
+		"10m. idle sync $stage mount throw: rejection before any child start, cleanup once, zero spawn, no gist/cancel/error, no loader residue, arbiter recovers to the stable editor",
+		async ({ stage }: { stage: "replace" | "focus" | "render" }) => {
 			const unhandled: unknown[] = [];
 			const handler = (reason: unknown) => {
 				unhandled.push(reason);
 			};
 			process.on("unhandledRejection", handler);
+			const spy = installLoaderLifecycleSpy();
 			try {
-				// Only the chosen mount stage throws; the throwing host is wired
-				// into the arbiter at harness construction so the command's own
-				// `this.dialogArbiter` is used. No process double is prepared, so
-				// any spawn attempt fails the zero-spawn assertions. The host
-				// callbacks that follow the throwing stage still run (the real
-				// arbiter's mount sequence), so the editor identity stays stable
-				// and the arbiter restores to idle after the failure.
+				// Only the chosen mount stage throws; the faithful recorder host is
+				// wired into the arbiter at harness construction so the command's own
+				// `this.dialogArbiter` is used. No process double is prepared, so any
+				// spawn attempt fails the zero-spawn assertions. The recorder mutates
+				// its tracked surface/focus exactly like production except at the
+				// selected throwing stage, so the cleanup/restore callbacks that run
+				// after the throw leave the real state transitions the episode must
+				// prove: final surface and focus are the stable editor by identity.
 				const stableEditor = new Container();
-				const throwingHost: TestDialogArbiterHost = {
-					replaceEditorSurface: () => {
-						if (hostMethod === "replaceEditorSurface") throw new Error("mount boom");
-					},
-					setFocus: () => {
-						if (hostMethod === "setFocus") throw new Error("mount boom");
-					},
-					requestRender: () => {
-						if (hostMethod === "requestRender") throw new Error("mount boom");
-					},
-					getCurrentEditor: () => stableEditor,
-				};
-				const h = makeHarness(throwingHost);
-				// The real-loader construction oracle: the loader mounts (and its
-				// real Loader constructor starts once) before the mount throw
-				// settles the request, so a healthy visible mount yields exactly
-				// one loader start; zero would mean the loader was never shown.
-				const loaderStarts = countLoaderStartCalls();
+				const recorder = makeMountErrorHostRecorder({ stage }, stableEditor);
+				const h = makeHarness(recorder.host);
 				mocks.spawnSync.mockReturnValue({ status: 0 });
 				exportWritesFile();
 
 				const share = handleShareCommand.call(h.target);
-				// The request rejection is observed during present, before any
-				// child process could be spawned.
+				// The request rejection is observed during present, before any child
+				// process could be spawned.
 				await flush();
 				await flush();
 
 				expect(mocks.spawn).not.toHaveBeenCalled();
+				expect(unhandled).toEqual([]);
 				// The loader was constructed exactly once for the visible mount and
-				// its mounted-dispose path cleaned up the owned temp file once. A
-				// loader residue (not disposed) or a never-constructed loader (no
-				// mount at all) would fail the loader-start and cleanup assertions.
-				expect(loaderStarts()).toBe(1);
+				// its mounted-dispose path cleaned up the owned temp file once. The
+				// real Loader constructor's `start()` internally calls `stop()` once
+				// (restartAnimation clears the interval first), so exactly one
+				// dispose shows as stop = start + 1: a loader residue (constructed
+				// but never disposed) would leave stop = start, and a never-mounted
+				// cleanup would leave start = 0.
+				expect(spy.startCalls()).toBe(1);
+				expect(spy.stopCalls()).toBe(2);
 				expect(mocks.unlinkCalls).toEqual([tmpFile()]);
 				expect(fs.existsSync(tmpFile())).toBe(false);
-				// The surface is restored to the stable editor identity, never left
-				// blank or pointing at a disposed loader.
-				expect(h.editorContainer.children).toEqual([stableEditor]);
-				// No gist status/error and no cancel feedback: the mount failure is
-				// a dialog-side terminal.
+				// The surface and focus are restored to the stable editor identity,
+				// never left blank, pointing at a disposed loader, or holding an
+				// undefined/wrong editor: identity (toBe), not structural equality.
+				expect(recorder.getSurface()).toBe(stableEditor);
+				expect(recorder.getFocus()).toBe(stableEditor);
+				// No gist status/error and no cancel feedback: the mount failure is a
+				// dialog-side terminal.
 				expect(h.showStatus).not.toHaveBeenCalled();
 				expect(h.showError).not.toHaveBeenCalled();
-				// The outcome settled as a dialog terminal, so the command
-				// returned; the arbiter recovered to idle rather than staying busy.
+				// The callback log proves the selected stage threw and the cleanup/
+				// restore proceeded in the expected ownership order. For the focus and
+				// render stages the mount first handed the surface the loader identity
+				// (recorded, distinct from the stable editor); for the replace stage
+				// the throw happened before any write, so no mount replace is recorded.
+				if (stage === "replace") {
+					expect(recorder.replaceCalls[0].component).toBeUndefined();
+				} else {
+					expect(recorder.replaceCalls[0].component).toBeDefined();
+					expect(recorder.replaceCalls[0].component).not.toBe(stableEditor);
+				}
+				// The mounted cleanup cleared the loader surface (one undefined
+				// replace) before the stable editor was restored by identity as the
+				// last replace and focus; the clear precedes the restore.
+				expect(recorder.replaceCalls.length).toBeGreaterThanOrEqual(2);
+				expect(recorder.replaceCalls.some((call) => call.component === undefined)).toBe(true);
+				expect(recorder.replaceCalls.at(-1)?.component).toBe(stableEditor);
+				expect(recorder.focusCalls.at(-1)?.component).toBe(stableEditor);
+				expect(recorder.renderCalls.length).toBeGreaterThanOrEqual(1);
+				let lastStableIndex = -1;
+				for (let i = recorder.replaceCalls.length - 1; i >= 0; i -= 1) {
+					if (recorder.replaceCalls[i].component === stableEditor) {
+						lastStableIndex = i;
+						break;
+					}
+				}
+				expect(recorder.replaceCalls.findIndex((call) => call.component === undefined)).toBeLessThan(
+					lastStableIndex,
+				);
+				// The outcome settled as a dialog terminal, so the command returned;
+				// the arbiter recovered to idle rather than staying busy, and no
+				// loader identity remains in the surface or focus.
 				await settleWithin(share);
 				expect(h.arbiter.isBusy()).toBe(false);
+				expect(recorder.getSurface()).toBe(stableEditor);
+				expect(recorder.getFocus()).toBe(stableEditor);
 				await flush();
 				expect(unhandled).toEqual([]);
 			} finally {
+				spy.restore();
 				process.removeListener("unhandledRejection", handler);
 			}
 		},
