@@ -116,10 +116,11 @@ Minimal mergeable slice: atomic - 仅非 overlay 分支 + caller-level tests；o
 
 ## 7. 迁移 showSelector 应用选择器
 
-- [ ] 7.1 将 `showSelector` helper 改写为 `arbiter.present`（kind: app，`cancel: () => undefined`），其全部调用方自动经队列，`done` 回调语义不变（二次 `done` 为 no-op，由 arbiter 保证）
-- [ ] 7.2 集成测试：一条经真实 `showSelector` 路径的用例（thinking selector），断言展示、结算、焦点恢复（现有测试 stub 掉了 helper 本体，真实路径当前零覆盖）；一条 `extension select` 与 `showSelector` 反向并发的对称用例（spec"两种先后顺序对称"的真实配对）；断言真实调用方重复 `done()` 时第二次为 no-op
+- [x] 7.1 将 `showSelector` helper 改写为 `arbiter.present`（kind: app，`cancel: () => undefined`），其全部调用方自动经队列，`done` 回调语义不变（二次 `done` 为 no-op，由 arbiter 保证）
+- [x] 7.2 集成测试：一条经真实 `showSelector` 路径的用例（thinking selector），断言展示、结算、焦点恢复（现有测试 stub 掉了 helper 本体，真实路径当前零覆盖）；一条 `extension select` 与 `showSelector` 反向并发的对称用例（spec"两种先后顺序对称"的真实配对）；断言真实调用方重复 `done()` 时第二次为 no-op；一条真实 `resetExtensionUI`/`cancelKind("extension")` 用例断言 visible 或 queued 的 app selector 不被取消、仍可结算（spec「session 切换关闭 extension 对话框」的 app 保留边；完整 session_replaced 场景仍属组 10）。固定 seam 为 `packages/coding-agent/test/interactive-mode-show-selector.test.ts` 与既有 `test/dialog-arbiter.test.ts` / `test/interactive-mode-extension-select.test.ts`；从 `packages/coding-agent` 运行 `npx tsx ../../node_modules/vitest/dist/cli.js --run test/interactive-mode-show-selector.test.ts test/dialog-arbiter.test.ts test/interactive-mode-extension-select.test.ts`，期望退出 0 且 thinking 路径展示/结算/焦点、两种先后顺序对称、二次 done no-op、reset 保留 app selector 全部通过。现有 `interactive-mode-effort-command.test.ts` 继续 stub helper 测命令解析，不替代真实路径。
 
 Suggested fixture level: compact - 一次改写影响 5 个应用选择器且真实路径无既有覆盖，需真实路径集成护栏
+Effective fixture level: expanded - `showSelector` 是五个 app 选择器共享入口，改写接入 FIFO/settle-once/`cancelKind`/`disposeAll` 与 `editorContainer`/focus 所有权，命中 mandatory shared-entrypoint/concurrency trigger 和项目 TUI domain trigger。Selected risk packs: concurrency/shared state/ordering、error handling/rollback、legacy compatibility、TUI focus/render lifecycle、session/extension teardown lifecycle。Public API/CLI、config、file IO、schema、auth、resource limits、release/packaging、documentation 不选：不新增 CLI/wire、无配置/文件/schema、取消语义已由 arbiter `cancel: () => undefined` 继承。
 Minimal mergeable slice: atomic - 单 helper 替换 + 集成护栏，调用方零改动，独立合并保绿
 
 ## 8. 迁移 hot-reload box
