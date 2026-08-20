@@ -420,7 +420,7 @@ describe("interactive mode reload box arbiter migration", () => {
 		expect(h.arbiter.isBusy()).toBe(false);
 	});
 
-	test("visible thinking selector queues the box: reload work completes while thinking stays; box mounts only after thinking settles", async () => {
+	test("settle before show: reload fails while the thinking selector is visible; the placeholder box never mounts", async () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 		const h = makeHarness();
@@ -469,6 +469,71 @@ describe("interactive mode reload box arbiter migration", () => {
 		list.setSelectedIndex(3);
 		list.onSelect?.(list.getSelectedItem()!);
 		await flush();
+		expect(h.editorContainer.children).toEqual([h.editor]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
+		expect(h.arbiter.isBusy()).toBe(false);
+	});
+
+	test("visible thinking selector queues the box: reload stays in flight; the box mounts and force-paints only after thinking settles", async () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const h = makeHarness();
+
+		// Open the real thinking selector; it owns the surface and the arbiter.
+		handleEffortCommand.call(h.target, "");
+		const thinkingSurface = h.editorContainer.children[0];
+		expect(thinkingSurface).toBeInstanceOf(ThinkingSelectorComponent);
+		expect(h.arbiter.isBusy()).toBe(true);
+
+		// Hold the reload in flight: while it is pending the thinking selector must
+		// keep the surface and the box must not mount (FIFO queueing, D3).
+		let rejectReload!: (error: Error) => void;
+		const reloadPending = new Promise<never>((_, reject) => {
+			rejectReload = reject;
+		});
+		prepareReloadTarget(h, () => reloadPending);
+		const reload = handleReloadCommand.call(h.target);
+		let reloadDone = false;
+		void reload.finally(() => {
+			reloadDone = true;
+		});
+
+		await flush();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await flush();
+
+		// Reload work is in flight and the placeholder is queued behind the
+		// thinking selector: thinking still owns the surface.
+		expect(reloadDone).toBe(false);
+		expect(h.editorContainer.children).toEqual([thinkingSurface]);
+		expect(h.editorContainer.children[0]).toBeInstanceOf(ThinkingSelectorComponent);
+		expect(h.arbiter.isBusy()).toBe(true);
+
+		// Settle the thinking selector: the queued placeholder becomes current and
+		// mounts while the reload work is still in flight.
+		const list = (thinkingSurface as ThinkingSelectorComponent).getSelectList();
+		list.setSelectedIndex(3);
+		list.onSelect?.(list.getSelectedItem()!);
+		await flush();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		await flush();
+
+		const reloadBox = h.editorContainer.children[0];
+		expect(reloadBox).toBeDefined();
+		expect(reloadBox).not.toBe(h.editor);
+		expect(reloadBox).not.toBe(thinkingSurface);
+		expect(h.editorContainer.children).toEqual([reloadBox]);
+		expect(h.setFocus).toHaveBeenLastCalledWith(reloadBox);
+		// The placeholder mount force-paints; the editor restore does not.
+		expect(h.requestRender).toHaveBeenLastCalledWith(true);
+		expect(reloadDone).toBe(false);
+		expect(h.arbiter.isBusy()).toBe(true);
+
+		// Fail the reload: the placeholder settles and the current editor restores.
+		rejectReload(new Error("reload failed"));
+		await expect(reload).resolves.toBeUndefined();
+		await flush();
+
 		expect(h.editorContainer.children).toEqual([h.editor]);
 		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
 		expect(h.arbiter.isBusy()).toBe(false);
