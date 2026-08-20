@@ -55,7 +55,10 @@ function countBraces(text: string): number {
 //  - template literals blank their quasi text (including the backticks) but
 //    recursively retain every executable `${...}` expression body, masking the
 //    strings/comments/nested-template quasi inside it, and keeping the `${`/`}`
-//    delimiters so brace depth stays balanced. The retained expression bodies
+//    delimiters so brace depth stays balanced;
+//  - regex literals are blanked (content, character classes and escaped
+//    delimiters) so their braces can never corrupt depth accounting; division
+//    is distinguished by the preceding token. The retained expression bodies
 //    stay scannable; the blanked quasi can never produce a pattern hit.
 function maskLiterals(source: string): string {
 	const masked = [...source];
@@ -127,6 +130,12 @@ function maskLiterals(source: string): string {
 				index = e;
 			} else if (ch === "`") {
 				index = maskTemplate(index);
+			} else if (ch === "/") {
+				if (isRegexStart(source, index)) {
+					index = maskRegex(source, masked, index);
+				} else {
+					index += 1;
+				}
 			} else if (ch === "{") {
 				depth += 1;
 				index += 1;
@@ -169,11 +178,74 @@ function maskLiterals(source: string): string {
 			index = Math.max(endInclusive, index + 1);
 		} else if (ch === "`") {
 			index = maskTemplate(index);
+		} else if (ch === "/") {
+			if (isRegexStart(source, index)) {
+				index = maskRegex(source, masked, index);
+			} else {
+				// Division operator: stays executable, never a regex body.
+				index += 1;
+			}
 		} else {
 			index += 1;
 		}
 	}
 	return masked.join("");
+}
+
+// Regex bodies live inside `maskLiterals` below; these helpers only know the
+// delimiters and the preceding-token rule, not regex syntax.
+const REGEX_START_BEFORE = /[([{,;:=!?&|+\-*%<>~^]/;
+
+// Is the `/` at `index` the start of a regex literal rather than a division
+// operator? After blanking, the previous non-whitespace character decides:
+// expression-start tokens begin a literal, an identifier/closing bracket means
+// division. This is a narrow lexical rule, not a general parser.
+function isRegexStart(source: string, index: number): boolean {
+	let previous = index - 1;
+	while (previous >= 0 && /\s/.test(source[previous]!)) {
+		previous -= 1;
+	}
+	return previous < 0 || REGEX_START_BEFORE.test(source[previous]!);
+}
+
+// Mask one regex literal whose opening `/` sits at `start`: scan forward,
+// treating `[...]` as a character class (so a `/` or `{` inside it is not a
+// delimiter/quantifier) and `\` as escaping the next character. Returns the
+// index just past the closing `/` or `start + 1` when the token is unterminated.
+function maskRegex(source: string, masked: string[], start: number): number {
+	const length = source.length;
+	let index = start + 1;
+	let inClass = false;
+	while (index < length) {
+		const ch = source[index]!;
+		if (ch === "\\") {
+			index += 2;
+			continue;
+		}
+		if (ch === "[") {
+			inClass = true;
+			index += 1;
+			continue;
+		}
+		if (ch === "]") {
+			inClass = false;
+			index += 1;
+			continue;
+		}
+		if (ch === "/" && !inClass) {
+			const endInclusive = index + 1;
+			for (let k = start; k < endInclusive; k++) {
+				masked[k] = source[k] === "\n" ? "\n" : " ";
+			}
+			return endInclusive;
+		}
+		if (ch === "\n") break;
+		index += 1;
+	}
+	// Unterminated: mask only the opening delimiter so following code stays
+	// scannable and the rest keeps its newlines.
+	masked[start] = " ";
+	return start + 1;
 }
 
 // 1-based inclusive line range: `start` is the declaration line, `end` is the
@@ -228,10 +300,14 @@ function findClassMethods(masked: string): OwnerRange[] {
 
 // Arrow-opened blocks (e.g. the constructor's injected `replaceEditorSurface`
 // closure) whose `{` opens at depth >= 2; used to distinguish the arrow body
-// from its enclosing constructor body. Each block is labelled with the arrow's
-// binding name when the arrow is a named property (`key: (arg) => {`) or a
-// const/let declaration; otherwise it stays "arrow".
-function findArrowBlocks(masked: string, source: string): OwnerRange[] {
+// from its enclosing constructor body. Every `=>` token on a line is considered
+// (character-offset level), so same-line nested block arrows and concise
+// expression bodies each establish their own block. Each block carries the
+// global character offset of its `=>` token (innermost selection for same-line
+// arrows) and is labelled with the arrow's binding name when the arrow is a
+// named property (`key: (arg) =>`) or a const/let declaration; otherwise it
+// stays "arrow".
+function findArrowBlocks(masked: string, source: string): Array<OwnerRange & { arrowOffset: number }> {
 	const lines = masked.split("\n");
 	const depths: number[] = [];
 	let depth = 0;
@@ -239,37 +315,54 @@ function findArrowBlocks(masked: string, source: string): OwnerRange[] {
 		depths.push(depth);
 		depth += countBraces(line);
 	}
-	const blocks: OwnerRange[] = [];
+	const lineStarts: number[] = [];
+	let lineStart = 0;
+	for (const line of lines) {
+		lineStarts.push(lineStart);
+		lineStart += line.length + 1;
+	}
+	const blocks: Array<OwnerRange & { arrowOffset: number }> = [];
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index]!;
-		const arrow = line.indexOf("=>");
-		if (arrow === -1) continue;
-		const brace = line.indexOf("{", arrow);
-		if (brace === -1) continue;
 		const pre = depths[index]!;
 		if (pre < 2) continue;
-		let end = lines.length - 1;
-		for (let j = index + 1; j < lines.length; j++) {
-			if (depths[j]! <= pre) {
-				end = j - 1;
-				break;
-			}
+		let searchFrom = 0;
+		let arrow = line.indexOf("=>", searchFrom);
+		while (arrow !== -1) {
+			searchFrom = arrow + 2;
+			const brace = line.indexOf("{", arrow);
+			const end =
+				brace === -1
+					? index + 1
+					: (() => {
+							let j = index + 1;
+							while (j < lines.length && depths[j]! > pre) {
+								j += 1;
+							}
+							return j;
+						})();
+			// 1-based coordinates, same convention as findClassMethods.
+			blocks.push({
+				start: index + 1,
+				end,
+				name: arrowBindingName(source, index, arrow),
+				arrowOffset: lineStarts[index]! + arrow,
+			});
+			arrow = line.indexOf("=>", searchFrom);
 		}
-		// 1-based coordinates, same convention as findClassMethods.
-		blocks.push({ start: index + 1, end: end + 1, name: arrowBindingName(source, index) });
 	}
 	return blocks;
 }
 
 // The arrow body opens on the masked declaration line; find the owning arrow's
 // name from the original source line: the token immediately before `:` (named
-// property like `replaceEditorSurface: (component) => {`) or before `=`
-// (const/let declaration like `const labelled = (...) => {`).
-function arrowBindingName(source: string, lineIndex: number): string {
+// property like `replaceEditorSurface: (component) =>`) or before `=`
+// (const/let declaration like `const labelled = (...) =>`), anchored at this
+// specific `=>` so multiple arrows on one line each resolve to their binding.
+function arrowBindingName(source: string, lineIndex: number, arrowOffset: number): string {
 	const line = source.split("\n")[lineIndex] ?? "";
-	const arrow = line.indexOf("=>");
-	if (arrow === -1) return "arrow";
-	const before = line.slice(0, arrow);
+	if (arrowOffset === -1) return "arrow";
+	const before = line.slice(0, arrowOffset);
 	const colon = before.lastIndexOf(":");
 	const eq = before.lastIndexOf("=");
 	const anchor = Math.max(colon, eq);
@@ -349,12 +442,13 @@ function scanEditorContainerOwners(source: string): OwnerHit[] {
 		const method = resolveMethodOwner(methods, line);
 		const methodLabel = method ? method.name : "<no enclosing class method>";
 
-		// Innermost containing arrow: smallest range wins, ties go to the latest
-		// start so a nested callback declared inside the replaceEditorSurface
-		// arrow is owned by the nested binding, not by the whitelisted arrow.
+		// Innermost containing arrow: smallest range wins, then the `=>` token
+		// whose global character offset is the last one at-or-before the hit, so
+		// a nested callback declared inside the replaceEditorSurface arrow is
+		// owned by the nested binding, never by the whitelisted arrow.
 		const containing = arrows
-			.filter((block) => block.start <= line && line <= block.end)
-			.sort((a, b) => a.end - a.start - (b.end - b.start) || b.start - a.start);
+			.filter((block) => block.start <= line && line <= block.end && block.arrowOffset <= offset)
+			.sort((a, b) => a.end - a.start - (b.end - b.start) || b.arrowOffset - a.arrowOffset);
 		const inArrow = containing[0];
 		if (inArrow) {
 			return {
@@ -1030,6 +1124,169 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		expect(clearFailure).toBeDefined();
 		expect(clearFailure!.owner).toContain("nested");
 		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
+	});
+
+	test("regex literal braces in a whitelisted method cannot extend its range to a later forbidden clear", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A regex whose `{` would, if treated as an executable brace, keep
+		// setCustomEditorComponent's depth from closing, so a later raw clear in
+		// handleAgentsBack would be swallowed by the whitelisted range.
+		const setCustomMarker = "\tprivate setCustomEditorComponent(factory: EditorFactory | undefined): void {";
+		const setCustomIndex = original.indexOf(setCustomMarker);
+		expect(setCustomIndex).toBeGreaterThan(-1);
+		const poisoned =
+			original.slice(0, setCustomIndex) +
+			setCustomMarker +
+			"\n\t\tconst poison = /{/;" +
+			original.slice(setCustomIndex + setCustomMarker.length);
+		const backMarker = "private handleAgentsBack(): boolean {";
+		const backIndex = poisoned.indexOf(backMarker);
+		expect(backIndex).toBeGreaterThan(-1);
+		const injectedClear = "\t\tthis.editorContainer.clear();";
+		const injected =
+			poisoned.slice(0, backIndex) +
+			backMarker +
+			"\n" +
+			injectedClear +
+			poisoned.slice(backIndex + backMarker.length);
+		const clearFailure = scanEditorContainerOwners(injected).find(
+			(failure) => failure.label === "editorContainer.clear(",
+		);
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const expectedClearLine = injected.slice(0, backIndex).split("\n").length + 1;
+		expect(clearFailure!.line).toBe(expectedClearLine);
+	});
+
+	test("regex character classes and escaped delimiters cannot corrupt depth or emit a literal-text hit", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const regexLines = [
+			"\t\tconst classBraces = /[{}\\/\\\\]/g;",
+			"\t\tconst quantifier = /a{2,3}/;",
+			"\t\tconst literalText = /editorContainer.clear()/;",
+		];
+		const injectedClear = "\t\tthis.editorContainer.clear();";
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n" +
+			regexLines.join("\n") +
+			"\n" +
+			injectedClear +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		const clearFailure = hits.find((failure) => failure.label === "editorContainer.clear(");
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const markerLine = injected.slice(0, markerIndex).split("\n").length;
+		expect(clearFailure!.line).toBe(markerLine + 1 + regexLines.length);
+		// The regex bodies are masked: none of their lines produce a pattern hit.
+		const lines = injected.split("\n");
+		for (const regexLine of regexLines) {
+			const regexLineNumber = lines.indexOf(regexLine) + 1;
+			expect(hits.some((failure) => failure.line === regexLineNumber)).toBe(false);
+		}
+	});
+
+	test("division is not consumed as a regex literal and the later forbidden clear is still reported", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const division = "\t\tconst ratio = numerator / denominator;";
+		const injectedClear = "\t\tthis.editorContainer.clear();";
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n" +
+			division +
+			"\n" +
+			injectedClear +
+			original.slice(markerIndex + marker.length);
+		const clearFailure = scanEditorContainerOwners(injected).find(
+			(failure) => failure.label === "editorContainer.clear(",
+		);
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const markerLine = injected.slice(0, markerIndex).split("\n").length;
+		expect(clearFailure!.line).toBe(markerLine + 2);
+	});
+
+	test("a same-line nested block arrow inside replaceEditorSurface is owned by the nested binding", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		// The nested arrow and its clear sit on the same line as the whitelisted
+		// arrow's opening brace; the scanner must not fold them into the parent.
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			" const nested = () => { this.editorContainer.clear(); };" +
+			original.slice(markerIndex + marker.length);
+		const clearFailure = scanEditorContainerOwners(injected).find(
+			(failure) => failure.label === "editorContainer.clear(",
+		);
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toContain("nested");
+		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
+		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length);
+	});
+
+	test("a concise arrow inside replaceEditorSurface is owned by the innermost arrow, not the whitelisted parent", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\t\t\tqueueMicrotask(() => this.editorContainer.clear());" +
+			original.slice(markerIndex + marker.length);
+		const clearFailure = scanEditorContainerOwners(injected).find(
+			(failure) => failure.label === "editorContainer.clear(",
+		);
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toContain("(arrow)");
+		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
+		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length + 1);
+	});
+
+	test("with multiple arrows on one line the hit resolves to the innermost arrow, never the first", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		// Two concise arrows on the whitelisted arrow's own line: only the second's
+		// body contains the raw clear, so the hit must resolve to that binding.
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			" const a = () => 1; const b = () => this.editorContainer.clear();" +
+			original.slice(markerIndex + marker.length);
+		const clearFailure = scanEditorContainerOwners(injected).find(
+			(failure) => failure.label === "editorContainer.clear(",
+		);
+		expect(clearFailure).toBeDefined();
+		expect(clearFailure!.owner).toBe("constructor > b (arrow)");
+		expect(clearFailure!.owner).not.toContain("> a (arrow)");
+		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
+		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length);
 	});
 
 	test("teardownSessionUi body calls real this.stop before stopThemeWatcher without fixed lines", () => {
