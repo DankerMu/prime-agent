@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type Component, Container, setKeybindings } from "@earendil-works/pi-tui";
+import { type Component, Container, Loader, setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { BorderedLoader } from "../src/modes/interactive/components/bordered-loader.js";
@@ -172,6 +172,29 @@ function tmpFile(): string {
 	return calls[calls.length - 1][0]!;
 }
 
+// Real-loader construction oracle. The real BorderedLoader constructor builds
+// a real pi-tui Loader, whose constructor immediately calls `start()`: that
+// runs the real immediate render (`ui.requestRender`) and starts the real
+// spinner interval. Counting `Loader.prototype.start` therefore proves whether
+// the real loader was ever constructed, while keeping every real render/timer
+// behavior intact. It is a public class method, so a prototype spy is
+// installable; no fake component bypasses the real loader semantics. A loader
+// preconstructed before `present` (whose interval would otherwise leak unseen)
+// fails the oracle red.
+function countLoaderStartCalls(): () => number {
+	const proto = Loader.prototype as { start: () => void };
+	const original = proto.start;
+	let calls = 0;
+	proto.start = function (this: unknown) {
+		calls += 1;
+		return original.call(this);
+	};
+	return () => {
+		proto.start = original;
+		return calls;
+	};
+}
+
 // A deferred export producer: resolves with the path without writing anything.
 function deferredExport(): { path: () => string; resolve: () => void; reject: (error: unknown) => void } {
 	let resolve!: () => void;
@@ -280,12 +303,18 @@ describe("interactive mode share gist loader arbiter migration", () => {
 		expect(h.setFocus).toHaveBeenLastCalledWith(h.editor);
 	});
 
-	test("2. app blocker + fast gist completion: settle before show; loader never mounts; onEvict/delete once", async () => {
+	test("2. app blocker + fast gist completion: settle before show; loader never constructs; onEvict/delete once", async () => {
 		const h = makeHarness();
 		exportWritesFile();
 		mocks.spawnSync.mockReturnValue({ status: 0 });
 		const proc = makeProc();
 		mocks.spawn.mockReturnValue(proc.proc);
+
+		// The real-loader construction oracle is armed before the share command
+		// runs: it counts the immediate renders the real Loader performs inside
+		// the BorderedLoader constructor. It must stay at zero for the whole
+		// queued invocation.
+		const loaderStarts = countLoaderStartCalls();
 
 		const blocker = presentBlocker(h.arbiter);
 		expect(h.editorContainer.children).toEqual([blocker.blocker]);
@@ -301,9 +330,16 @@ describe("interactive mode share gist loader arbiter migration", () => {
 		await flush();
 
 		// The placeholder settled before it could ever be shown: the blocker
-		// still owns the surface and the loader was never constructed/mounted.
+		// still owns the surface, and the real loader was never constructed.
+		// The start counter observes a real constructor side effect (the real
+		// Loader immediately renders and starts its spinner interval), not a
+		// fake: preconstructing the real loader before `present` fails this
+		// oracle red.
+		expect(loaderStarts()).toBe(0);
 		expect(h.editorContainer.children).toEqual([blocker.blocker]);
 		expect(h.setFocus).toHaveBeenLastCalledWith(blocker.blocker);
+		// The never-mounted request's onEvict is the sole cleanup owner: the
+		// temp file is deleted once and the mounted-dispose path never ran.
 		expect(mocks.unlinkCalls).toEqual([tmpFile()]);
 		expect(fs.existsSync(tmpFile())).toBe(false);
 		expect(h.showStatus).toHaveBeenCalledTimes(1);
@@ -326,20 +362,29 @@ describe("interactive mode share gist loader arbiter migration", () => {
 		mocks.spawn.mockReturnValue(proc.proc);
 
 		const blocker = presentBlocker(h.arbiter);
+		// The real-loader construction oracle is armed before the share command
+		// runs and must stay at zero for the whole queued invocation.
+		const loaderStarts = countLoaderStartCalls();
 		const share = handleShareCommand.call(h.target);
 		await flush();
 
 		// The loader is queued behind the blocker and was never mounted.
 		expect(h.editorContainer.children).toEqual([blocker.blocker]);
+		// The real loader was never constructed while queued: the oracle counts
+		// the real Loader constructor's immediate start (render + spinner
+		// interval), which a preconstructed loader would leak.
+		expect(loaderStarts()).toBe(0);
 
 		// Repeated teardown: the queued request cancels once (killing the owned
-		// child process) and onEvict deletes the temp file once.
+		// child process) and onEvict deletes the temp file once. The mounted
+		// component-dispose path never ran, so onEvict is the sole owner.
 		h.arbiter.disposeAll();
 		h.arbiter.disposeAll();
 		await settleWithin(share);
 		await flush();
 
 		expect(proc.kill).toHaveBeenCalledTimes(1);
+		expect(loaderStarts()).toBe(0);
 		expect(mocks.unlinkCalls).toEqual([tmpFile()]);
 		expect(fs.existsSync(tmpFile())).toBe(false);
 		expect(h.showStatus).not.toHaveBeenCalled();
@@ -612,54 +657,80 @@ describe("interactive mode share gist loader arbiter migration", () => {
 		expect(h.showError).not.toHaveBeenCalled();
 	});
 
-	test("10m. idle sync mount throw (replaceEditorSurface): rejection during present, cleanup once, zero spawn, no gist outcome, no unhandled rejection", async () => {
-		const unhandled: unknown[] = [];
-		const handler = (reason: unknown) => {
-			unhandled.push(reason);
-		};
-		process.on("unhandledRejection", handler);
-		try {
-			// Only the mount throw drives this scenario; no process double is
-			// prepared, so any spawn attempt fails the zero-spawn assertions. The
-			// throwing host is wired into the arbiter at harness construction so
-			// the command's own `this.dialogArbiter` is used. The preserved-editor
-			// identity is stable so the arbiter restores to idle after the mount
-			// failure.
-			const stableEditor = new Container();
-			const h = makeHarness({
-				replaceEditorSurface: () => {
-					throw new Error("mount boom");
-				},
-				setFocus: () => {},
-				requestRender: () => {},
-				getCurrentEditor: () => stableEditor,
-			});
-			mocks.spawnSync.mockReturnValue({ status: 0 });
-			exportWritesFile();
+	test.each([
+		{ stage: "replace", name: "replaceEditorSurface", hostMethod: "replaceEditorSurface" as const },
+		{ stage: "focus", name: "setFocus", hostMethod: "setFocus" as const },
+		{ stage: "render", name: "requestRender", hostMethod: "requestRender" as const },
+	])(
+		"10m. idle sync %s mount throw: rejection before any child start, cleanup once, zero spawn, no gist/cancel/error, no loader residue, arbiter recovers to the stable editor",
+		async ({ hostMethod }) => {
+			const unhandled: unknown[] = [];
+			const handler = (reason: unknown) => {
+				unhandled.push(reason);
+			};
+			process.on("unhandledRejection", handler);
+			try {
+				// Only the chosen mount stage throws; the throwing host is wired
+				// into the arbiter at harness construction so the command's own
+				// `this.dialogArbiter` is used. No process double is prepared, so
+				// any spawn attempt fails the zero-spawn assertions. The host
+				// callbacks that follow the throwing stage still run (the real
+				// arbiter's mount sequence), so the editor identity stays stable
+				// and the arbiter restores to idle after the failure.
+				const stableEditor = new Container();
+				const throwingHost: TestDialogArbiterHost = {
+					replaceEditorSurface: () => {
+						if (hostMethod === "replaceEditorSurface") throw new Error("mount boom");
+					},
+					setFocus: () => {
+						if (hostMethod === "setFocus") throw new Error("mount boom");
+					},
+					requestRender: () => {
+						if (hostMethod === "requestRender") throw new Error("mount boom");
+					},
+					getCurrentEditor: () => stableEditor,
+				};
+				const h = makeHarness(throwingHost);
+				// The real-loader construction oracle: the loader mounts (and its
+				// real Loader constructor starts once) before the mount throw
+				// settles the request, so a healthy visible mount yields exactly
+				// one loader start; zero would mean the loader was never shown.
+				const loaderStarts = countLoaderStartCalls();
+				mocks.spawnSync.mockReturnValue({ status: 0 });
+				exportWritesFile();
 
-			const share = handleShareCommand.call(h.target);
-			// The request rejection is observed during present, before any child
-			// process could be spawned.
-			await flush();
-			await flush();
+				const share = handleShareCommand.call(h.target);
+				// The request rejection is observed during present, before any
+				// child process could be spawned.
+				await flush();
+				await flush();
 
-			expect(mocks.spawn).not.toHaveBeenCalled();
-			// Cleanup once: the never-mounted request's onEvict deletes the owned
-			// temp file (the loader was never constructed, so dispose never ran).
-			expect(mocks.unlinkCalls).toEqual([tmpFile()]);
-			expect(fs.existsSync(tmpFile())).toBe(false);
-			// No gist status/error: the mount failure is a dialog-side terminal.
-			expect(h.showStatus).not.toHaveBeenCalled();
-			expect(h.showError).not.toHaveBeenCalled();
-			// The outcome settled as a dialog terminal, so the command returned.
-			await settleWithin(share);
-			expect(h.arbiter.isBusy()).toBe(false);
-			await flush();
-			expect(unhandled).toEqual([]);
-		} finally {
-			process.removeListener("unhandledRejection", handler);
-		}
-	});
+				expect(mocks.spawn).not.toHaveBeenCalled();
+				// The loader was constructed exactly once for the visible mount and
+				// its mounted-dispose path cleaned up the owned temp file once. A
+				// loader residue (not disposed) or a never-constructed loader (no
+				// mount at all) would fail the loader-start and cleanup assertions.
+				expect(loaderStarts()).toBe(1);
+				expect(mocks.unlinkCalls).toEqual([tmpFile()]);
+				expect(fs.existsSync(tmpFile())).toBe(false);
+				// The surface is restored to the stable editor identity, never left
+				// blank or pointing at a disposed loader.
+				expect(h.editorContainer.children).toEqual([stableEditor]);
+				// No gist status/error and no cancel feedback: the mount failure is
+				// a dialog-side terminal.
+				expect(h.showStatus).not.toHaveBeenCalled();
+				expect(h.showError).not.toHaveBeenCalled();
+				// The outcome settled as a dialog terminal, so the command
+				// returned; the arbiter recovered to idle rather than staying busy.
+				await settleWithin(share);
+				expect(h.arbiter.isBusy()).toBe(false);
+				await flush();
+				expect(unhandled).toEqual([]);
+			} finally {
+				process.removeListener("unhandledRejection", handler);
+			}
+		},
+	);
 
 	test("10s. visible cancel with a synchronous close from kill(): cancel edge wins, one 'Share cancelled', kill once, cleanup/restore once", async () => {
 		const h = makeHarness();
