@@ -108,6 +108,21 @@
 - WHEN 携带 `onEvict` 的请求在未展示状态下被移除（abort、settle、cancelKind、dispose 任一路径）
 - THEN 其 `onEvict` 被调用恰好一次（调用点得以清理临时文件、事件监听等资源），且与结算合计各恰好发生一次
 
+#### Scenario: gist loader 的文件与子进程 ownership 在任一终止边闭合
+
+- WHEN `/share` 已开始 export，随后 gist loader 在 queued 或 visible 状态被用户取消/session dispose，或 export/gist 子进程失败或完成，并且子进程 close/error 与该终止边以任一顺序竞争
+- THEN 第一条终止边决定结果；活动的所属子进程在取消/dispose 时 kill 恰好一次；部分或完整临时导出文件由未挂载 `onEvict` 或已挂载组件 dispose 的互斥 owner 删除恰好一次；迟到 close/error 不产生第二次结算、清理、状态/错误反馈或 teardown 后 UI 调用
+
+#### Scenario: 并发 share invocation 的临时文件互不干扰
+
+- WHEN 两次 `/share` 在前一次 export/gist 尚未完成时并发开始，且两条子进程以反向顺序完成或其中一条取消
+- THEN 两次 invocation 使用不同 temp path，各子进程只读取自己的文件；任一请求清理只删除自己的 path，不影响另一条仍在使用的文件、结算与输出
+
+#### Scenario: gist 认证失败不取得临时文件 ownership
+
+- WHEN `/share` 的 `gh auth status` preflight 失败且临时目录中已有同名文件
+- THEN 不调用 export、不创建 arbiter 请求且不删除该既有文件，只保留既有认证错误反馈
+
 ### Requirement: 焦点与编辑器恢复
 
 对话框结算后，arbiter MUST 将 editor-surface 恢复为**结算时刻**的当前编辑器并将焦点交还给它；恢复目标 MUST 动态获取，不得使用入队时捕获的编辑器引用。

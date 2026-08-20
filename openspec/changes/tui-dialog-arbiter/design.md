@@ -96,7 +96,10 @@ present<T>(request: {
 
 **D3：reload box 与 gist loader 也走队列。**
 它们同样占用 editor-surface；不入队就仍是互踩源。二者经 D1 的 `settle` 句柄结算：结算先于展示到达时直接移除不展示（陈旧占位框不上屏）。重载/导出流程本身**不等待占位框展示**——占位框只是可见反馈；队列空时保留现有 `requestRender(true) + nextTick` 先画后干时序，队列非空时流程照常推进。
-备选：改成 overlay——被否：改变现有 UX 且超出本切片范围。
+
+gist loader 额外持有本次 export 的临时文件与活动 `gh gist create` 子进程。每次 invocation 使用独立、不可冲突的 temp path，禁止复用进程级 `session.html`；文件 ownership 仅在 export 开始后建立，并收敛为带 once guard 的 invocation-local 幂等清理函数：已挂载项由组件 `dispose` 调用，未挂载项由 `onEvict` 调用，二者按 D1 ownership 互斥；export reject 即使留下部分文件也由同一函数回滚。用户 abort 经 `show` 内 `done`，terminal `disposeAll` 经 request `cancel`；两者都杀死尚活跃的所属子进程。命令以对称 tagged Promise 同时观察 arbiter result 与子进程 completion，使 process-first 与 cancel-first 都由真正先到的终止边胜出；迟到 close/error 只被观察，不得二次结算、清理或触碰已停止 UI。认证 preflight 失败发生在 export/ownership 之前，不得删除同名既有文件；export 尚未创建 arbiter request 时发生 terminal teardown，则只清理本次 path，不再发出 UI error 或启动子进程。
+
+备选：(a) 改成 overlay——被否：改变现有 UX 且超出本切片范围；(b) 只在 loader `onAbort` 杀进程/删文件——被否：queued 项和 terminal teardown 不经过 mounted callback，会继续泄漏资源并允许迟到 UI。
 
 **D4：settle-once 由 arbiter 强制；强制关闭是第一类批量结算入口。**
 `done`/`settle`、abort、构造失败、dispose、强制关闭的竞争由内部状态机裁决，后到的结算调用是 no-op（不 throw，不二次 resolve）。三个批量/生命周期入口：

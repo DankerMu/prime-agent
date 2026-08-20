@@ -9008,85 +9008,189 @@ export class InteractiveMode {
 			return;
 		}
 
-		// Export to a temp file
-		const tmpFile = path.join(os.tmpdir(), "session.html");
-		try {
-			await this.agentConnection.exportToHtml(tmpFile);
-		} catch (error: unknown) {
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
-			return;
-		}
-
-		// Show cancellable loader, replacing the editor
-		const loader = new BorderedLoader(this.ui, theme, "Creating gist...");
-		this.editorContainer.clear();
-		this.editorContainer.addChild(loader);
-		this.ui.setFocus(loader);
-		this.ui.requestRender();
-
-		const restoreEditor = () => {
-			loader.dispose();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
+		// One unique temp path per invocation, generated only after the auth
+		// preflight succeeds: a preflight failure never takes ownership of a
+		// pre-existing same-name file. The path is owned from here on; the export
+		// reject and the arbiter request below both roll it back exactly once.
+		const tmpFile = path.join(os.tmpdir(), `session-${randomUUID()}.html`);
+		let cleaned = false;
+		const cleanupFile = () => {
+			if (cleaned) return;
+			cleaned = true;
 			try {
 				fs.unlinkSync(tmpFile);
 			} catch {
-				// Ignore cleanup errors
+				// The file may already be gone or the invocation may have moved on.
 			}
 		};
-
-		// Create a secret gist asynchronously
-		let proc: ReturnType<typeof spawn> | null = null;
-
-		loader.onAbort = () => {
-			proc?.kill();
-			restoreEditor();
-			this.showStatus("Share cancelled");
-		};
-
 		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
-				let stdout = "";
-				let stderr = "";
-				proc.stdout?.on("data", (data) => {
-					stdout += data.toString();
-				});
-				proc.stderr?.on("data", (data) => {
-					stderr += data.toString();
-				});
-				proc.on("close", (code) => resolve({ stdout, stderr, code }));
-			});
-
-			if (loader.signal.aborted) return;
-
-			restoreEditor();
-
-			if (result.code !== 0) {
-				const errorMsg = result.stderr?.trim() || "Unknown error";
-				this.showError(`Failed to create gist: ${errorMsg}`);
-				return;
-			}
-
-			// Extract gist ID from the URL returned by gh
-			// gh returns something like: https://gist.github.com/username/GIST_ID
-			const gistUrl = result.stdout?.trim();
-			const gistId = gistUrl?.split("/").pop();
-			if (!gistId) {
-				this.showError("Failed to parse gist ID from gh output");
-				return;
-			}
-
-			// Create the preview URL
-			const previewUrl = getShareViewerUrl(gistId);
-			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
+			await this.agentConnection.exportToHtml(tmpFile);
 		} catch (error: unknown) {
-			if (!loader.signal.aborted) {
-				restoreEditor();
-				this.showError(`Failed to create gist: ${error instanceof Error ? error.message : "Unknown error"}`);
+			cleanupFile();
+			if (this.isInitialized) {
+				this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
 			}
+			return;
 		}
+
+		// The loader is presented through the arbiter (kind: placeholder). On an
+		// idle arbiter `show` runs synchronously inside `present`, so the loader
+		// mounts and is painted before this command returns; on a busy arbiter it
+		// queues and the gist work below proceeds without waiting for it. The
+		// invocation owns its temp path: the mounted loader's dispose (wrapped
+		// below) or the never-mounted request's onEvict call cleanupFile exactly
+		// once, the two owners being mutually exclusive per mount ownership.
+		let proc: ReturnType<typeof spawn> | null = null;
+		// Idempotent process kill: a dialog terminal (cancel/dispose/error) kills
+		// the active owned process at most once; a process that already won the
+		// outcome suppresses any later kill and its cancel feedback.
+		let killed = false;
+		// Request-local terminal claim: the first edge in actual event order to
+		// claim it is the outcome. `dialogTerminal` claims atomically before
+		// killing so a synchronous close from kill() cannot preempt it, and
+		// `finishProcess` observes the same claim so a close/error after a dialog
+		// claim is inert while a process claim suppresses later cancel feedback.
+		let terminal: "dialog" | "process" | undefined;
+		const killProcess = () => {
+			if (killed || terminal === "process") return;
+			killed = true;
+			try {
+				proc?.kill();
+			} catch {
+				// The process may already be gone.
+			}
+		};
+		// The first terminal edge in actual event order wins. Both the child
+		// outcome and the dialog terminal resolve this promise directly with no
+		// extra .then hop, so a close that fires before a same-turn cancel still
+		// wins and vice versa. The child result travels with the process outcome.
+		let resolveOutcome!: (outcome: {
+			process: boolean;
+			child?: { code: number | null; stdout: string; stderr: string };
+		}) => void;
+		const outcome = new Promise<{
+			process: boolean;
+			child?: { code: number | null; stdout: string; stderr: string };
+		}>((resolve) => {
+			resolveOutcome = resolve;
+		});
+		// The first terminal edge in actual event order wins: a dialog terminal
+		// claims the invocation synchronously before any kill, so a process close
+		// that fires inside kill() cannot overtake it. The child result travels
+		// with the process outcome.
+		const dialogTerminal = (): boolean => {
+			if (terminal !== undefined) return terminal === "dialog";
+			terminal = "dialog";
+			killProcess();
+			resolveOutcome({ process: false });
+			return true;
+		};
+		const handle = this.dialogArbiter.present<void>({
+			kind: "placeholder",
+			cancel: () => {
+				dialogTerminal();
+				return undefined;
+			},
+			onEvict: () => cleanupFile(),
+			show: (done) => {
+				const loader = new BorderedLoader(this.ui, theme, "Creating gist...");
+				const originalDispose = loader.dispose;
+				loader.dispose = () => {
+					originalDispose.call(loader);
+					cleanupFile();
+				};
+				loader.onAbort = () => {
+					// User-cancel feedback depends on the atomic claim, not on a
+					// separate processDone read: a synchronous close from kill()
+					// cannot overtake the claim made here.
+					const won = dialogTerminal();
+					done();
+					if (won && this.isInitialized) {
+						this.showStatus("Share cancelled");
+					}
+				};
+				return { component: loader, focus: loader };
+			},
+		});
+		// A mount/construction error rejects the handle without a dialog-side
+		// terminal: this fallback still settles the outcome as a dialog terminal.
+		void handle.result.then(
+			() => {},
+			() => dialogTerminal(),
+		);
+		// A synchronous mount/construction rejection is settled by the arbiter
+		// inside `present`; settle one microtask so it is observed before any
+		// child is started. A claimed (or queued/visible healthy) request does
+		// not block its process from starting.
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+		if (terminal === "dialog") return;
+
+		// Session teardown may have stopped the host while the export was in
+		// flight: the request already settled (file cleaned via onEvict) and no
+		// surface may be touched or child started after stop.
+		if (!this.isInitialized) return;
+
+		// Create a secret gist asynchronously. The child result is collected here
+		// and delivered through the outcome; close and error both finish it, and
+		// a synchronous spawn throw enters the same process-error outcome.
+		let stdout = "";
+		let stderr = "";
+		const finishProcess = (code: number | null, out: string, err: string) => {
+			if (terminal === "dialog") return;
+			// The process edge claims the invocation: a later dialog terminal
+			// (cancel/dispose/error) stays inert, and a later close/error cannot
+			// settle twice.
+			if (terminal === "process") return;
+			terminal = "process";
+			resolveOutcome({ process: true, child: { code, stdout: out, stderr: err } });
+		};
+		try {
+			proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+			proc.stdout?.on("data", (data) => {
+				stdout += data.toString();
+			});
+			proc.stderr?.on("data", (data) => {
+				stderr += data.toString();
+			});
+			proc.on("close", (code) => finishProcess(code, stdout, stderr));
+			proc.on("error", (error: Error) => finishProcess(null, stdout, error.message));
+		} catch (error: unknown) {
+			finishProcess(null, "", error instanceof Error ? error.message : String(error));
+		}
+
+		const outcomeResult = await outcome;
+
+		// The dialog settled first (user cancel, session dispose, or a mount
+		// error): the loader's onAbort or the request cancel already killed the
+		// child, the arbiter already ran mounted-dispose or onEvict cleanup, and
+		// the cancel feedback was already given. A late close must not produce
+		// any further settlement, cleanup, status/error, or UI write.
+		if (!outcomeResult.process) return;
+
+		// The process completed first: settle the loader through the handle
+		// before any share status/error (mount-or-evict cleanup then runs).
+		handle.settle(undefined);
+
+		if (!this.isInitialized) return;
+		const childResult = outcomeResult.child!;
+		if (childResult.code !== 0) {
+			const errorMsg = childResult.stderr?.trim() || "Unknown error";
+			this.showError(`Failed to create gist: ${errorMsg}`);
+			return;
+		}
+
+		// Extract gist ID from the URL returned by gh
+		// gh returns something like: https://gist.github.com/username/GIST_ID
+		const gistUrl = childResult.stdout?.trim();
+		const gistId = gistUrl?.split("/").pop();
+		if (!gistId) {
+			this.showError("Failed to parse gist ID from gh output");
+			return;
+		}
+
+		// Create the preview URL
+		const previewUrl = getShareViewerUrl(gistId);
+		this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
 	}
 
 	private async handleCopyCommand(): Promise<void> {
