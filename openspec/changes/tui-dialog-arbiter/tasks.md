@@ -125,10 +125,11 @@ Minimal mergeable slice: atomic - 单 helper 替换 + 集成护栏，调用方�
 
 ## 8. 迁移 hot-reload box
 
-- [ ] 8.1 将 `handleReloadCommand` 的 reload box 展示/dismiss 改写为 `arbiter.present`（kind: placeholder，`cancel: () => undefined`）：结算经 `settle` 句柄统一成功/失败分支，失败分支的 `previousEditor` 回退收敛为动态恢复目标（design D7）；命令开头的 `resetExtensionUI` 先行执行 `cancelKind`，占位框随后入队；队列空时保留 `requestRender(true) + nextTick` 先画后干时序，重载流程不等待占位框展示
-- [ ] 8.2 行为测试：reload 失败分支结算后容器为结算时刻的当前编辑器（期间发生编辑器替换时不回退旧引用）；`settle` 先于展示到达时占位框整体略过且重载正常完成
+- [x] 8.1 将 `handleReloadCommand` 的 reload box 展示/dismiss 改写为 `arbiter.present`（kind: placeholder，`cancel: () => undefined`）：结算经 `settle` 句柄统一成功/失败分支，失败分支的 `previousEditor` 回退收敛为动态恢复目标（design D7）；命令开头的 `resetExtensionUI` 先行执行 `cancelKind("extension")`，占位框随后入队；队列空时保留 `requestRender(true) + nextTick` 先画后干时序（若 arbiter host 的 `requestRender()` 目前无参，本任务把 host 扩展为可传 `force?: boolean` 并注入 `this.ui.requestRender`，使 placeholder 挂载能 force-paint；普通 dialog 挂载/恢复仍走默认非 force），重载流程不等待占位框展示。issue #9 为 raw box 加的 `cancelKind("app")` + `isBusy()` 单微任务等待在本任务删除：app selector 未结算时占位框排队，不再抢 surface。
+- [x] 8.2 行为测试：reload 失败分支结算后容器为结算时刻的当前编辑器（期间发生编辑器替换时不回退旧引用）；`settle` 先于展示到达时占位框整体略过且重载正常完成；空闲时 box 在返回的 Promise 被 await 前同步挂载（先画后干）；真实 `handleReloadCommand` 在 thinking/app selector 可见时**不** `cancelKind("app")`，box 排队不抢 surface，reload 流程不等待 box 完成，selector 结算后若 placeholder 尚未 settle 才展示；真实 `/reload` 对可见 extension select 先经 `resetExtensionUI`/`cancelKind("extension")` 结算 select，随后 placeholder 入队/展示（spec「/reload 期间的强制关闭与占位框共存」；「非交互占位同样排队」的未取消可见项用 app selector 证明，因为生产 reload 会先取消 extension）。固定 seam 为 `packages/coding-agent/test/interactive-mode-reload-box.test.ts`，并更新既有 `test/interactive-mode-extension-select.test.ts` / `test/interactive-mode-show-selector.test.ts` 中依赖 raw box 或「reload 取消 app」的断言。从 `packages/coding-agent` 运行 `npx tsx ../../node_modules/vitest/dist/cli.js --run test/interactive-mode-reload-box.test.ts test/interactive-mode-extension-select.test.ts test/interactive-mode-show-selector.test.ts test/dialog-arbiter.test.ts`，期望退出 0。
 
 Suggested fixture level: compact - 涉及外部结算时序与一处已声明行为变更，需专门场景验证
+Effective fixture level: expanded - `handleReloadCommand` 是共享 editor-surface 入口，接入 FIFO/外部 settle/`cancelKind` 与 `editorContainer`/focus 所有权，并改变失败恢复目标（D7(2)），命中 mandatory shared-entrypoint/concurrency trigger 和项目 TUI domain trigger。Selected risk packs: concurrency/shared state/ordering、error handling/rollback、legacy compatibility、TUI focus/render lifecycle、session/extension teardown lifecycle。Public API/CLI、config、file IO、schema、auth、resource limits、release/packaging、documentation 不选：不新增 CLI/wire、无配置/文件/schema；gist 临时文件属组 9。
 Minimal mergeable slice: atomic - 单调用点 + 配套测试，独立合并保绿
 
 ## 9. 迁移 gist export loader

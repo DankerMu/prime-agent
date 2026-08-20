@@ -60,7 +60,7 @@ function makeHarness(rows = 24, userBindings: KeybindingsConfig = {}): Harness {
 			if (component) editorContainer.addChild(component);
 		},
 		setFocus: (component) => setFocus(component),
-		requestRender: () => requestRender(),
+		requestRender: (force?: boolean) => requestRender(force),
 		getCurrentEditor: () => editor,
 	});
 	const target = Object.assign(Object.create(InteractiveMode.prototype) as InteractiveMode, {
