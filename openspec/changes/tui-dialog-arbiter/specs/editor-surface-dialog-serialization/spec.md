@@ -192,8 +192,8 @@ extension `select`/`input`/`editor`（`confirm` 由 `select` 组合实现，随 
 
 #### Scenario: 非交互占位同样排队
 
-- WHEN extension `select` 对话框展示期间触发 hot-reload
-- THEN reload box 排队等待而不清空 select 对话框；select 结算后 reload box 展示（若其 settle 尚未到达），重载流程本身不等待占位框展示、照常完成
+- WHEN 应用 `showSelector` 选择器展示期间触发 hot-reload
+- THEN reload box 排队等待而不清空应用选择器；选择器结算后 reload box 展示（若其 settle 尚未到达），重载流程本身不等待占位框展示、照常完成；extension 对话框则按 `/reload` 的既有 `resetExtensionUI` 语义先经 `cancelKind("extension")` 结算
 
 ### Requirement: 单对话框行为保持不变
 
