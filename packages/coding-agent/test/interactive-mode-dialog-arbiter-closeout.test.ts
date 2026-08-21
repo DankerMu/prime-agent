@@ -3,29 +3,39 @@ import { type Component, Container, setKeybindings } from "@earendil-works/pi-tu
 import {
 	type CallExpression,
 	type ClassDeclaration,
+	type ClassExpression,
+	type ExpressionStatement,
 	type FunctionLikeDeclaration,
+	type ImportSpecifier,
 	isArrowFunction,
 	isBinaryExpression,
 	isCallExpression,
 	isClassDeclaration,
+	isClassExpression,
 	isConstructorDeclaration,
+	isExpressionStatement,
 	isFunctionDeclaration,
 	isFunctionExpression,
 	isGetAccessorDeclaration,
 	isIdentifier,
+	isImportDeclaration,
+	isImportSpecifier,
 	isMethodDeclaration,
+	isNamedImports,
 	isNewExpression,
 	isObjectLiteralExpression,
 	isPropertyAccessExpression,
 	isPropertyAssignment,
 	isSetAccessorDeclaration,
+	isStringLiteral,
+	isThisExpression,
 	isVariableDeclaration,
 	type MethodDeclaration,
 	type Node,
 	type SourceFile,
 } from "typescript/unstable/ast";
 import { createVirtualFileSystem } from "typescript/unstable/fs";
-import { API } from "typescript/unstable/sync";
+import { API, type Checker } from "typescript/unstable/sync";
 import { afterAll, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ExtensionEditorComponent } from "../src/modes/interactive/components/extension-editor.js";
@@ -95,9 +105,18 @@ function initOracle(): void {
 	});
 }
 
-// Create the successor snapshot before disposing the prior one; AST nodes must
-// never be retained across updates.
-function parseSource(source: string): SourceFile {
+// One parsed source snapshot plus the project checker bound to that snapshot.
+// AST nodes and the checker are only valid until the next updateSnapshot, so
+// every scan builds a fresh context and never retains nodes/checker across
+// snapshots.
+interface ParseContext {
+	sourceFile: SourceFile;
+	checker: Checker;
+}
+
+// Create the successor snapshot before disposing the prior one; AST nodes and
+// the checker must never be retained across updates.
+function parseSource(source: string): ParseContext {
 	initOracle();
 	virtualWrite(oracleFs!, VIRTUAL_TS, source);
 	const next = oracleApi!.updateSnapshot({ fileChanges: { changed: [VIRTUAL_TS] } });
@@ -121,7 +140,7 @@ function parseSource(source: string): SourceFile {
 			.join("; ");
 		throw new Error(`syntactic diagnostic in mutation source: ${detail}`);
 	}
-	return sourceFile;
+	return { sourceFile, checker: project.checker };
 }
 
 function isFunctionLikeDeclaration(node: Node): node is FunctionLikeDeclaration {
@@ -136,12 +155,28 @@ function isFunctionLikeDeclaration(node: Node): node is FunctionLikeDeclaration 
 	);
 }
 
+// The first class declaration/expression encountered when walking up from
+// `node`, or undefined when none separates `node` from its owning function.
+function nearestClassBoundary(node: Node): ClassDeclaration | ClassExpression | undefined {
+	let current: Node | undefined = node.parent;
+	while (current !== undefined) {
+		if (isClassDeclaration(current) || isClassExpression(current)) return current;
+		current = current.parent;
+	}
+	return undefined;
+}
+
 // Innermost function-like ancestor of `node` (real parent links), or undefined
-// for a class-field or top-level write.
+// for a class-field or top-level write. The search stops at the nearest class
+// boundary before reaching an outer function: a field initializer inside a
+// nested class must not borrow the enclosing constructor/host/setter. A
+// method/function inside the nested class still wins because it is encountered
+// before its class.
 function innermostFunction(node: Node): FunctionLikeDeclaration | undefined {
 	let current: Node | undefined = node.parent;
 	while (current !== undefined) {
 		if (isFunctionLikeDeclaration(current)) return current;
+		if (isClassDeclaration(current) || isClassExpression(current)) return undefined;
 		current = current.parent;
 	}
 	return undefined;
@@ -178,12 +213,15 @@ function nodeLabel(fn: FunctionLikeDeclaration): string {
 
 // Stable diagnostic owner label: the full function-like ancestor chain from the
 // class level down to the innermost owner, e.g.
-// `constructor > replaceEditorSurface (arrow) > nested (arrow)`.
+// `constructor > replaceEditorSurface (arrow) > nested (arrow)`. The chain
+// stops at a class boundary so a nested-class method never shows outer function
+// ownership.
 function functionLabel(fn: FunctionLikeDeclaration): string {
 	const chain: FunctionLikeDeclaration[] = [];
 	let current: Node | undefined = fn;
 	while (current !== undefined) {
 		if (isFunctionLikeDeclaration(current)) chain.unshift(current);
+		if (isClassDeclaration(current) || isClassExpression(current)) break;
 		current = current.parent;
 	}
 	return chain
@@ -199,6 +237,23 @@ function functionLabel(fn: FunctionLikeDeclaration): string {
 			return `${nodeLabel(node)} (${isArrowFunction(node) ? "arrow" : "function"})`;
 		})
 		.join(" > ");
+}
+
+// A class field initializer has no function owner inside its class. Fields of
+// InteractiveMode itself keep the plain `<no enclosing function>` label; a
+// field inside a nested class names that class so the rejected owner is
+// explicit and can never be mistaken for the enclosing constructor/host.
+function classFieldOwnerLabel(
+	interactiveMode: ClassDeclaration,
+	sourceFile: SourceFile,
+	node: Node,
+): string | undefined {
+	const boundary = nearestClassBoundary(node);
+	if (boundary === undefined || boundary === interactiveMode) return undefined;
+	const classLabel = isClassDeclaration(boundary)
+		? (boundary.name?.getText(sourceFile) ?? "class")
+		: "class expression";
+	return `<no enclosing function> in ${classLabel} field`;
 }
 
 function findInteractiveMode(sourceFile: SourceFile): ClassDeclaration {
@@ -221,6 +276,64 @@ function findMethod(interactiveMode: ClassDeclaration, name: string): MethodDecl
 		throw new Error(`expected exactly one ${name} method, found ${matches.length}`);
 	}
 	return matches[0]!;
+}
+
+// Exactly one named ImportSpecifier from the module whose specifier text is
+// exactly `moduleText` whose IMPORTED export name equals `importedName` AND
+// whose local name equals `localName`. A fake-export alias such as
+// `import { Fake as DialogArbiter }` has the right local name but the wrong
+// imported name, so it never matches. Missing, ambiguous, or non-literal module
+// specifiers fail explicitly. Returns the resolved checker symbol of the import
+// binding so host/teardown authorization can compare checker identity.
+function findImportBindingSymbol(
+	ctx: ParseContext,
+	moduleText: string,
+	importedName: string,
+	localName: string,
+	kindLabel: string,
+): {
+	specifier: ImportSpecifier;
+	importedName: string;
+	localName: string;
+	symbol: NonNullable<ReturnType<Checker["getResolvedSymbol"]>>;
+} {
+	const { sourceFile, checker } = ctx;
+	const matches: ImportSpecifier[] = [];
+	for (const statement of sourceFile.statements) {
+		if (!isImportDeclaration(statement)) continue;
+		const specifier = statement.moduleSpecifier;
+		if (!isStringLiteral(specifier) || specifier.text !== moduleText) continue;
+		const namedBindings = statement.importClause?.namedBindings;
+		if (!namedBindings || !isNamedImports(namedBindings)) continue;
+		for (const element of namedBindings.elements) {
+			if (!isImportSpecifier(element)) continue;
+			const elementImported = element.propertyName?.getText(sourceFile) ?? element.name.getText(sourceFile);
+			if (elementImported === importedName && element.name.getText(sourceFile) === localName) matches.push(element);
+		}
+	}
+	if (matches.length !== 1) {
+		throw new Error(
+			`expected exactly one named ${kindLabel} import ${importedName} as ${localName} from ${moduleText}, found ${matches.length}`,
+		);
+	}
+	const specifier = matches[0]!;
+	const symbol = checker.getResolvedSymbol(specifier.name);
+	if (symbol === undefined) {
+		throw new Error(
+			`named ${kindLabel} import ${importedName} as ${localName} from ${moduleText} does not resolve to a symbol`,
+		);
+	}
+	return { specifier, importedName, localName, symbol };
+}
+
+// Identity comparison for symbols from the same snapshot. The checker caches
+// symbol objects snapshot-wide, so resolved symbols may be compared by object
+// identity; the stable per-checker id guards against any handle churn.
+function sameSymbol(
+	a: NonNullable<ReturnType<Checker["getResolvedSymbol"]>>,
+	b: NonNullable<ReturnType<Checker["getResolvedSymbol"]>>,
+): boolean {
+	return a === b || a.id === b.id;
 }
 
 // The receiver's FINAL identifier: the `.name` of a PropertyAccessExpression
@@ -260,6 +373,21 @@ interface OracleHit {
 	owner: string;
 }
 
+// One matched editorContainer clear/addChild call. Accepted calls additionally
+// record their authorization role; rejected calls never silently disappear.
+interface AcceptedCall {
+	label: string;
+	line: number;
+	owner: string;
+	operation: "clear" | "addChild";
+	role: "constructor-initial-mount" | "dialog-arbiter-host" | "set-custom-editor";
+}
+
+interface ScanResult {
+	accepted: AcceptedCall[];
+	rejected: OracleHit[];
+}
+
 // Structural whitelist: constructor initial mount (unique direct-constructor
 // call with the exact initial-mount text), the unique `replaceEditorSurface`
 // property arrow inside the constructor's `new DialogArbiter({...})` object
@@ -271,7 +399,8 @@ interface Whitelist {
 	setCustomEditorComponent: MethodDeclaration;
 }
 
-function buildWhitelist(interactiveMode: ClassDeclaration, sourceFile: SourceFile): Whitelist {
+function buildWhitelist(interactiveMode: ClassDeclaration, ctx: ParseContext): Whitelist {
+	const { sourceFile, checker } = ctx;
 	const constructorMatches = interactiveMode.members.filter(isConstructorDeclaration);
 	if (constructorMatches.length !== 1) {
 		throw new Error(`expected exactly one constructor, found ${constructorMatches.length}`);
@@ -297,28 +426,41 @@ function buildWhitelist(interactiveMode: ClassDeclaration, sourceFile: SourceFil
 		throw new Error("constructor initial mount not found");
 	}
 
-	// Exactly one `new DialogArbiter({...})` directly owned by the constructor
-	// whose object-literal argument holds exactly one `replaceEditorSurface`
+	// Host authorization is checker identity against the named import binding
+	// from `./dialog-arbiter.js`, never callee text. Exactly one `new <imported
+	// DialogArbiter>({...})` directly owned by the constructor whose
+	// object-literal argument holds exactly one `replaceEditorSurface`
 	// PropertyAssignment whose initializer is an ArrowFunction. Candidates are
 	// counted globally across every direct-constructor NewExpression; a second
-	// host anywhere (another NewExpression or a duplicate property) fails closed.
+	// host anywhere (another NewExpression or a duplicate property) fails
+	// closed. A block-local shadow, an alias, or a property callee resolves to a
+	// different symbol and cannot authorize.
+	const dialogArbiterImport = findImportBindingSymbol(
+		ctx,
+		"./dialog-arbiter.js",
+		"DialogArbiter",
+		"DialogArbiter",
+		"DialogArbiter",
+	);
 	const hostCandidates: FunctionLikeDeclaration[] = [];
 	const scanNewArbiter = (node: Node): void => {
 		if (isNewExpression(node)) {
 			if (innermostFunction(node) !== constructorNode) return;
-			if (node.expression.getText(sourceFile) === "DialogArbiter" && node.arguments !== undefined) {
-				for (const argument of node.arguments) {
-					if (!isObjectLiteralExpression(argument)) continue;
-					const propertyCandidates = argument.properties
-						.filter(isPropertyAssignment)
-						.filter((property) => property.name.getText(sourceFile) === "replaceEditorSurface");
-					if (propertyCandidates.length !== 1 || !isArrowFunction(propertyCandidates[0]!.initializer)) {
-						throw new Error(
-							`expected exactly one replaceEditorSurface arrow property in new DialogArbiter, found ${propertyCandidates.length}`,
-						);
-					}
-					hostCandidates.push(propertyCandidates[0]!.initializer);
+			const callee = node.expression;
+			if (!isIdentifier(callee) || node.arguments === undefined) return;
+			const calleeSymbol = checker.getResolvedSymbol(callee);
+			if (calleeSymbol === undefined || !sameSymbol(calleeSymbol, dialogArbiterImport.symbol)) return;
+			for (const argument of node.arguments) {
+				if (!isObjectLiteralExpression(argument)) continue;
+				const propertyCandidates = argument.properties
+					.filter(isPropertyAssignment)
+					.filter((property) => property.name.getText(sourceFile) === "replaceEditorSurface");
+				if (propertyCandidates.length !== 1 || !isArrowFunction(propertyCandidates[0]!.initializer)) {
+					throw new Error(
+						`expected exactly one replaceEditorSurface arrow property in new DialogArbiter, found ${propertyCandidates.length}`,
+					);
 				}
+				hostCandidates.push(propertyCandidates[0]!.initializer);
 			}
 		}
 		node.forEachChild(scanNewArbiter);
@@ -336,41 +478,88 @@ function buildWhitelist(interactiveMode: ClassDeclaration, sourceFile: SourceFil
 	};
 }
 
-function scanEditorContainerOwners(source: string): OracleHit[] {
-	const sourceFile = parseSource(source);
+// Full scan result as plain data: every matched call is recorded either as an
+// authorized accepted call (label, computed line, owner, operation, role) or as
+// a rejected hit (label, computed line, owner). Unauthorized calls always stay
+// in `rejected`.
+function scanEditorContainerOwners(source: string): ScanResult {
+	const ctx = parseSource(source);
+	const { sourceFile } = ctx;
 	const interactiveMode = findInteractiveMode(sourceFile);
-	const whitelist = buildWhitelist(interactiveMode, sourceFile);
+	const whitelist = buildWhitelist(interactiveMode, ctx);
 
-	const hits: OracleHit[] = [];
+	const accepted: AcceptedCall[] = [];
+	const rejected: OracleHit[] = [];
 	const walk = (node: Node): void => {
 		if (isCallExpression(node)) {
 			const pattern = matchesPattern(node, sourceFile);
 			if (pattern !== undefined) {
 				const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
 				const owner = innermostFunction(node);
-				const allowed =
-					node === whitelist.initialMount ||
-					(owner !== undefined && owner === whitelist.replaceEditorSurface) ||
-					(owner !== undefined && owner === whitelist.setCustomEditorComponent);
-				if (!allowed) {
-					hits.push({
+				const role =
+					node === whitelist.initialMount
+						? ("constructor-initial-mount" as const)
+						: owner !== undefined && owner === whitelist.replaceEditorSurface
+							? ("dialog-arbiter-host" as const)
+							: owner !== undefined && owner === whitelist.setCustomEditorComponent
+								? ("set-custom-editor" as const)
+								: undefined;
+				const ownerLabel =
+					owner === undefined
+						? (classFieldOwnerLabel(interactiveMode, sourceFile, node) ?? "<no enclosing function>")
+						: functionLabel(owner);
+				if (role !== undefined) {
+					accepted.push({
 						label: `editorContainer.${pattern}(`,
 						line: line + 1,
-						owner: owner === undefined ? "<no enclosing function>" : functionLabel(owner),
+						owner: ownerLabel,
+						operation: pattern,
+						role,
 					});
+				} else {
+					rejected.push({ label: `editorContainer.${pattern}(`, line: line + 1, owner: ownerLabel });
 				}
 			}
 		}
 		node.forEachChild(walk);
 	};
 	walk(interactiveMode);
-	return hits;
+	return { accepted, rejected };
+}
+
+// Real-source accepted calls only: a helper asserting the exact structured
+// accepted signature the fixture's five production writes must keep. Order and
+// roles/operations/owners matter; lines are informational and tolerate source
+// line motion.
+function assertRealSourceAcceptedSignature(result: ScanResult): void {
+	expect(result.accepted).toHaveLength(5);
+	expect(result.accepted.map((call) => call.operation)).toEqual([
+		"addChild",
+		"clear",
+		"addChild",
+		"clear",
+		"addChild",
+	]);
+	expect(result.accepted.map((call) => call.role)).toEqual([
+		"constructor-initial-mount",
+		"dialog-arbiter-host",
+		"dialog-arbiter-host",
+		"set-custom-editor",
+		"set-custom-editor",
+	]);
+	expect(result.accepted[0]!.owner).toBe("constructor");
+	expect(result.accepted[1]!.owner).toBe("constructor > replaceEditorSurface (arrow)");
+	expect(result.accepted[2]!.owner).toBe("constructor > replaceEditorSurface (arrow)");
+	expect(result.accepted[3]!.owner).toBe("setCustomEditorComponent");
+	expect(result.accepted[4]!.owner).toBe("setCustomEditorComponent");
 }
 
 // ---------------------------------------------------------------------------
 // AST teardown locator: unique body-bearing teardownSessionUi method, real
-// `this.stop(...)` and `stopThemeWatcher()` CallExpressions inside it, both
-// unique and ordered by node position (this.stop before the watcher).
+// `this.stop(...)` and imported `stopThemeWatcher()` CallExpressions as direct
+// statements of its body, both unique and ordered by node position (this.stop
+// before the watcher). Nested callbacks/conditions and local shadows can never
+// satisfy the locator.
 // ---------------------------------------------------------------------------
 interface TeardownLocation {
 	methodStartLine: number;
@@ -380,27 +569,58 @@ interface TeardownLocation {
 }
 
 function locateTeardownSessionUi(source: string): TeardownLocation {
-	const sourceFile = parseSource(source);
+	const ctx = parseSource(source);
+	const { sourceFile, checker } = ctx;
 	const interactiveMode = findInteractiveMode(sourceFile);
 	const teardown = findMethod(interactiveMode, "teardownSessionUi");
 	const body = teardown.body;
 	if (body === undefined) throw new Error("teardownSessionUi has no body");
 
+	const watcherImport = findImportBindingSymbol(
+		ctx,
+		"./theme/theme.js",
+		"stopThemeWatcher",
+		"stopThemeWatcher",
+		"stopThemeWatcher",
+	);
+
 	const lineOf = (node: Node): number => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+	// A direct statement is the call wrapped in an ExpressionStatement whose
+	// parent is exactly the method body: `this.stop(...);` /
+	// `stopThemeWatcher();` at the top level of the method, never inside a
+	// nested callback, block, or conditional.
+	const isDirectStatement = (call: CallExpression): call is CallExpression & { parent: ExpressionStatement } =>
+		isExpressionStatement(call.parent) && call.parent.parent === body;
+
 	const stops: number[] = [];
 	const watchers: number[] = [];
 	const walk = (node: Node): void => {
 		if (isCallExpression(node)) {
 			const expression = node.expression;
+			// Optional teardown must be rejected in both positions: `this.stop?.()`
+			// puts the token on the CallExpression while `this?.stop()` puts it on
+			// the PropertyAccessExpression, so the call AND its property access
+			// must both be unconditional for a stop candidate to count.
 			if (
 				isPropertyAccessExpression(expression) &&
 				expression.name.text === "stop" &&
-				expression.expression.getText(sourceFile) === "this"
+				isThisExpression(expression.expression) &&
+				node.questionDotToken === undefined &&
+				expression.questionDotToken === undefined &&
+				isDirectStatement(node)
 			) {
 				stops.push(node.getStart(sourceFile));
 			}
-			if (expression.getText(sourceFile) === "stopThemeWatcher") {
-				watchers.push(node.getStart(sourceFile));
+			if (
+				isIdentifier(expression) &&
+				expression.getText(sourceFile) === "stopThemeWatcher" &&
+				node.questionDotToken === undefined &&
+				isDirectStatement(node)
+			) {
+				const symbol = checker.getResolvedSymbol(expression);
+				if (symbol !== undefined && sameSymbol(symbol, watcherImport.symbol)) {
+					watchers.push(node.getStart(sourceFile));
+				}
 			}
 		}
 		node.forEachChild(walk);
@@ -410,9 +630,11 @@ function locateTeardownSessionUi(source: string): TeardownLocation {
 	const methodStart = lineOf(teardown);
 	const methodEnd = sourceFile.getLineAndCharacterOfPosition(teardown.getEnd()).line + 1;
 	if (stops.length !== 1)
-		throw new Error(`expected exactly one this.stop call in teardownSessionUi, found ${stops.length}`);
+		throw new Error(`expected exactly one direct this.stop call in teardownSessionUi, found ${stops.length}`);
 	if (watchers.length !== 1) {
-		throw new Error(`expected exactly one stopThemeWatcher call in teardownSessionUi, found ${watchers.length}`);
+		throw new Error(
+			`expected exactly one direct stopThemeWatcher call in teardownSessionUi, found ${watchers.length}`,
+		);
 	}
 	const stopOffset = stops[0]!;
 	const watcherOffset = watchers[0]!;
@@ -444,7 +666,7 @@ function findCallAt(teardown: MethodDeclaration, offset: number, sourceFile: Sou
 // 1-based line range of a unique body-bearing InteractiveMode method (no fixed
 // product lines); used by mutation tests to place statements at method edges.
 function locateMethodRange(source: string, name: string): { start: number; end: number } {
-	const sourceFile = parseSource(source);
+	const { sourceFile } = parseSource(source);
 	const interactiveMode = findInteractiveMode(sourceFile);
 	const method = findMethod(interactiveMode, name);
 	return {
@@ -859,7 +1081,11 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		initTheme("dark");
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
 		const source = readFileSync(filePath, "utf8");
-		expect(scanEditorContainerOwners(source)).toEqual([]);
+		const result = scanEditorContainerOwners(source);
+		// No unauthorized call anywhere, and the five real production writes all
+		// remain accepted with their exact roles/operations/owners.
+		expect(result.rejected).toEqual([]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("oracle flags a bypass inserted into a non-whitelisted method", () => {
@@ -876,7 +1102,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
 		expect(hits).toEqual([
 			{
@@ -900,7 +1126,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		const lines = original.split("\n");
 		lines.splice(mountLine + 1, 0, "\t\tthis.editorContainer.clear();");
 		const injected = lines.join("\n");
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		expect(hits).toEqual([
 			{
 				label: "editorContainer.clear(",
@@ -908,6 +1135,9 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor",
 			},
 		]);
+		// The injected constructor-body clear is rejected without stealing or
+		// dropping the real constructor mount/host/setter production calls.
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("oracle does not attribute a class-field bypass on the line before setCustomEditorComponent to that whitelisted method", () => {
@@ -925,7 +1155,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			original.slice(0, markerIndex) +
 			"\tprivate editorContainerBypass = this.editorContainer.clear();\n" +
 			original.slice(markerIndex);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		// The class field has no enclosing function: it must never borrow the
 		// adjacent whitelisted method. Its line is derived from the injected
 		// field's own offset in the mutation source.
@@ -955,7 +1185,19 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear(); // first body line" +
 			original.slice(markerIndex + marker.length);
-		expect(scanEditorContainerOwners(firstBody)).toEqual([]);
+		const firstResult = scanEditorContainerOwners(firstBody);
+		expect(firstResult.rejected).toEqual([]);
+		// The injected boundary clear is an extra accepted setter call on top of
+		// the real five-write signature (which must remain fully present).
+		expect(firstResult.accepted).toHaveLength(6);
+		expect(firstResult.accepted[0]!.operation).toBe("addChild");
+		expect(firstResult.accepted[1]!.operation).toBe("clear");
+		expect(firstResult.accepted[2]!.operation).toBe("addChild");
+		expect(firstResult.accepted[3]!.operation).toBe("clear");
+		expect(firstResult.accepted[4]!.operation).toBe("clear"); // injected first-body line
+		expect(firstResult.accepted[5]!.operation).toBe("addChild");
+		expect(firstResult.accepted[3]!.role).toBe("set-custom-editor");
+		expect(firstResult.accepted[4]!.role).toBe("set-custom-editor");
 		// Inject a clear just before the method's closing brace: locate the last
 		// body line via the parsed method range (no fixed line).
 		const setCustomRange = locateMethodRange(original, "setCustomEditorComponent");
@@ -963,7 +1205,15 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		const lastBodyIndex = setCustomRange.end - 1; // 1-based end -> 0-based index
 		bodyLines.splice(lastBodyIndex, 0, "\t\tthis.editorContainer.clear(); // last body line");
 		const lastBody = bodyLines.join("\n");
-		expect(scanEditorContainerOwners(lastBody)).toEqual([]);
+		const lastResult = scanEditorContainerOwners(lastBody);
+		expect(lastResult.rejected).toEqual([]);
+		// The injected last-body clear is an extra accepted setter entry appended
+		// after the two real setter writes.
+		expect(lastResult.accepted).toHaveLength(6);
+		expect(lastResult.accepted[3]!.operation).toBe("clear");
+		expect(lastResult.accepted[4]!.operation).toBe("addChild");
+		expect(lastResult.accepted[5]!.operation).toBe("clear"); // injected last-body line
+		expect(lastResult.accepted[5]!.role).toBe("set-custom-editor");
 	});
 
 	test("oracle flags an unrelated constructor arrow containing clear and names that arrow", () => {
@@ -980,7 +1230,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\t\tthis.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
 		expect(hits).toEqual([
 			{
@@ -990,6 +1241,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			},
 		]);
 		expect(hits[0]!.owner).not.toBe("constructor > arrow (arrow)");
+		// The real constructor mount and host calls stay authorized.
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("oracle attributes a raw clear inside the get promptStash accessor to that accessor", () => {
@@ -1007,7 +1260,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		// The injected clear's line is derived from the mutation source offset
 		// after the marker (the first textual clear in the file is the real
 		// constructor/replaceEditorSurface write, not the injected one).
@@ -1043,7 +1296,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\t" +
 			templateBypass +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
 		expect(hits).toEqual([
 			{
@@ -1068,7 +1321,10 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			'\t\tconst a = "this.editorContainer.addChild(x);";\n' +
 			"\t\tconst b = `this.editorContainer.clear();`;" +
 			original.slice(markerIndex + marker.length);
-		expect(scanEditorContainerOwners(injected)).toEqual([]);
+		const result = scanEditorContainerOwners(injected);
+		expect(result.rejected).toEqual([]);
+		// The real five production writes stay accepted and authorized.
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("oracle flags a nested arrow inside replaceEditorSurface and names the nested binding", () => {
@@ -1089,7 +1345,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\t\t\t\t\tthis.editorContainer.clear();" +
 			"\n\t\t\t\t\t};" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 2;
 		expect(hits).toEqual([
 			{
@@ -1098,6 +1355,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow) > nested (arrow)",
 			},
 		]);
+		// The real host clear/addChild and the constructor mount stay accepted.
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("regex literals are not executable and cannot emit a hit or poison a method", () => {
@@ -1121,7 +1380,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n" +
 			injectedClear +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		const markerLine = injected.slice(0, markerIndex).split("\n").length;
 		// Regex bodies produce no hits; the later clear is the only rejected hit.
 		expect(hits).toEqual([
@@ -1150,7 +1409,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n" +
 			injectedClear +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		const markerLine = injected.slice(0, markerIndex).split("\n").length;
 		expect(hits).toEqual([
 			{
@@ -1175,7 +1434,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			" const nested = () => { this.editorContainer.clear(); };" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		expect(hits).toEqual([
 			{
 				label: "editorContainer.clear(",
@@ -1183,6 +1443,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow) > nested (arrow)",
 			},
 		]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("a concise arrow inside replaceEditorSurface is owned by the innermost arrow, not the whitelisted parent", () => {
@@ -1197,7 +1458,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\t\t\tqueueMicrotask(() => this.editorContainer.clear());" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		expect(hits).toEqual([
 			{
 				label: "editorContainer.clear(",
@@ -1205,6 +1467,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow) > arrow (arrow)",
 			},
 		]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("with multiple arrows on one line the hit resolves to the innermost arrow, never the first", () => {
@@ -1221,7 +1484,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			" const a = () => 1; const b = () => this.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		expect(hits).toEqual([
 			{
 				label: "editorContainer.clear(",
@@ -1229,6 +1493,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow) > b (arrow)",
 			},
 		]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("a nested callback deliberately named replaceEditorSurface does not inherit the whitelist", () => {
@@ -1243,7 +1508,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\t\t\tconst replaceEditorSurface = () => this.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
 		expect(hits).toEqual([
 			{
@@ -1274,7 +1539,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			original.slice(0, arbiterIndex) +
 			"\t\tconst replaceEditorSurface = () => this.editorContainer.clear();\n" +
 			original.slice(arbiterIndex);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		const injectedLine = injected.slice(0, arbiterIndex).split("\n").length;
 		// Exactly the injected local write is rejected; the real property's
 		// original clear and conditional addChild are still allowed.
@@ -1285,6 +1551,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow)",
 			},
 		]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("a valid local/nested function named replaceEditorSurface in a constructor statement is rejected", () => {
@@ -1301,7 +1568,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			original.slice(0, arbiterIndex) +
 			"\t\tfunction replaceEditorSurface() {\n\t\t\tthis.editorContainer.clear();\n\t\t}\n" +
 			original.slice(arbiterIndex);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		const injectedLine = injected.slice(0, arbiterIndex).split("\n").length + 1;
 		expect(hits).toEqual([
 			{
@@ -1310,6 +1578,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (function)",
 			},
 		]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("multiline parenthesized, object, ternary and nested-function bodies own the raw write, later parent write stays allowed", () => {
@@ -1324,9 +1593,13 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\t\t\tconst fn = () => ({\n\t\t\t\t\tx: this.editorContainer.clear(),\n\t\t\t\t});\n\t\t\t\tthis.editorContainer.addChild(component);",
 			"\n\t\t\t\tconst fn = () => this.editorContainer.clear()\n\t\t\t\t\t? 1\n\t\t\t\t\t: 2;\n\t\t\t\tthis.editorContainer.addChild(component);",
 		];
+		// Every injected host body re-adds the host-level `addChild(component)`
+		// statement after its own nested write, so the accepted side gains one
+		// extra host call beyond the real five-write signature.
 		for (const body of arrowBodies) {
 			const injected = original.slice(0, markerIndex) + marker + body + original.slice(markerIndex + marker.length);
-			const hits = scanEditorContainerOwners(injected);
+			const result = scanEditorContainerOwners(injected);
+			const hits = result.rejected;
 			const clearLine = injected.slice(0, injected.indexOf("this.editorContainer.clear()")).split("\n").length;
 			expect(hits).toEqual([
 				{
@@ -1335,13 +1608,26 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 					owner: "constructor > replaceEditorSurface (arrow) > fn (arrow)",
 				},
 			]);
+			// The real constructor mount/setter writes plus the injected host
+			// addChild are all accepted; only the nested fn write is rejected.
+			expect(result.accepted).toHaveLength(6);
+			expect(result.accepted[0]!.role).toBe("constructor-initial-mount");
+			expect(result.accepted[1]!.operation).toBe("addChild"); // injected host addChild
+			expect(result.accepted[1]!.role).toBe("dialog-arbiter-host");
+			expect(result.accepted[2]!.operation).toBe("clear"); // real host clear
+			expect(result.accepted[2]!.role).toBe("dialog-arbiter-host");
+			expect(result.accepted[3]!.operation).toBe("addChild"); // real host addChild
+			expect(result.accepted[3]!.role).toBe("dialog-arbiter-host");
+			expect(result.accepted[4]!.role).toBe("set-custom-editor");
+			expect(result.accepted[5]!.role).toBe("set-custom-editor");
 		}
 		// An ordinary nested function binding owns its raw write as a function.
 		const functionBody =
 			"\n\t\t\t\tfunction fn() {\n\t\t\t\t\tthis.editorContainer.clear();\n\t\t\t\t}\n\t\t\t\tthis.editorContainer.addChild(component);";
 		const functionInjected =
 			original.slice(0, markerIndex) + marker + functionBody + original.slice(markerIndex + marker.length);
-		const functionHits = scanEditorContainerOwners(functionInjected);
+		const functionResult = scanEditorContainerOwners(functionInjected);
+		const functionHits = functionResult.rejected;
 		const functionClearLine = functionInjected
 			.slice(0, functionInjected.indexOf("this.editorContainer.clear()"))
 			.split("\n").length;
@@ -1352,6 +1638,9 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "constructor > replaceEditorSurface (arrow) > fn (function)",
 			},
 		]);
+		expect(functionResult.accepted).toHaveLength(6);
+		expect(functionResult.accepted[1]!.operation).toBe("addChild");
+		expect(functionResult.accepted[1]!.role).toBe("dialog-arbiter-host");
 	});
 
 	test("nested arrow and nested function raw writes inside setCustomEditorComponent are rejected with complete hit sets", () => {
@@ -1372,7 +1661,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\tconst nestedArrow = () => this.editorContainer.clear();" +
 			"\n\t\tfunction nestedFunction() {\n\t\t\tthis.editorContainer.addChild(this.editor);\n\t\t}" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const result = scanEditorContainerOwners(injected);
+		const hits = result.rejected;
 		// Anchor both injected lines on the mutation offsets (the first textual
 		// clear/addChild in the file belong to the real product source).
 		const arrowClearOffset = injected.indexOf("\n\t\tconst nestedArrow = () => this.editorContainer.clear();");
@@ -1393,6 +1683,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 				owner: "setCustomEditorComponent > nestedFunction (function)",
 			},
 		]);
+		// The method's own original direct clear/addChild stay authorized.
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("a raw write before an arrow token is not retroactively owned by that arrow", () => {
@@ -1410,7 +1702,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear(); const later = () => 1;" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		expect(hits).toEqual([
 			{
 				label: "editorContainer.clear(",
@@ -1480,7 +1772,9 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			original.slice(markerIndex + marker.length);
 		// The spaced/computed/optional variants are outside task 10.1's exact
 		// pattern scope; no hit is produced.
-		expect(scanEditorContainerOwners(injected)).toEqual([]);
+		const result = scanEditorContainerOwners(injected);
+		expect(result.rejected).toEqual([]);
+		assertRealSourceAcceptedSignature(result);
 	});
 
 	test("a bare local editorContainer alias still matches the exact executable pattern", () => {
@@ -1498,7 +1792,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tconst editorContainer = this.editorContainer;\n\t\teditorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		// The injected clear sits after the alias declaration; anchor the line on
 		// the injected call text, not the first textual occurrence in the file.
 		const injectedClearOffset = injected.indexOf("\n\t\teditorContainer.clear();");
@@ -1528,7 +1822,7 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\teditorContainerProxy.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const hits = scanEditorContainerOwners(injected);
+		const hits = scanEditorContainerOwners(injected).rejected;
 		// The injected call's line is derived from its own offset in the mutation
 		// source (the first textual `editorContainer.clear(` in the file belongs
 		// to the real product source, not the injected call).
@@ -1572,6 +1866,445 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		// Both calls live inside the located method range (no fixed lines).
 		expect(stopCallLine).toBeGreaterThanOrEqual(methodStartLine);
 		expect(stopThemeWatcherLine).toBeLessThanOrEqual(methodEndLine);
+	});
+
+	test("a nested class field raw write inside the constructor body cannot borrow the constructor owner", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A nested class declaration with a field initializer placed directly in
+		// the constructor body (after the real initial mount). The write has no
+		// enclosing function inside the nested class and must NOT borrow the
+		// enclosing constructor owner.
+		const mountMarker = "this.editorContainer.addChild(this.editor as Component);";
+		const mountIndex = original.indexOf(mountMarker);
+		expect(mountIndex).toBeGreaterThan(-1);
+		const nested =
+			"\n\t\tclass NestedMountBypass {\n" +
+			"\t\t\treadonly write = this.editorContainer.clear();\n" +
+			"\t\t}\n" +
+			"\t\tvoid NestedMountBypass;\n";
+		const injected =
+			original.slice(0, mountIndex) + mountMarker + nested + original.slice(mountIndex + mountMarker.length);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\treadonly write = this.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "<no enclosing function> in NestedMountBypass field",
+			},
+		]);
+		// The real constructor mount, host, and setter calls stay authorized.
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("a nested class field raw write inside the real replaceEditorSurface host arrow cannot borrow the host owner", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A nested class field initializer inserted at the top of the real host
+		// arrow body must be owned by the nested class, never the whitelisted
+		// replaceEditorSurface arrow.
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const nested =
+			"\n\t\t\t\tclass NestedHostBypass {\n" +
+			"\t\t\t\t\treadonly write = this.editorContainer.clear();\n" +
+			"\t\t\t\t}\n" +
+			"\t\t\t\tvoid NestedHostBypass;\n";
+		const injected = original.slice(0, markerIndex) + marker + nested + original.slice(markerIndex + marker.length);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\t\t\treadonly write = this.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "<no enclosing function> in NestedHostBypass field",
+			},
+		]);
+		// The host's own real clear/addChild and the mount/setter stay accepted.
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("a nested class field raw write inside setCustomEditorComponent cannot borrow the method owner", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\tprivate setCustomEditorComponent(factory: EditorFactory | undefined): void {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const nested =
+			"\n\t\tclass NestedSetterBypass {\n" +
+			"\t\t\treadonly write = this.editorContainer.clear();\n" +
+			"\t\t}\n" +
+			"\t\tvoid NestedSetterBypass;\n";
+		const injected = original.slice(0, markerIndex) + marker + nested + original.slice(markerIndex + marker.length);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\treadonly write = this.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "<no enclosing function> in NestedSetterBypass field",
+			},
+		]);
+		// The setter's own real clear/addChild stay authorized.
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("a nested method inside a nested class field is owned by that method, not the outer constructor", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A method of a nested class is encountered before its class boundary, so
+		// a raw write inside it is owned by that method and must never borrow the
+		// outer constructor or inherit host/setter authorization.
+		const mountMarker = "this.editorContainer.addChild(this.editor as Component);";
+		const mountIndex = original.indexOf(mountMarker);
+		expect(mountIndex).toBeGreaterThan(-1);
+		const nested =
+			"\n\t\tclass NestedMethodOwner {\n" +
+			"\t\t\twrite(): void {\n" +
+			"\t\t\t\tthis.editorContainer.clear();\n" +
+			"\t\t\t}\n" +
+			"\t\t}\n" +
+			"\t\tvoid NestedMethodOwner;\n";
+		const injected =
+			original.slice(0, mountIndex) + mountMarker + nested + original.slice(mountIndex + mountMarker.length);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\t\tthis.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "write",
+			},
+		]);
+		// The nested method label never borrows the outer constructor chain.
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("a block-local DialogArbiter shadow with a compatible host object fails closed", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A block-local class named DialogArbiter declared in the constructor
+		// body shadows the imported binding for the whole constructor: both the
+		// shadow's `new DialogArbiter({...})` and the real host's NewExpression
+		// now resolve to the local shadow symbol (not the import), so no host
+		// candidate is authorized and the scan fails closed explicitly. Text
+		// equality on the callee would have accepted the shadow.
+		const arbiterMarker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const arbiterIndex = original.indexOf(arbiterMarker);
+		expect(arbiterIndex).toBeGreaterThan(-1);
+		const shadow =
+			"\t\tclass DialogArbiter {\n" +
+			"\t\t\tconstructor(options: { replaceEditorSurface: (component: unknown) => void }) {\n" +
+			"\t\t\t\tvoid options;\n" +
+			"\t\t\t}\n" +
+			"\t\t}\n" +
+			"\t\tconst shadowHost = new DialogArbiter({\n" +
+			"\t\t\treplaceEditorSurface: (component) => {\n" +
+			"\t\t\t\tthis.editorContainer.clear();\n" +
+			"\t\t\t},\n" +
+			"\t\t});\n" +
+			"\t\tvoid shadowHost;\n";
+		const injected = original.slice(0, arbiterIndex) + shadow + original.slice(arbiterIndex);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(
+			/expected exactly one DialogArbiter host arrow in constructor, found 0/,
+		);
+	});
+
+	test("an alias of DialogArbiter cannot authorize raw calls; the real imported host stays the unique accepted host", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `const Alias = DialogArbiter; new Alias({...})` is a syntactically valid
+		// constructor host candidate whose callee resolves to the local alias
+		// symbol, not the imported DialogArbiter binding: the alias host's raw
+		// calls are rejected and never authorize.
+		const arbiterMarker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const arbiterIndex = original.indexOf(arbiterMarker);
+		expect(arbiterIndex).toBeGreaterThan(-1);
+		const alias =
+			"\t\tconst Alias = DialogArbiter;\n" +
+			"\t\tconst aliasHost = new Alias({\n" +
+			"\t\t\treplaceEditorSurface: (component) => {\n" +
+			"\t\t\t\tthis.editorContainer.clear();\n" +
+			"\t\t\t},\n" +
+			"\t\t});\n" +
+			"\t\tvoid aliasHost;\n";
+		const injected = original.slice(0, arbiterIndex) + alias + original.slice(arbiterIndex);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\t\tthis.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (arrow)",
+			},
+		]);
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("a property callee registry.DialogArbiter with a replaceEditorSurface arrow cannot authorize raw calls", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A call `registry.DialogArbiter({...})` with a replaceEditorSurface arrow
+		// in the constructor is not a NewExpression with an Identifier callee at
+		// all, so its raw writes are rejected at their own lines and never
+		// authorize.
+		const arbiterMarker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const arbiterIndex = original.indexOf(arbiterMarker);
+		expect(arbiterIndex).toBeGreaterThan(-1);
+		const registry =
+			"\t\tconst registry = {\n" +
+			"\t\t\tDialogArbiter: (options: { replaceEditorSurface: (component: unknown) => void }) => {\n" +
+			"\t\t\t\tvoid options;\n" +
+			"\t\t\t\treturn options;\n" +
+			"\t\t\t},\n" +
+			"\t\t};\n" +
+			"\t\tregistry.DialogArbiter({\n" +
+			"\t\t\treplaceEditorSurface: (component) => {\n" +
+			"\t\t\t\tthis.editorContainer.clear();\n" +
+			"\t\t\t},\n" +
+			"\t\t});\n";
+		const injected = original.slice(0, arbiterIndex) + registry + original.slice(arbiterIndex);
+		const result = scanEditorContainerOwners(injected);
+		const injectedClearOffset = injected.indexOf("\t\t\t\tthis.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const injectedLine = injected.slice(0, injectedClearOffset).split("\n").length;
+		expect(result.rejected).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (arrow)",
+			},
+		]);
+		assertRealSourceAcceptedSignature(result);
+	});
+
+	test("deleting the real host addChild breaks the accepted signature", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Removing one production host raw call (the conditional addChild) must
+		// change the accepted signature: the strict five-write structural contract
+		// reports the missing host addChild instead of staying green.
+		const hostAddChild = "this.editorContainer.addChild(component);";
+		const hostAddChildIndex = original.indexOf(hostAddChild);
+		expect(hostAddChildIndex).toBeGreaterThan(-1);
+		const deleted = original.slice(0, hostAddChildIndex) + original.slice(hostAddChildIndex + hostAddChild.length);
+		const result = scanEditorContainerOwners(deleted);
+		expect(result.rejected).toEqual([]);
+		// The strict five-write structural contract reports the missing host
+		// addChild: no unauthorized call hides this, the accepted signature is
+		// shorter and fails explicitly.
+		expect(() => assertRealSourceAcceptedSignature(result)).toThrow(/to have a length of 5 but got 4/);
+	});
+
+	test("deleting one real setter raw call breaks the accepted signature", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Removing one production setCustomEditorComponent raw call (the clear)
+		// must change the accepted signature: the strict five-write structural
+		// contract reports the missing setter clear instead of staying green.
+		const marker = "\tprivate setCustomEditorComponent(factory: EditorFactory | undefined): void {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const bodyAfterMarker = original.slice(markerIndex + marker.length);
+		const setterClearOffset = bodyAfterMarker.indexOf("this.editorContainer.clear();");
+		expect(setterClearOffset).toBeGreaterThan(-1);
+		const deleted =
+			original.slice(0, markerIndex + marker.length + setterClearOffset) +
+			bodyAfterMarker.slice(setterClearOffset + "this.editorContainer.clear();".length);
+		const result = scanEditorContainerOwners(deleted);
+		expect(result.rejected).toEqual([]);
+		// The strict five-write structural contract reports the missing setter
+		// clear instead of staying green.
+		expect(() => assertRealSourceAcceptedSignature(result)).toThrow(/to have a length of 5 but got 4/);
+	});
+
+	test("nested callbacks inside teardownSessionUi cannot satisfy the direct teardown locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Replace the direct `this.stop(...)` and `stopThemeWatcher()` statements
+		// with queueMicrotask-wrapped versions. The locator requires each call to
+		// be a direct expression statement of the method body, so both calls
+		// disappear and the locator fails explicitly on the first missing call.
+		const teardownMarker = "async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {";
+		const teardownIndex = original.indexOf(teardownMarker);
+		expect(teardownIndex).toBeGreaterThan(-1);
+		const bodyAfter = original.slice(teardownIndex + teardownMarker.length);
+		const stopIndex = bodyAfter.indexOf("this.stop({ preserveAltScreen: options.preserveAltScreen });");
+		expect(stopIndex).toBeGreaterThan(-1);
+		const stopEnd = stopIndex + "this.stop({ preserveAltScreen: options.preserveAltScreen });".length;
+		const watcherIndex = bodyAfter.indexOf("stopThemeWatcher();", stopEnd);
+		expect(watcherIndex).toBeGreaterThan(-1);
+		const watcherEnd = watcherIndex + "stopThemeWatcher();".length;
+		const replaced =
+			original.slice(0, teardownIndex + teardownMarker.length) +
+			bodyAfter.slice(0, stopIndex) +
+			"queueMicrotask(() => this.stop({ preserveAltScreen: options.preserveAltScreen }));" +
+			bodyAfter.slice(stopEnd, watcherIndex) +
+			"queueMicrotask(() => stopThemeWatcher());" +
+			bodyAfter.slice(watcherEnd);
+		expect(() => locateTeardownSessionUi(replaced)).toThrow(
+			/expected exactly one direct this.stop call in teardownSessionUi, found 0/,
+		);
+	});
+
+	test("a local stopThemeWatcher shadow cannot satisfy the teardown locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Declare a direct local `function stopThemeWatcher() {}` binding before
+		// the real call. The direct call is still present, but its callee now
+		// resolves to the local shadow, not the imported binding, so the locator
+		// finds zero imported watcher calls and fails explicitly.
+		const teardownMarker = "async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {";
+		const teardownIndex = original.indexOf(teardownMarker);
+		expect(teardownIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, teardownIndex) +
+			teardownMarker +
+			"\n\t\tfunction stopThemeWatcher(): void {}\n\t\tvoid stopThemeWatcher;" +
+			original.slice(teardownIndex + teardownMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(
+			/expected exactly one direct stopThemeWatcher call in teardownSessionUi, found 0/,
+		);
+	});
+
+	test("an optional this.stop?.() teardown call cannot satisfy the direct locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Replace the direct unconditional `this.stop(...)` with `this.stop?.(...)`.
+		// The optional token sits on the CallExpression, so the unconditional
+		// candidate disappears and the locator fails explicitly with count 0.
+		const teardownMarker = "async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {";
+		const teardownIndex = original.indexOf(teardownMarker);
+		expect(teardownIndex).toBeGreaterThan(-1);
+		const bodyAfter = original.slice(teardownIndex + teardownMarker.length);
+		const stopMarker = "this.stop({ preserveAltScreen: options.preserveAltScreen });";
+		const stopIndex = bodyAfter.indexOf(stopMarker);
+		expect(stopIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, teardownIndex + teardownMarker.length) +
+			bodyAfter.slice(0, stopIndex) +
+			"this.stop?.({ preserveAltScreen: options.preserveAltScreen });" +
+			bodyAfter.slice(stopIndex + stopMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(
+			/expected exactly one direct this.stop call in teardownSessionUi, found 0/,
+		);
+	});
+
+	test("a property-optional this?.stop(...) teardown call cannot satisfy the direct locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Replace the direct unconditional `this.stop(...)` with `this?.stop(...)`.
+		// The optional token sits on the PropertyAccessExpression (not the
+		// CallExpression), so the unconditional stop candidate disappears and the
+		// locator fails explicitly with count 0.
+		const teardownMarker = "async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {";
+		const teardownIndex = original.indexOf(teardownMarker);
+		expect(teardownIndex).toBeGreaterThan(-1);
+		const bodyAfter = original.slice(teardownIndex + teardownMarker.length);
+		const stopMarker = "this.stop({ preserveAltScreen: options.preserveAltScreen });";
+		const stopIndex = bodyAfter.indexOf(stopMarker);
+		expect(stopIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, teardownIndex + teardownMarker.length) +
+			bodyAfter.slice(0, stopIndex) +
+			"this?.stop({ preserveAltScreen: options.preserveAltScreen });" +
+			bodyAfter.slice(stopIndex + stopMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(
+			/expected exactly one direct this.stop call in teardownSessionUi, found 0/,
+		);
+	});
+
+	test("an optional stopThemeWatcher?.() teardown call cannot satisfy the direct locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Replace the direct unconditional `stopThemeWatcher()` with
+		// `stopThemeWatcher?.()`. The optional token sits on the CallExpression,
+		// so the unconditional candidate disappears and the locator fails
+		// explicitly with count 0.
+		const teardownMarker = "async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {";
+		const teardownIndex = original.indexOf(teardownMarker);
+		expect(teardownIndex).toBeGreaterThan(-1);
+		const bodyAfter = original.slice(teardownIndex + teardownMarker.length);
+		const stopIndex = bodyAfter.indexOf("this.stop({ preserveAltScreen: options.preserveAltScreen });");
+		expect(stopIndex).toBeGreaterThan(-1);
+		const watcherMarker = "stopThemeWatcher();";
+		const watcherIndex = bodyAfter.indexOf(watcherMarker, stopIndex);
+		expect(watcherIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, teardownIndex + teardownMarker.length) +
+			bodyAfter.slice(0, watcherIndex) +
+			"stopThemeWatcher?.();" +
+			bodyAfter.slice(watcherIndex + watcherMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(
+			/expected exactly one direct stopThemeWatcher call in teardownSessionUi, found 0/,
+		);
+	});
+
+	test("a fake-export alias FakeDialogArbiter as DialogArbiter cannot authorize the host", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `import { FakeDialogArbiter as DialogArbiter } from "./dialog-arbiter.js"`
+		// has the expected local name but the wrong imported export name, so the
+		// genuine named import is absent and the host scan fails explicitly. The
+		// fake export need not resolve to a real export; the failure is
+		// structural, not semantic.
+		const hostImportMarker = 'import { DialogArbiter } from "./dialog-arbiter.js";';
+		const hostImportIndex = original.indexOf(hostImportMarker);
+		expect(hostImportIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, hostImportIndex) +
+			'import { FakeDialogArbiter as DialogArbiter } from "./dialog-arbiter.js";' +
+			original.slice(hostImportIndex + hostImportMarker.length);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(
+			/expected exactly one named DialogArbiter import DialogArbiter as DialogArbiter from \.\/dialog-arbiter\.js, found 0/,
+		);
+	});
+
+	test("a fake-export alias fakeStopThemeWatcher as stopThemeWatcher cannot satisfy the teardown locator", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `import { fakeStopThemeWatcher as stopThemeWatcher } from
+		// "./theme/theme.js"` has the expected local name but the wrong imported
+		// export name, so the genuine named import is absent and the teardown
+		// locator fails explicitly.
+		const watcherImportMarker = "\tstopThemeWatcher,\n";
+		const watcherImportIndex = original.indexOf(watcherImportMarker);
+		expect(watcherImportIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, watcherImportIndex) +
+			"\tfakeStopThemeWatcher as stopThemeWatcher,\n" +
+			original.slice(watcherImportIndex + watcherImportMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(
+			/expected exactly one named stopThemeWatcher import stopThemeWatcher as stopThemeWatcher from \.\/theme\/theme\.js, found 0/,
+		);
 	});
 });
 
