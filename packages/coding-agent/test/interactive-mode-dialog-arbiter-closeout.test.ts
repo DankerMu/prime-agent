@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { type Component, Container, setKeybindings } from "@earendil-works/pi-tui";
 import {
 	type CallExpression,
@@ -34,8 +36,8 @@ import {
 	type Node,
 	type SourceFile,
 } from "typescript/unstable/ast";
-import { createVirtualFileSystem } from "typescript/unstable/fs";
-import { API, type Checker } from "typescript/unstable/sync";
+import type { FileSystem } from "typescript/unstable/fs";
+import { API, type Checker, type Project } from "typescript/unstable/sync";
 import { afterAll, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ExtensionEditorComponent } from "../src/modes/interactive/components/extension-editor.js";
@@ -59,12 +61,25 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 //
 // One API instance and one in-memory virtual source/config are shared by all
 // scans (lazily initialized), and `afterAll` disposes the snapshot and closes
-// the API exactly once, leaving no tsgo process.
+// the API exactly once, leaving no tsgo process. The virtual source lives at
+// the REAL absolute path of the product interactive-mode.ts with a small
+// fall-through filesystem overlay, so `./dialog-arbiter.js` and
+// `./theme/theme.js` resolve to the real product modules. Authorizing imports
+// must be whole-clause value imports of the exact named export whose alias
+// target declarations live in the expected real source module.
 // ---------------------------------------------------------------------------
 
-const VIRTUAL_DIR = "/__dialog-arbiter-closeout-oracle__";
-const VIRTUAL_TS = `${VIRTUAL_DIR}/interactive-mode.ts`;
-const VIRTUAL_TSCONFIG = `${VIRTUAL_DIR}/tsconfig.json`;
+// The virtual source is mounted at the REAL absolute path of the product
+// interactive-mode.ts (derived from this test module's own location, never a
+// fixed user path), so relative imports such as `./dialog-arbiter.js` and
+// `./theme/theme.js` resolve to the real product modules through the real
+// filesystem. The virtual tsconfig sits at an actual absolute path under the
+// package directory but exists only in overlay memory; no disk file is touched.
+const PACKAGE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const VIRTUAL_TS = path.join(PACKAGE_DIR, "src/modes/interactive/interactive-mode.ts");
+const VIRTUAL_TSCONFIG = path.join(PACKAGE_DIR, "tsconfig.json");
+const REAL_DIALOG_ARBITER_TS = path.join(PACKAGE_DIR, "src/modes/interactive/dialog-arbiter.ts");
+const REAL_THEME_TS = path.join(PACKAGE_DIR, "src/modes/interactive/theme/theme.ts");
 
 const TS_CONFIG = JSON.stringify({
 	compilerOptions: {
@@ -74,42 +89,62 @@ const TS_CONFIG = JSON.stringify({
 		strict: true,
 		noEmit: true,
 	},
-	include: ["*.ts"],
+	// Only the interactive directory participates; sibling directories and
+	// node_modules are resolved from the real filesystem.
+	include: ["src/modes/interactive/**/*.ts"],
 });
 
 let oracleApi: API | undefined;
-let oracleFs: ReturnType<typeof createVirtualFileSystem> | undefined;
 let oracleSnapshot: ReturnType<API["updateSnapshot"]> | undefined;
+const virtualFiles = new Map<string, string>();
 
-// The virtual FS write callback is optional on the FileSystem type but always
-// present on the value created by createVirtualFileSystem.
-function virtualWrite(fs: ReturnType<typeof createVirtualFileSystem>, path: string, content: string): void {
-	fs.writeFile!(path, content);
-}
+// A small typed overlay over the real filesystem: virtual source/config reads
+// return the in-memory values, writes/removes mutate only the in-memory map,
+// and every unspecified callback stays undefined so the API falls back to the
+// real filesystem. Directory/entries/realpath callbacks are omitted entirely:
+// nothing in the virtual set needs them.
+const oracleFs: FileSystem = {
+	readFile(fileName) {
+		return virtualFiles.has(fileName) ? virtualFiles.get(fileName) : undefined;
+	},
+	fileExists(fileName) {
+		return virtualFiles.has(fileName) ? true : undefined;
+	},
+	writeFile(fileName, content) {
+		virtualFiles.set(fileName, content);
+	},
+	removeFile(fileName) {
+		virtualFiles.delete(fileName);
+	},
+};
 
-// Lazily initialize the shared virtual filesystem/API/config/source exactly
-// once and reuse it for every scan. The virtual FS falls back to the real FS
-// for unspecified paths; the oracle source/config themselves never touch disk.
-// The project and source file are opened on the first snapshot so later
-// `fileChanges.changed` updates can locate the project for the changed file.
+// Lazily initialize the shared overlay/API/config/source exactly once and
+// reuse it for every scan. The API cwd is the actual package directory, so
+// relative imports from the virtual interactive-mode resolve to the real
+// product modules. The project and source file are opened on the first
+// snapshot so later `fileChanges.changed` updates can locate the project for
+// the changed file.
 function initOracle(): void {
 	if (oracleApi !== undefined) return;
-	const virtualFs = createVirtualFileSystem({});
-	virtualWrite(virtualFs, VIRTUAL_TSCONFIG, TS_CONFIG);
-	virtualWrite(virtualFs, VIRTUAL_TS, "");
-	oracleFs = virtualFs;
-	oracleApi = new API({ cwd: VIRTUAL_DIR, fs: virtualFs });
+	virtualFiles.set(VIRTUAL_TSCONFIG, TS_CONFIG);
+	virtualFiles.set(VIRTUAL_TS, "");
+	oracleApi = new API({ cwd: PACKAGE_DIR, fs: oracleFs });
 	oracleSnapshot = oracleApi.updateSnapshot({
 		openProjects: [VIRTUAL_TSCONFIG],
 		openFiles: [VIRTUAL_TS],
 	});
 }
 
-// One parsed source snapshot plus the project checker bound to that snapshot.
-// AST nodes and the checker are only valid until the next updateSnapshot, so
-// every scan builds a fresh context and never retains nodes/checker across
-// snapshots.
+function virtualWrite(fileName: string, content: string): void {
+	virtualFiles.set(fileName, content);
+}
+
+// One parsed source snapshot plus the project and its checker bound to that
+// snapshot. AST nodes, the checker, and project handles are only valid until
+// the next updateSnapshot, so every scan builds a fresh context and never
+// retains them across snapshots.
 interface ParseContext {
+	project: Project;
 	sourceFile: SourceFile;
 	checker: Checker;
 }
@@ -118,7 +153,7 @@ interface ParseContext {
 // the checker must never be retained across updates.
 function parseSource(source: string): ParseContext {
 	initOracle();
-	virtualWrite(oracleFs!, VIRTUAL_TS, source);
+	virtualWrite(VIRTUAL_TS, source);
 	const next = oracleApi!.updateSnapshot({ fileChanges: { changed: [VIRTUAL_TS] } });
 	if (oracleSnapshot !== undefined) oracleSnapshot.dispose();
 	oracleSnapshot = next;
@@ -140,7 +175,7 @@ function parseSource(source: string): ParseContext {
 			.join("; ");
 		throw new Error(`syntactic diagnostic in mutation source: ${detail}`);
 	}
-	return { sourceFile, checker: project.checker };
+	return { project, sourceFile, checker: project.checker };
 }
 
 function isFunctionLikeDeclaration(node: Node): node is FunctionLikeDeclaration {
@@ -278,18 +313,35 @@ function findMethod(interactiveMode: ClassDeclaration, name: string): MethodDecl
 	return matches[0]!;
 }
 
-// Exactly one named ImportSpecifier from the module whose specifier text is
-// exactly `moduleText` whose IMPORTED export name equals `importedName` AND
-// whose local name equals `localName`. A fake-export alias such as
-// `import { Fake as DialogArbiter }` has the right local name but the wrong
-// imported name, so it never matches. Missing, ambiguous, or non-literal module
-// specifiers fail explicitly. Returns the resolved checker symbol of the import
-// binding so host/teardown authorization can compare checker identity.
+// Exactly one named VALUE ImportSpecifier from the module whose specifier text
+// is exactly `moduleText`, whose IMPORTED export name equals `importedName`,
+// whose local name equals `localName`, and whose alias target is a real export
+// declaration in the module at `expectedTargetPath`. Every condition is
+// required:
+//
+//   - the enclosing ImportClause must be a whole-clause value import
+//     (`phaseModifier === undefined`), so `import type { DialogArbiter }`
+//     cannot authorize a runtime host;
+//   - the ImportSpecifier must not be type-only (`isTypeOnly === false`), so
+//     `import { type DialogArbiter }` cannot authorize a runtime host;
+//   - the local ImportSpecifier symbol must resolve, and
+//     `checker.getAliasedSymbol` must resolve to the expected export name with
+//     at least one declaration (a fake-export alias yields the checker's
+//     unknown symbol and fails);
+//   - every target declaration handle must resolve to a node whose SourceFile
+//     normalized absolute file name equals `expectedTargetPath` (the real
+//     product module), so a same-named export in a different module fails.
+//
+// Missing, ambiguous, non-literal module specifiers, unresolved/unknown
+// symbols, and wrong-module targets all fail explicitly. Returns the resolved
+// checker symbol of the import binding so host/teardown authorization can
+// compare checker identity.
 function findImportBindingSymbol(
 	ctx: ParseContext,
 	moduleText: string,
 	importedName: string,
 	localName: string,
+	expectedTargetPath: string,
 	kindLabel: string,
 ): {
 	specifier: ImportSpecifier;
@@ -298,12 +350,19 @@ function findImportBindingSymbol(
 	symbol: NonNullable<ReturnType<Checker["getResolvedSymbol"]>>;
 } {
 	const { sourceFile, checker } = ctx;
+	let phaseTypeOnly = false;
 	const matches: ImportSpecifier[] = [];
 	for (const statement of sourceFile.statements) {
 		if (!isImportDeclaration(statement)) continue;
 		const specifier = statement.moduleSpecifier;
 		if (!isStringLiteral(specifier) || specifier.text !== moduleText) continue;
-		const namedBindings = statement.importClause?.namedBindings;
+		const importClause = statement.importClause;
+		if (importClause === undefined) continue;
+		if (importClause.phaseModifier !== undefined) {
+			phaseTypeOnly = true;
+			continue;
+		}
+		const namedBindings = importClause.namedBindings;
 		if (!namedBindings || !isNamedImports(namedBindings)) continue;
 		for (const element of namedBindings.elements) {
 			if (!isImportSpecifier(element)) continue;
@@ -311,17 +370,42 @@ function findImportBindingSymbol(
 			if (elementImported === importedName && element.name.getText(sourceFile) === localName) matches.push(element);
 		}
 	}
+	if (phaseTypeOnly && matches.length === 0) {
+		throw new Error(
+			`expected a value ${kindLabel} import ${importedName} as ${localName} from ${moduleText}, found a whole-clause type-only import`,
+		);
+	}
 	if (matches.length !== 1) {
 		throw new Error(
 			`expected exactly one named ${kindLabel} import ${importedName} as ${localName} from ${moduleText}, found ${matches.length}`,
 		);
 	}
 	const specifier = matches[0]!;
+	if (specifier.isTypeOnly) {
+		throw new Error(
+			`expected a value ${kindLabel} import ${importedName} as ${localName} from ${moduleText}, found a type-only ImportSpecifier`,
+		);
+	}
 	const symbol = checker.getResolvedSymbol(specifier.name);
 	if (symbol === undefined) {
 		throw new Error(
 			`named ${kindLabel} import ${importedName} as ${localName} from ${moduleText} does not resolve to a symbol`,
 		);
+	}
+	const aliased = checker.getAliasedSymbol(symbol);
+	if (checker.isUnknownSymbol(aliased) || aliased.name !== importedName || aliased.declarations.length === 0) {
+		throw new Error(
+			`named ${kindLabel} import ${importedName} as ${localName} from ${moduleText} does not resolve to the real exported ${importedName}`,
+		);
+	}
+	for (const declaration of aliased.declarations) {
+		const declarationNode = declaration.resolve(ctx.project);
+		const declarationFile = declarationNode?.getSourceFile().fileName;
+		if (declarationFile === undefined || path.resolve(declarationFile) !== expectedTargetPath) {
+			throw new Error(
+				`named ${kindLabel} import ${importedName} as ${localName} from ${moduleText} resolves to ${declarationFile ?? "an unresolvable node"} instead of ${expectedTargetPath}`,
+			);
+		}
 	}
 	return { specifier, importedName, localName, symbol };
 }
@@ -440,6 +524,7 @@ function buildWhitelist(interactiveMode: ClassDeclaration, ctx: ParseContext): W
 		"./dialog-arbiter.js",
 		"DialogArbiter",
 		"DialogArbiter",
+		REAL_DIALOG_ARBITER_TS,
 		"DialogArbiter",
 	);
 	const hostCandidates: FunctionLikeDeclaration[] = [];
@@ -581,6 +666,7 @@ function locateTeardownSessionUi(source: string): TeardownLocation {
 		"./theme/theme.js",
 		"stopThemeWatcher",
 		"stopThemeWatcher",
+		REAL_THEME_TS,
 		"stopThemeWatcher",
 	);
 
@@ -1077,6 +1163,39 @@ function prepareReloadTarget(
 }
 
 describe("dialog arbiter closeout: source negative oracle", () => {
+	test("the real relative module imports resolve with no cannot-find-module diagnostic", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const source = readFileSync(filePath, "utf8");
+		// The virtual source at the real path must resolve both relative product
+		// modules; a cannot-find-module diagnostic would mean the oracle compares
+		// unresolved local alias symbols instead of real export declarations.
+		const ctx = parseSource(source);
+		const cannotFindModule = ctx.project.program
+			.getSemanticDiagnostics(ctx.sourceFile.fileName)
+			.filter((diagnostic) => diagnostic.code === 2307);
+		expect(cannotFindModule).toEqual([]);
+		// The alias targets resolve to the real product modules themselves.
+		const dialogArbiter = findImportBindingSymbol(
+			ctx,
+			"./dialog-arbiter.js",
+			"DialogArbiter",
+			"DialogArbiter",
+			REAL_DIALOG_ARBITER_TS,
+			"DialogArbiter",
+		);
+		expect(dialogArbiter.symbol.name).toBe("DialogArbiter");
+		const stopThemeWatcher = findImportBindingSymbol(
+			ctx,
+			"./theme/theme.js",
+			"stopThemeWatcher",
+			"stopThemeWatcher",
+			REAL_THEME_TS,
+			"stopThemeWatcher",
+		);
+		expect(stopThemeWatcher.symbol.name).toBe("stopThemeWatcher");
+	});
+
 	test("every editorContainer clear/addChild belongs to the whitelisted owners", () => {
 		initTheme("dark");
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
@@ -2305,6 +2424,59 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		expect(() => locateTeardownSessionUi(injected)).toThrow(
 			/expected exactly one named stopThemeWatcher import stopThemeWatcher as stopThemeWatcher from \.\/theme\/theme\.js, found 0/,
 		);
+	});
+
+	test("a whole-clause import type { DialogArbiter } cannot authorize the host (value import required)", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `import type { DialogArbiter }` is syntactically valid but imports only
+		// the type phase; production would emit TS1361 on the constructor host
+		// use and never run. The host scan must fail the explicit value-import
+		// requirement instead of accepting the type-only binding.
+		const hostImportMarker = 'import { DialogArbiter } from "./dialog-arbiter.js";';
+		const hostImportIndex = original.indexOf(hostImportMarker);
+		expect(hostImportIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, hostImportIndex) +
+			'import type { DialogArbiter } from "./dialog-arbiter.js";' +
+			original.slice(hostImportIndex + hostImportMarker.length);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(/whole-clause type-only import/);
+	});
+
+	test("a per-specifier { type DialogArbiter } import cannot authorize the host (value import required)", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `import { type DialogArbiter }` keeps the clause a value import but
+		// marks the specifier itself type-only; production would emit TS1361 on
+		// the constructor host use. The host scan must fail the explicit
+		// value-import requirement.
+		const hostImportMarker = 'import { DialogArbiter } from "./dialog-arbiter.js";';
+		const hostImportIndex = original.indexOf(hostImportMarker);
+		expect(hostImportIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, hostImportIndex) +
+			'import { type DialogArbiter } from "./dialog-arbiter.js";' +
+			original.slice(hostImportIndex + hostImportMarker.length);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(/type-only ImportSpecifier/);
+	});
+
+	test("a per-specifier type stopThemeWatcher cannot satisfy the teardown locator (value import required)", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Marking the watcher entry `type stopThemeWatcher` inside the mixed
+		// named import list is syntactically valid but type-only; the teardown
+		// locator must fail the explicit value-import requirement.
+		const watcherImportMarker = "\tstopThemeWatcher,\n";
+		const watcherImportIndex = original.indexOf(watcherImportMarker);
+		expect(watcherImportIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, watcherImportIndex) +
+			"\ttype stopThemeWatcher,\n" +
+			original.slice(watcherImportIndex + watcherImportMarker.length);
+		expect(() => locateTeardownSessionUi(injected)).toThrow(/type-only ImportSpecifier/);
 	});
 });
 
