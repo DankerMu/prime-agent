@@ -1,6 +1,32 @@
 import { readFileSync } from "node:fs";
 import { type Component, Container, setKeybindings } from "@earendil-works/pi-tui";
-import { describe, expect, test, vi } from "vitest";
+import {
+	type CallExpression,
+	type ClassDeclaration,
+	type FunctionLikeDeclaration,
+	isArrowFunction,
+	isBinaryExpression,
+	isCallExpression,
+	isClassDeclaration,
+	isConstructorDeclaration,
+	isFunctionDeclaration,
+	isFunctionExpression,
+	isGetAccessorDeclaration,
+	isIdentifier,
+	isMethodDeclaration,
+	isNewExpression,
+	isObjectLiteralExpression,
+	isPropertyAccessExpression,
+	isPropertyAssignment,
+	isSetAccessorDeclaration,
+	isVariableDeclaration,
+	type MethodDeclaration,
+	type Node,
+	type SourceFile,
+} from "typescript/unstable/ast";
+import { createVirtualFileSystem } from "typescript/unstable/fs";
+import { API } from "typescript/unstable/sync";
+import { afterAll, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ExtensionEditorComponent } from "../src/modes/interactive/components/extension-editor.js";
 import { ExtensionSelectorComponent } from "../src/modes/interactive/components/extension-selector.js";
@@ -9,519 +35,422 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 // ---------------------------------------------------------------------------
-// 10.1 source negative oracle: every `editorContainer.clear(` / `addChild(`
-// write lives inside one of the whitelisted owners. This is a deterministic
-// lexical scan (no parser dependency): comments, quoted string content and
-// template quasi text are masked while offsets and newlines are preserved, but
-// executable `${...}` template expressions are recursively retained (with their
-// strings/comments/nested templates masked) so a bypass hidden inside a
-// template expression is still scanned. Brace depth is counted on the masked
-// text only, each exact unmasked match is mapped to the innermost owning
-// class-level method/accessor/constructor (or the constructor's injected
-// `replaceEditorSurface` arrow, identified by its property name), and the
-// whitelist is occurrence-specific. Owner mapping is load-bearing: a bypass
-// sneaked into any other method (for example a direct reset that clears the
-// container) must fail with the method owner and the 1-based line printed.
+// 10.1 source negative oracle. `scanEditorContainerOwners` parses each source
+// with the TypeScript 7 virtual AST snapshot API (`typescript/unstable/*`) and
+// maps every executable `editorContainer.clear(` / `editorContainer.addChild(`
+// CallExpression inside `InteractiveMode` to its true innermost function-like
+// owner via real parent links. Only three structurally identified occurrences
+// may pass: the constructor's single initial mount, the unique
+// `replaceEditorSurface` PropertyAssignment arrow inside the constructor's
+// `new DialogArbiter({...})` object literal, and the unique
+// `setCustomEditorComponent` method. Names are diagnostics only; node identity
+// and ancestor relations decide ownership. Every scanned source must first pass
+// syntactic diagnostics or the scan throws a diagnostic error.
+//
+// One API instance and one in-memory virtual source/config are shared by all
+// scans (lazily initialized), and `afterAll` disposes the snapshot and closes
+// the API exactly once, leaving no tsgo process.
 // ---------------------------------------------------------------------------
 
-// Class-level method/accessor/constructor declarations sit at brace depth 1
-// (directly inside `export class InteractiveMode {` at line 832). A declaration
-// line carries a name token before `(`, `=`, `:`, or `<`, and the opening paren
-// (when present) must precede any `=`/`:` on the line so field initializers and
-// typed fields are not mistaken for methods.
-const DECL_LINE_RE =
-	/^[ \t]{1,3}(?:(?:private|public|protected|static|readonly|override|async|get|set|declare)\s+)*(?:readonly\s+)*(?:(?:private|public|protected|static|override|async)\s+)*(?:readonly\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:[<(=:])/;
+const VIRTUAL_DIR = "/__dialog-arbiter-closeout-oracle__";
+const VIRTUAL_TS = `${VIRTUAL_DIR}/interactive-mode.ts`;
+const VIRTUAL_TSCONFIG = `${VIRTUAL_DIR}/tsconfig.json`;
 
-function isMethodDeclLine(line: string): boolean {
-	const openParen = line.indexOf("(");
-	if (openParen === -1) return false;
-	const eq = line.indexOf("=");
-	const colon = line.indexOf(":");
-	const terminators = [eq, colon].filter((index) => index >= 0);
-	return openParen < (terminators.length > 0 ? Math.min(...terminators) : line.length);
+const TS_CONFIG = JSON.stringify({
+	compilerOptions: {
+		module: "esnext",
+		target: "esnext",
+		moduleResolution: "bundler",
+		strict: true,
+		noEmit: true,
+	},
+	include: ["*.ts"],
+});
+
+let oracleApi: API | undefined;
+let oracleFs: ReturnType<typeof createVirtualFileSystem> | undefined;
+let oracleSnapshot: ReturnType<API["updateSnapshot"]> | undefined;
+
+// The virtual FS write callback is optional on the FileSystem type but always
+// present on the value created by createVirtualFileSystem.
+function virtualWrite(fs: ReturnType<typeof createVirtualFileSystem>, path: string, content: string): void {
+	fs.writeFile!(path, content);
 }
 
-function countBraces(text: string): number {
-	let count = 0;
-	for (const char of text) {
-		if (char === "{") count += 1;
-		else if (char === "}") count -= 1;
+// Lazily initialize the shared virtual filesystem/API/config/source exactly
+// once and reuse it for every scan. The virtual FS falls back to the real FS
+// for unspecified paths; the oracle source/config themselves never touch disk.
+// The project and source file are opened on the first snapshot so later
+// `fileChanges.changed` updates can locate the project for the changed file.
+function initOracle(): void {
+	if (oracleApi !== undefined) return;
+	const virtualFs = createVirtualFileSystem({});
+	virtualWrite(virtualFs, VIRTUAL_TSCONFIG, TS_CONFIG);
+	virtualWrite(virtualFs, VIRTUAL_TS, "");
+	oracleFs = virtualFs;
+	oracleApi = new API({ cwd: VIRTUAL_DIR, fs: virtualFs });
+	oracleSnapshot = oracleApi.updateSnapshot({
+		openProjects: [VIRTUAL_TSCONFIG],
+		openFiles: [VIRTUAL_TS],
+	});
+}
+
+// Create the successor snapshot before disposing the prior one; AST nodes must
+// never be retained across updates.
+function parseSource(source: string): SourceFile {
+	initOracle();
+	virtualWrite(oracleFs!, VIRTUAL_TS, source);
+	const next = oracleApi!.updateSnapshot({ fileChanges: { changed: [VIRTUAL_TS] } });
+	if (oracleSnapshot !== undefined) oracleSnapshot.dispose();
+	oracleSnapshot = next;
+	const project = oracleSnapshot.getDefaultProjectForFile(VIRTUAL_TS);
+	if (project === undefined) {
+		throw new Error(`no configured project for ${VIRTUAL_TS}`);
 	}
-	return count;
+	const sourceFile = project.program.getSourceFile(VIRTUAL_TS);
+	if (sourceFile === undefined) {
+		throw new Error(`program has no source file for ${VIRTUAL_TS}`);
+	}
+	const diagnostics = project.program.getSyntacticDiagnostics(VIRTUAL_TS);
+	if (diagnostics.length > 0) {
+		const detail = diagnostics
+			.map((diagnostic) => {
+				const { line, character } = sourceFile.getLineAndCharacterOfPosition(diagnostic.pos);
+				return `TS${diagnostic.code} ${diagnostic.text} at ${line + 1}:${character + 1}`;
+			})
+			.join("; ");
+		throw new Error(`syntactic diagnostic in mutation source: ${detail}`);
+	}
+	return sourceFile;
 }
 
-// Single-pass masker preserving character offsets and newlines:
-//  - comments (`//` and `/* ... */`) and quoted strings are blanked;
-//  - template literals blank their quasi text (including the backticks) but
-//    recursively retain every executable `${...}` expression body, masking the
-//    strings/comments/nested-template quasi inside it, and keeping the `${`/`}`
-//    delimiters so brace depth stays balanced;
-//  - regex literals are blanked (content, character classes and escaped
-//    delimiters) so their braces can never corrupt depth accounting; division
-//    is distinguished by the preceding token. The retained expression bodies
-//    stay scannable; the blanked quasi can never produce a pattern hit.
-function maskLiterals(source: string): string {
-	const masked = [...source];
-	const length = source.length;
-	const blankSpan = (start: number, end: number) => {
-		for (let k = start; k < end; k++) {
-			masked[k] = source[k] === "\n" ? "\n" : " ";
+function isFunctionLikeDeclaration(node: Node): node is FunctionLikeDeclaration {
+	return (
+		isArrowFunction(node) ||
+		isFunctionExpression(node) ||
+		isFunctionDeclaration(node) ||
+		isMethodDeclaration(node) ||
+		isConstructorDeclaration(node) ||
+		isGetAccessorDeclaration(node) ||
+		isSetAccessorDeclaration(node)
+	);
+}
+
+// Innermost function-like ancestor of `node` (real parent links), or undefined
+// for a class-field or top-level write.
+function innermostFunction(node: Node): FunctionLikeDeclaration | undefined {
+	let current: Node | undefined = node.parent;
+	while (current !== undefined) {
+		if (isFunctionLikeDeclaration(current)) return current;
+		current = current.parent;
+	}
+	return undefined;
+}
+
+// Short label for one function-like node: named method/accessor, `constructor`,
+// or the actual binding name of a nested arrow/function (PropertyAssignment,
+// VariableDeclaration, assignment LHS, function name); unnamed ones fall back
+// to `arrow` / `function`.
+function nodeLabel(fn: FunctionLikeDeclaration): string {
+	if (isConstructorDeclaration(fn)) return "constructor";
+	if (isMethodDeclaration(fn)) return fn.name.getText(fn.getSourceFile());
+	if (isGetAccessorDeclaration(fn)) return `get ${fn.name.getText(fn.getSourceFile())}`;
+	if (isSetAccessorDeclaration(fn)) return `set ${fn.name.getText(fn.getSourceFile())}`;
+	if (isFunctionDeclaration(fn)) return fn.name?.getText(fn.getSourceFile()) ?? "function";
+	if (isArrowFunction(fn) || isFunctionExpression(fn)) {
+		const parent = fn.parent;
+		if (isPropertyAssignment(parent)) return parent.name.getText(fn.getSourceFile());
+		if (isVariableDeclaration(parent) && isIdentifier(parent.name)) {
+			return parent.name.getText(fn.getSourceFile());
 		}
-	};
-	// Mask the quasi text of one template literal starting at `start` (a
-	// backtick). Returns the index just past the closing backtick.
-	const maskTemplate = (start: number): number => {
-		let end = start + 1;
-		let quasiStart = start;
-		while (end < length) {
-			const ch = source[end]!;
-			if (ch === "\\") {
-				end += 2;
-				continue;
-			}
-			if (ch === "`") {
-				blankSpan(quasiStart, end + 1);
-				return end + 1;
-			}
-			if (ch === "$" && source[end + 1] === "{") {
-				blankSpan(quasiStart, end);
-				end = maskExpressionBody(end + 1);
-				quasiStart = end;
-				continue;
-			}
-			end += 1;
-		}
-		blankSpan(quasiStart, length);
-		return length;
-	};
-	// Mask one `${...}` expression body whose `{` sits at `braceIndex`: string
-	// literals, comments and nested template quasi inside the body are blanked,
-	// the code and the delimiting braces stay. Returns the index just past the
-	// matching closing `}`.
-	const maskExpressionBody = (braceIndex: number): number => {
-		let depth = 1;
-		let index = braceIndex + 1;
-		while (index < length && depth > 0) {
-			const ch = source[index]!;
-			if (ch === '"' || ch === "'") {
-				const quote = ch;
-				let e = index + 1;
-				while (e < length) {
-					if (source[e] === "\\") {
-						e += 2;
-						continue;
-					}
-					if (source[e] === quote) break;
-					e += 1;
-				}
-				const endInclusive = e < length ? e + 1 : e;
-				blankSpan(index, endInclusive);
-				index = endInclusive;
-			} else if (ch === "/" && source[index + 1] === "/") {
-				let e = source.indexOf("\n", index);
-				if (e === -1) e = length;
-				blankSpan(index, e);
-				index = e;
-			} else if (ch === "/" && source[index + 1] === "*") {
-				let e = source.indexOf("*/", index + 2);
-				if (e === -1) e = length;
-				else e += 2;
-				blankSpan(index, e);
-				index = e;
-			} else if (ch === "`") {
-				index = maskTemplate(index);
-			} else if (ch === "/") {
-				if (isRegexStart(source, index)) {
-					index = maskRegex(source, masked, index);
-				} else {
-					index += 1;
-				}
-			} else if (ch === "{") {
-				depth += 1;
-				index += 1;
-			} else if (ch === "}") {
-				depth -= 1;
-				index += 1;
-			} else {
-				index += 1;
-			}
-		}
-		return index;
-	};
-	let index = 0;
-	while (index < length) {
-		const ch = source[index]!;
-		if (ch === "/" && source[index + 1] === "/") {
-			let e = source.indexOf("\n", index);
-			if (e === -1) e = length;
-			blankSpan(index, e);
-			index = e;
-		} else if (ch === "/" && source[index + 1] === "*") {
-			let e = source.indexOf("*/", index + 2);
-			if (e === -1) e = length;
-			else e += 2;
-			blankSpan(index, e);
-			index = e;
-		} else if (ch === '"' || ch === "'") {
-			const quote = ch;
-			let e = index + 1;
-			while (e < length) {
-				if (source[e] === "\\") {
-					e += 2;
-					continue;
-				}
-				if (source[e] === quote) break;
-				e += 1;
-			}
-			const endInclusive = e < length ? e + 1 : e;
-			blankSpan(index, endInclusive);
-			index = Math.max(endInclusive, index + 1);
-		} else if (ch === "`") {
-			index = maskTemplate(index);
-		} else if (ch === "/") {
-			if (isRegexStart(source, index)) {
-				index = maskRegex(source, masked, index);
-			} else {
-				// Division operator: stays executable, never a regex body.
-				index += 1;
-			}
-		} else {
-			index += 1;
+		if (isPropertyAccessExpression(parent)) return parent.name.text;
+		if (isFunctionExpression(fn) && fn.name !== undefined) return fn.name.getText(fn.getSourceFile());
+		if (isBinaryExpression(parent)) {
+			// Assignment like `this.ui.onCopy = (text) => ...`: the arrow's label
+			// is the assignment target's property name.
+			const lhs = parent.left;
+			if (isPropertyAccessExpression(lhs)) return lhs.name.text;
+			if (isIdentifier(lhs)) return lhs.getText(fn.getSourceFile());
 		}
 	}
-	return masked.join("");
+	return isArrowFunction(fn) ? "arrow" : "function";
 }
 
-// Regex bodies live inside `maskLiterals` below; these helpers only know the
-// delimiters and the preceding-token rule, not regex syntax.
-const REGEX_START_BEFORE = /[([{,;:=!?&|+\-*%<>~^]/;
-
-// Is the `/` at `index` the start of a regex literal rather than a division
-// operator? After blanking, the previous non-whitespace character decides:
-// expression-start tokens begin a literal, an identifier/closing bracket means
-// division. This is a narrow lexical rule, not a general parser.
-function isRegexStart(source: string, index: number): boolean {
-	let previous = index - 1;
-	while (previous >= 0 && /\s/.test(source[previous]!)) {
-		previous -= 1;
+// Stable diagnostic owner label: the full function-like ancestor chain from the
+// class level down to the innermost owner, e.g.
+// `constructor > replaceEditorSurface (arrow) > nested (arrow)`.
+function functionLabel(fn: FunctionLikeDeclaration): string {
+	const chain: FunctionLikeDeclaration[] = [];
+	let current: Node | undefined = fn;
+	while (current !== undefined) {
+		if (isFunctionLikeDeclaration(current)) chain.unshift(current);
+		current = current.parent;
 	}
-	return previous < 0 || REGEX_START_BEFORE.test(source[previous]!);
-}
-
-// Mask one regex literal whose opening `/` sits at `start`: scan forward,
-// treating `[...]` as a character class (so a `/` or `{` inside it is not a
-// delimiter/quantifier) and `\` as escaping the next character. Returns the
-// index just past the closing `/` or `start + 1` when the token is unterminated.
-function maskRegex(source: string, masked: string[], start: number): number {
-	const length = source.length;
-	let index = start + 1;
-	let inClass = false;
-	while (index < length) {
-		const ch = source[index]!;
-		if (ch === "\\") {
-			index += 2;
-			continue;
-		}
-		if (ch === "[") {
-			inClass = true;
-			index += 1;
-			continue;
-		}
-		if (ch === "]") {
-			inClass = false;
-			index += 1;
-			continue;
-		}
-		if (ch === "/" && !inClass) {
-			const endInclusive = index + 1;
-			for (let k = start; k < endInclusive; k++) {
-				masked[k] = source[k] === "\n" ? "\n" : " ";
+	return chain
+		.map((node) => {
+			if (
+				isMethodDeclaration(node) ||
+				isConstructorDeclaration(node) ||
+				isGetAccessorDeclaration(node) ||
+				isSetAccessorDeclaration(node)
+			) {
+				return nodeLabel(node);
 			}
-			return endInclusive;
-		}
-		if (ch === "\n") break;
-		index += 1;
-	}
-	// Unterminated: mask only the opening delimiter so following code stays
-	// scannable and the rest keeps its newlines.
-	masked[start] = " ";
-	return start + 1;
+			return `${nodeLabel(node)} (${isArrowFunction(node) ? "arrow" : "function"})`;
+		})
+		.join(" > ");
 }
 
-// 1-based inclusive line range: `start` is the declaration line, `end` is the
-// last body line. Consumers compare directly against 1-based hit lines.
-interface OwnerRange {
-	start: number;
-	end: number;
-	name: string;
+function findInteractiveMode(sourceFile: SourceFile): ClassDeclaration {
+	const matches = sourceFile.statements
+		.filter(isClassDeclaration)
+		.filter((statement) => statement.name?.text === "InteractiveMode");
+	if (matches.length !== 1) {
+		throw new Error(`expected exactly one InteractiveMode class, found ${matches.length}`);
+	}
+	return matches[0]!;
 }
 
-// Locate every class-level method/accessor/constructor body by scanning the
-// masked source for depth-1 declaration lines and pairing each with the line
-// where the depth drops back to 1 (its closing brace).
-function findClassMethods(masked: string): OwnerRange[] {
-	const lines = masked.split("\n");
-	const depths: number[] = [];
-	let depth = 0;
-	for (const line of lines) {
-		depths.push(depth);
-		depth += countBraces(line);
+// Unique body-bearing method on InteractiveMode by name; absence or ambiguity
+// fails explicitly.
+function findMethod(interactiveMode: ClassDeclaration, name: string): MethodDeclaration {
+	const matches = interactiveMode.members
+		.filter(isMethodDeclaration)
+		.filter((member) => member.name.getText(interactiveMode.getSourceFile()) === name && member.body !== undefined);
+	if (matches.length !== 1) {
+		throw new Error(`expected exactly one ${name} method, found ${matches.length}`);
 	}
-	const ranges: OwnerRange[] = [];
-	for (let index = 0; index < lines.length; index++) {
-		const line = lines[index]!;
-		if (depths[index] !== 1) continue;
-		const match = DECL_LINE_RE.exec(line);
-		if (!match || !isMethodDeclLine(line)) continue;
-		const name = match[1]!;
-		// Body opens on the first later line whose pre-depth is >= 2.
-		let bodyOpen = -1;
-		for (let j = index + 1; j < lines.length; j++) {
-			if (depths[j]! >= 2) {
-				bodyOpen = j;
-				break;
-			}
-		}
-		if (bodyOpen === -1) continue;
-		let end = lines.length - 1;
-		for (let j = bodyOpen + 1; j < lines.length; j++) {
-			if (depths[j]! === 1) {
-				end = j - 1;
-				break;
-			}
-		}
-		// Ranges are stored in 1-based line coordinates (declaration line through
-		// the last body line inclusive), so every consumer compares against the
-		// 1-based hit `line` directly without an off-by-one.
-		ranges.push({ start: index + 1, end: end + 1, name });
-	}
-	return ranges;
+	return matches[0]!;
 }
 
-// Arrow-opened blocks (e.g. the constructor's injected `replaceEditorSurface`
-// closure) whose `{` opens at depth >= 2; used to distinguish the arrow body
-// from its enclosing constructor body. Every `=>` token on a line is considered
-// (character-offset level), so same-line nested block arrows and concise
-// expression bodies each establish their own block. Each block carries the
-// global character offset of its `=>` token (innermost selection for same-line
-// arrows) and is labelled with the arrow's binding name when the arrow is a
-// named property (`key: (arg) =>`) or a const/let declaration; otherwise it
-// stays "arrow".
-function findArrowBlocks(masked: string, source: string): Array<OwnerRange & { arrowOffset: number }> {
-	const lines = masked.split("\n");
-	const depths: number[] = [];
-	let depth = 0;
-	for (const line of lines) {
-		depths.push(depth);
-		depth += countBraces(line);
-	}
-	const lineStarts: number[] = [];
-	let lineStart = 0;
-	for (const line of lines) {
-		lineStarts.push(lineStart);
-		lineStart += line.length + 1;
-	}
-	const blocks: Array<OwnerRange & { arrowOffset: number }> = [];
-	for (let index = 0; index < lines.length; index++) {
-		const line = lines[index]!;
-		const pre = depths[index]!;
-		if (pre < 2) continue;
-		let searchFrom = 0;
-		let arrow = line.indexOf("=>", searchFrom);
-		while (arrow !== -1) {
-			searchFrom = arrow + 2;
-			const brace = line.indexOf("{", arrow);
-			const end =
-				brace === -1
-					? index + 1
-					: (() => {
-							let j = index + 1;
-							while (j < lines.length && depths[j]! > pre) {
-								j += 1;
-							}
-							return j;
-						})();
-			// 1-based coordinates, same convention as findClassMethods.
-			blocks.push({
-				start: index + 1,
-				end,
-				name: arrowBindingName(source, index, arrow),
-				arrowOffset: lineStarts[index]! + arrow,
-			});
-			arrow = line.indexOf("=>", searchFrom);
-		}
-	}
-	return blocks;
+// The receiver's FINAL identifier: the `.name` of a PropertyAccessExpression
+// receiver (`this.editorContainer` -> `editorContainer`,
+// `editorContainerProxy.editorContainer` -> the inner `editorContainer`) or the
+// bare Identifier receiver itself (`editorContainer.clear()`).
+function finalReceiverIdentifier(receiver: Node): Node | undefined {
+	if (isPropertyAccessExpression(receiver)) return receiver.name;
+	if (isIdentifier(receiver)) return receiver;
+	return undefined;
 }
 
-// The arrow body opens on the masked declaration line; find the owning arrow's
-// name from the original source line: the token immediately before `:` (named
-// property like `replaceEditorSurface: (component) =>`) or before `=`
-// (const/let declaration like `const labelled = (...) =>`), anchored at this
-// specific `=>` so multiple arrows on one line each resolve to their binding.
-function arrowBindingName(source: string, lineIndex: number, arrowOffset: number): string {
-	const line = source.split("\n")[lineIndex] ?? "";
-	if (arrowOffset === -1) return "arrow";
-	const before = line.slice(0, arrowOffset);
-	const colon = before.lastIndexOf(":");
-	const eq = before.lastIndexOf("=");
-	const anchor = Math.max(colon, eq);
-	if (anchor === -1) return "arrow";
-	const nameMatch = before.slice(0, anchor).match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/);
-	return nameMatch ? nameMatch[1]! : "arrow";
+// The raw source slice starting at `editorContainer` through the call open
+// paren must be exactly `editorContainer.clear(` / `editorContainer.addChild(`.
+// The slice is anchored at the receiver's final identifier node and the callee
+// expression's end/open-paren character, never by substring search;
+// spaced/computed/optional variants stay excluded.
+function matchesPattern(call: CallExpression, sourceFile: SourceFile): "clear" | "addChild" | undefined {
+	const expression = call.expression;
+	if (!isPropertyAccessExpression(expression)) return undefined;
+	const operation = expression.name.text;
+	if (operation !== "clear" && operation !== "addChild") return undefined;
+	const receiverIdentifier = finalReceiverIdentifier(expression.expression);
+	if (receiverIdentifier === undefined || receiverIdentifier.getText(sourceFile) !== "editorContainer") {
+		return undefined;
+	}
+	const markerStart = receiverIdentifier.getStart(sourceFile);
+	const openParen = call.expression.end;
+	const parenChar = sourceFile.text[openParen];
+	if (parenChar !== "(") return undefined;
+	return sourceFile.text.slice(markerStart, openParen + 1) === `editorContainer.${operation}(` ? operation : undefined;
 }
 
-// The InteractiveMode class body (`export class InteractiveMode {` at line 832)
-// runs to the end of the file. The lexical scan also finds earlier helper
-// classes (e.g. ExpandableText) whose members must not be confused with the
-// arbiter-owning InteractiveMode members.
-function findInteractiveModeMethods(source: string, masked: string): OwnerRange[] {
-	// The class declaration line is 1-based (findIndex + 1), matching the 1-based
-	// method range convention; every member declaration line is >= this.
-	const classStart = source.split("\n").findIndex((line) => line.trim() === "export class InteractiveMode {") + 1;
-	return findClassMethods(masked).filter((method) => method.start >= classStart);
-}
-
-const PATTERNS = [
-	{ label: "editorContainer.clear(", regex: /editorContainer\.clear\(/g },
-	{ label: "editorContainer.addChild(", regex: /editorContainer\.addChild\(/g },
-];
-
-// Whitelist is occurrence-specific. Every hit must resolve to the innermost
-// enclosing class method/accessor/constructor, and only these are allowed:
-//  - the constructor's initial editor mount: a single exact
-//    `editorContainer.addChild(this.editor as Component)` statement (the
-//    semantic predicate tied to that exact initialization statement);
-//  - the constructor's injected `replaceEditorSurface` arrow: clear plus
-//    conditional addChild;
-//  - `setCustomEditorComponent`: clear + addChild (arbiter-idle branch only;
-//    guard correctness is inherited from the group 2 behavior tests).
-interface OwnerHit {
+interface OracleHit {
 	label: string;
 	line: number;
 	owner: string;
 }
 
-function scanEditorContainerOwners(source: string): OwnerHit[] {
-	const masked = maskLiterals(source);
-	const methods = findInteractiveModeMethods(source, masked);
-	const arrows = findArrowBlocks(masked, source);
+// Structural whitelist: constructor initial mount (unique direct-constructor
+// call with the exact initial-mount text), the unique `replaceEditorSurface`
+// property arrow inside the constructor's `new DialogArbiter({...})` object
+// literal, and the unique `setCustomEditorComponent` method. Multiple
+// structural candidates authorize none.
+interface Whitelist {
+	initialMount: CallExpression;
+	replaceEditorSurface: FunctionLikeDeclaration;
+	setCustomEditorComponent: MethodDeclaration;
+}
 
-	const lineOf = (offset: number): number => source.slice(0, offset).split("\n").length;
-
-	// The constructor's initial mount is the single exact
-	// `this.editorContainer.addChild(this.editor as Component)` statement in the
-	// constructor body (outside any arrow). The same exact statement legitimately
-	// exists in setCustomEditorComponent's arbiter-idle branch, so the uniqueness
-	// predicate is scoped to the constructor body only.
-	const constructorMethod = methods.find((method) => method.name === "constructor");
-	// Ranges are 1-based; an arrow's range starts at its declaration line, so a
-	// hit on or after the declaration line and within the body is inside it.
-	const inArrowRange = (line: number): boolean => arrows.some((block) => block.start <= line && line <= block.end);
-	const isConstructorInitialMount = (offset: number, line: number): boolean => {
-		if (!constructorMethod) return false;
-		// Method/arrow ranges and hit lines are all 1-based.
-		if (line < constructorMethod.start || line > constructorMethod.end) return false;
-		if (inArrowRange(line)) return false;
-		const occurrences = [...source.matchAll(/this\.editorContainer\.addChild\(this\.editor as Component\)/g)];
-		const inConstructor = occurrences.filter((occurrence) => {
-			const l = lineOf(occurrence.index);
-			return l >= constructorMethod.start && l <= constructorMethod.end && !inArrowRange(l);
-		});
-		// The pattern offset is the `editorContainer.addChild(` match inside the
-		// full `this.editorContainer.addChild(...)` statement span, so compare by
-		// span containment, not exact offset equality.
-		return (
-			inConstructor.length === 1 &&
-			offset >= inConstructor[0]!.index &&
-			offset < inConstructor[0]!.index + inConstructor[0]![0].length
-		);
-	};
-
-	const ownerOf = (offset: number, line: number): { owner: string; allowed: boolean } => {
-		const method = resolveMethodOwner(methods, line);
-		const methodLabel = method ? method.name : "<no enclosing class method>";
-
-		// Innermost containing arrow: smallest range wins, then the `=>` token
-		// whose global character offset is the last one at-or-before the hit, so
-		// a nested callback declared inside the replaceEditorSurface arrow is
-		// owned by the nested binding, never by the whitelisted arrow.
-		const containing = arrows
-			.filter((block) => block.start <= line && line <= block.end && block.arrowOffset <= offset)
-			.sort((a, b) => a.end - a.start - (b.end - b.start) || b.arrowOffset - a.arrowOffset);
-		const inArrow = containing[0];
-		if (inArrow) {
-			return {
-				owner: `${methodLabel} > ${inArrow.name} (arrow)`,
-				allowed: method?.name === "constructor" && inArrow.name === "replaceEditorSurface",
-			};
-		}
-		if (method?.name === "constructor") {
-			if (isConstructorInitialMount(offset, line)) {
-				return { owner: "constructor (initial editor mount)", allowed: true };
-			}
-			return { owner: "constructor (body)", allowed: false };
-		}
-		if (method?.name === "setCustomEditorComponent") {
-			return { owner: "setCustomEditorComponent", allowed: true };
-		}
-		return { owner: methodLabel, allowed: false };
-	};
-
-	const hits: OwnerHit[] = [];
-	for (const pattern of PATTERNS) {
-		pattern.regex.lastIndex = 0;
-		let match = pattern.regex.exec(masked);
-		while (match !== null) {
-			const line = lineOf(match.index);
-			const { owner, allowed } = ownerOf(match.index, line);
-			if (!allowed) {
-				hits.push({ label: pattern.label, line, owner });
-			}
-			match = pattern.regex.exec(masked);
-		}
+function buildWhitelist(interactiveMode: ClassDeclaration, sourceFile: SourceFile): Whitelist {
+	const constructorMatches = interactiveMode.members.filter(isConstructorDeclaration);
+	if (constructorMatches.length !== 1) {
+		throw new Error(`expected exactly one constructor, found ${constructorMatches.length}`);
 	}
+	const constructorNode = constructorMatches[0]!;
+
+	// Exactly one direct-constructor call whose text is the initial mount.
+	const initialMountText = "this.editorContainer.addChild(this.editor as Component)";
+	let initialMount: CallExpression | undefined;
+	const scanConstructor = (node: Node): void => {
+		if (isCallExpression(node)) {
+			if (node.getText(sourceFile) === initialMountText && innermostFunction(node) === constructorNode) {
+				if (initialMount !== undefined) {
+					throw new Error("multiple constructor initial-mount calls found");
+				}
+				initialMount = node;
+			}
+		}
+		node.forEachChild(scanConstructor);
+	};
+	scanConstructor(constructorNode);
+	if (initialMount === undefined) {
+		throw new Error("constructor initial mount not found");
+	}
+
+	// Exactly one `new DialogArbiter({...})` directly owned by the constructor
+	// whose object-literal argument holds exactly one `replaceEditorSurface`
+	// PropertyAssignment whose initializer is an ArrowFunction. Candidates are
+	// counted globally across every direct-constructor NewExpression; a second
+	// host anywhere (another NewExpression or a duplicate property) fails closed.
+	const hostCandidates: FunctionLikeDeclaration[] = [];
+	const scanNewArbiter = (node: Node): void => {
+		if (isNewExpression(node)) {
+			if (innermostFunction(node) !== constructorNode) return;
+			if (node.expression.getText(sourceFile) === "DialogArbiter" && node.arguments !== undefined) {
+				for (const argument of node.arguments) {
+					if (!isObjectLiteralExpression(argument)) continue;
+					const propertyCandidates = argument.properties
+						.filter(isPropertyAssignment)
+						.filter((property) => property.name.getText(sourceFile) === "replaceEditorSurface");
+					if (propertyCandidates.length !== 1 || !isArrowFunction(propertyCandidates[0]!.initializer)) {
+						throw new Error(
+							`expected exactly one replaceEditorSurface arrow property in new DialogArbiter, found ${propertyCandidates.length}`,
+						);
+					}
+					hostCandidates.push(propertyCandidates[0]!.initializer);
+				}
+			}
+		}
+		node.forEachChild(scanNewArbiter);
+	};
+	scanNewArbiter(constructorNode);
+	if (hostCandidates.length !== 1) {
+		throw new Error(`expected exactly one DialogArbiter host arrow in constructor, found ${hostCandidates.length}`);
+	}
+	const arbiterHost = hostCandidates[0]!;
+
+	return {
+		initialMount,
+		replaceEditorSurface: arbiterHost,
+		setCustomEditorComponent: findMethod(interactiveMode, "setCustomEditorComponent"),
+	};
+}
+
+function scanEditorContainerOwners(source: string): OracleHit[] {
+	const sourceFile = parseSource(source);
+	const interactiveMode = findInteractiveMode(sourceFile);
+	const whitelist = buildWhitelist(interactiveMode, sourceFile);
+
+	const hits: OracleHit[] = [];
+	const walk = (node: Node): void => {
+		if (isCallExpression(node)) {
+			const pattern = matchesPattern(node, sourceFile);
+			if (pattern !== undefined) {
+				const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+				const owner = innermostFunction(node);
+				const allowed =
+					node === whitelist.initialMount ||
+					(owner !== undefined && owner === whitelist.replaceEditorSurface) ||
+					(owner !== undefined && owner === whitelist.setCustomEditorComponent);
+				if (!allowed) {
+					hits.push({
+						label: `editorContainer.${pattern}(`,
+						line: line + 1,
+						owner: owner === undefined ? "<no enclosing function>" : functionLabel(owner),
+					});
+				}
+			}
+		}
+		node.forEachChild(walk);
+	};
+	walk(interactiveMode);
 	return hits;
 }
 
-// Innermost class-level method/accessor/constructor containing a 1-based line.
-function resolveMethodOwner(methods: OwnerRange[], line: number): OwnerRange | undefined {
-	const candidates = methods.filter((method) => method.start <= line && method.end >= line);
-	candidates.sort((a, b) => a.end - a.start - (b.end - b.start));
-	return candidates[0];
-}
-
-// Locate the teardownSessionUi method body on the real source (no fixed lines):
-// returns its 1-based declaration/body range and the 1-based lines of the real
-// `this.stop(...)` and `stopThemeWatcher()` calls within it, using only the
-// lexical method-range machinery shared with the scanner.
-function locateTeardownSessionUi(source: string): {
-	range: OwnerRange;
+// ---------------------------------------------------------------------------
+// AST teardown locator: unique body-bearing teardownSessionUi method, real
+// `this.stop(...)` and `stopThemeWatcher()` CallExpressions inside it, both
+// unique and ordered by node position (this.stop before the watcher).
+// ---------------------------------------------------------------------------
+interface TeardownLocation {
+	methodStartLine: number;
+	methodEndLine: number;
 	stopCallLine: number;
 	stopThemeWatcherLine: number;
-} {
-	const masked = maskLiterals(source);
-	const methods = findInteractiveModeMethods(source, masked);
-	const teardown = methods.find((method) => method.name === "teardownSessionUi");
-	expect(teardown).toBeDefined();
-	const lines = source.split("\n");
-	// Scope both call searches to the located method body (1-based lines in
-	// [start, end]): `stopThemeWatcher();` also exists in other methods, so a
-	// global scan would pick the wrong occurrence.
-	let stopCallLine = -1;
-	let stopThemeWatcherLine = -1;
-	for (let i = teardown!.start; i <= teardown!.end; i++) {
-		const line = lines[i - 1] ?? "";
-		if (stopCallLine === -1 && /^\s*this\.stop\(/.test(line) && line.includes("preserveAltScreen")) {
-			stopCallLine = i;
+}
+
+function locateTeardownSessionUi(source: string): TeardownLocation {
+	const sourceFile = parseSource(source);
+	const interactiveMode = findInteractiveMode(sourceFile);
+	const teardown = findMethod(interactiveMode, "teardownSessionUi");
+	const body = teardown.body;
+	if (body === undefined) throw new Error("teardownSessionUi has no body");
+
+	const lineOf = (node: Node): number => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+	const stops: number[] = [];
+	const watchers: number[] = [];
+	const walk = (node: Node): void => {
+		if (isCallExpression(node)) {
+			const expression = node.expression;
+			if (
+				isPropertyAccessExpression(expression) &&
+				expression.name.text === "stop" &&
+				expression.expression.getText(sourceFile) === "this"
+			) {
+				stops.push(node.getStart(sourceFile));
+			}
+			if (expression.getText(sourceFile) === "stopThemeWatcher") {
+				watchers.push(node.getStart(sourceFile));
+			}
 		}
-		if (line.trim() === "stopThemeWatcher();") {
-			stopThemeWatcherLine = i;
-		}
+		node.forEachChild(walk);
+	};
+	walk(body);
+
+	const methodStart = lineOf(teardown);
+	const methodEnd = sourceFile.getLineAndCharacterOfPosition(teardown.getEnd()).line + 1;
+	if (stops.length !== 1)
+		throw new Error(`expected exactly one this.stop call in teardownSessionUi, found ${stops.length}`);
+	if (watchers.length !== 1) {
+		throw new Error(`expected exactly one stopThemeWatcher call in teardownSessionUi, found ${watchers.length}`);
 	}
-	expect(stopCallLine).toBeGreaterThan(0);
-	expect(stopThemeWatcherLine).toBeGreaterThan(0);
-	return { range: teardown!, stopCallLine, stopThemeWatcherLine };
+	const stopOffset = stops[0]!;
+	const watcherOffset = watchers[0]!;
+	if (stopOffset >= watcherOffset) {
+		throw new Error("this.stop must precede stopThemeWatcher by node position");
+	}
+	return {
+		methodStartLine: methodStart,
+		methodEndLine: methodEnd,
+		stopCallLine: lineOf(findCallAt(teardown, stopOffset, sourceFile)),
+		stopThemeWatcherLine: lineOf(findCallAt(teardown, watcherOffset, sourceFile)),
+	};
+}
+
+// The call node whose start offset equals `offset` inside `teardown`'s body.
+function findCallAt(teardown: MethodDeclaration, offset: number, sourceFile: SourceFile): Node {
+	let found: Node | undefined;
+	const walk = (node: Node): void => {
+		if (node.getStart(sourceFile) === offset) {
+			found = node;
+		}
+		node.forEachChild(walk);
+	};
+	walk(teardown);
+	if (found === undefined) throw new Error("call not found at offset");
+	return found;
+}
+
+// 1-based line range of a unique body-bearing InteractiveMode method (no fixed
+// product lines); used by mutation tests to place statements at method edges.
+function locateMethodRange(source: string, name: string): { start: number; end: number } {
+	const sourceFile = parseSource(source);
+	const interactiveMode = findInteractiveMode(sourceFile);
+	const method = findMethod(interactiveMode, name);
+	return {
+		start: sourceFile.getLineAndCharacterOfPosition(method.getStart(sourceFile)).line + 1,
+		end: sourceFile.getLineAndCharacterOfPosition(method.getEnd()).line + 1,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -947,11 +876,15 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "handleAgentsBack",
+			},
+		]);
 	});
 
 	test("oracle flags an extra clear in the constructor body", () => {
@@ -968,11 +901,13 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		lines.splice(mountLine + 1, 0, "\t\tthis.editorContainer.clear();");
 		const injected = lines.join("\n");
 		const hits = scanEditorContainerOwners(injected);
-		const clearFailure = hits.find((failure) => failure.label === "editorContainer.clear(");
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("constructor (body)");
-		// The whitelisted initial mount itself is still allowed.
-		expect(hits.filter((failure) => failure.label === "editorContainer.addChild(")).toEqual([]);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: mountLine + 2,
+				owner: "constructor",
+			},
+		]);
 	});
 
 	test("oracle does not attribute a class-field bypass on the line before setCustomEditorComponent to that whitelisted method", () => {
@@ -990,17 +925,20 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			original.slice(0, markerIndex) +
 			"\tprivate editorContainerBypass = this.editorContainer.clear();\n" +
 			original.slice(markerIndex);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).not.toBe("setCustomEditorComponent");
-		// The whitelisted addChild/clear inside setCustomEditorComponent itself is
-		// still allowed (only the injected field hit is reported).
-		const setCustomHits = scanEditorContainerOwners(injected).filter(
-			(failure) => failure.owner === "setCustomEditorComponent",
-		);
-		expect(setCustomHits).toEqual([]);
+		const hits = scanEditorContainerOwners(injected);
+		// The class field has no enclosing function: it must never borrow the
+		// adjacent whitelisted method. Its line is derived from the injected
+		// field's own offset in the mutation source.
+		const fieldOffset = injected.indexOf("private editorContainerBypass");
+		expect(fieldOffset).toBeGreaterThan(-1);
+		const fieldLine = injected.slice(0, fieldOffset).split("\n").length;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: fieldLine,
+				owner: "<no enclosing function>",
+			},
+		]);
 	});
 
 	test("oracle method boundaries hold on the first and last body lines of setCustomEditorComponent", () => {
@@ -1017,22 +955,15 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\tthis.editorContainer.clear(); // first body line" +
 			original.slice(markerIndex + marker.length);
-		const firstBodyHits = scanEditorContainerOwners(firstBody);
-		expect(firstBodyHits.filter((failure) => failure.label === "editorContainer.clear(")).toEqual([]);
-		// Inject a second clear before the method's closing brace by appending it
-		// right before the LAST body line of the method (found via the scanner's
-		// own range, so no fixed line). The declaration text is the anchor, and the
-		// method's end is derived from the same 1-based range machinery.
-		const masked = maskLiterals(original);
-		const methods = findInteractiveModeMethods(original, masked);
-		const setCustom = methods.find((method) => method.name === "setCustomEditorComponent");
-		expect(setCustom).toBeDefined();
+		expect(scanEditorContainerOwners(firstBody)).toEqual([]);
+		// Inject a clear just before the method's closing brace: locate the last
+		// body line via the parsed method range (no fixed line).
+		const setCustomRange = locateMethodRange(original, "setCustomEditorComponent");
 		const bodyLines = original.split("\n");
-		const lastBodyIndex = setCustom!.end - 1; // 1-based end -> 0-based index
+		const lastBodyIndex = setCustomRange.end - 1; // 1-based end -> 0-based index
 		bodyLines.splice(lastBodyIndex, 0, "\t\tthis.editorContainer.clear(); // last body line");
 		const lastBody = bodyLines.join("\n");
-		const lastBodyHits = scanEditorContainerOwners(lastBody);
-		expect(lastBodyHits.filter((failure) => failure.label === "editorContainer.clear(")).toEqual([]);
+		expect(scanEditorContainerOwners(lastBody)).toEqual([]);
 	});
 
 	test("oracle flags an unrelated constructor arrow containing clear and names that arrow", () => {
@@ -1049,11 +980,47 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\t\tthis.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("onCopy");
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > onCopy (arrow)",
+			},
+		]);
+		expect(hits[0]!.owner).not.toBe("constructor > arrow (arrow)");
+	});
+
+	test("oracle attributes a raw clear inside the get promptStash accessor to that accessor", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `get promptStash` is a real accessor; a raw clear injected into its body
+		// must be owned by the accessor, never `<no enclosing function>` or an
+		// adjacent method.
+		const marker = "private get promptStash(): PromptStash | undefined {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\tthis.editorContainer.clear();" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		// The injected clear's line is derived from the mutation source offset
+		// after the marker (the first textual clear in the file is the real
+		// constructor/replaceEditorSurface write, not the injected one).
+		const injectedClearOffset = injected.indexOf("\n\t\tthis.editorContainer.clear();", markerIndex);
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const clearLine = injected.slice(0, injectedClearOffset).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: clearLine,
+				owner: "get promptStash",
+			},
+		]);
 	});
 
 	test("oracle flags a template-literal executable bypass expression", () => {
@@ -1061,8 +1028,8 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
 		const original = readFileSync(filePath, "utf8");
 		// An executable `${this.editorContainer.clear()}` inside a template in a
-		// non-whitelisted method must be flagged (template expressions are
-		// retained, not blanked).
+		// non-whitelisted method must be flagged (template expressions are real
+		// CallExpressions to the parser).
 		const marker = "private handleAgentsBack(): boolean {";
 		const markerIndex = original.indexOf(marker);
 		expect(markerIndex).toBeGreaterThan(-1);
@@ -1076,11 +1043,15 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\t" +
 			templateBypass +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "handleAgentsBack",
+			},
+		]);
 	});
 
 	test("the same text inside a comment, string, or template quasi is ignored", () => {
@@ -1118,49 +1089,18 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n\t\t\t\t\t\tthis.editorContainer.clear();" +
 			"\n\t\t\t\t\t};" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("nested");
-		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 2;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (arrow) > nested (arrow)",
+			},
+		]);
 	});
 
-	test("regex literal braces in a whitelisted method cannot extend its range to a later forbidden clear", () => {
-		initTheme("dark");
-		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
-		const original = readFileSync(filePath, "utf8");
-		// A regex whose `{` would, if treated as an executable brace, keep
-		// setCustomEditorComponent's depth from closing, so a later raw clear in
-		// handleAgentsBack would be swallowed by the whitelisted range.
-		const setCustomMarker = "\tprivate setCustomEditorComponent(factory: EditorFactory | undefined): void {";
-		const setCustomIndex = original.indexOf(setCustomMarker);
-		expect(setCustomIndex).toBeGreaterThan(-1);
-		const poisoned =
-			original.slice(0, setCustomIndex) +
-			setCustomMarker +
-			"\n\t\tconst poison = /{/;" +
-			original.slice(setCustomIndex + setCustomMarker.length);
-		const backMarker = "private handleAgentsBack(): boolean {";
-		const backIndex = poisoned.indexOf(backMarker);
-		expect(backIndex).toBeGreaterThan(-1);
-		const injectedClear = "\t\tthis.editorContainer.clear();";
-		const injected =
-			poisoned.slice(0, backIndex) +
-			backMarker +
-			"\n" +
-			injectedClear +
-			poisoned.slice(backIndex + backMarker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("handleAgentsBack");
-		const expectedClearLine = injected.slice(0, backIndex).split("\n").length + 1;
-		expect(clearFailure!.line).toBe(expectedClearLine);
-	});
-
-	test("regex character classes and escaped delimiters cannot corrupt depth or emit a literal-text hit", () => {
+	test("regex literals are not executable and cannot emit a hit or poison a method", () => {
 		initTheme("dark");
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
 		const original = readFileSync(filePath, "utf8");
@@ -1182,20 +1122,18 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			injectedClear +
 			original.slice(markerIndex + marker.length);
 		const hits = scanEditorContainerOwners(injected);
-		const clearFailure = hits.find((failure) => failure.label === "editorContainer.clear(");
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("handleAgentsBack");
 		const markerLine = injected.slice(0, markerIndex).split("\n").length;
-		expect(clearFailure!.line).toBe(markerLine + 1 + regexLines.length);
-		// The regex bodies are masked: none of their lines produce a pattern hit.
-		const lines = injected.split("\n");
-		for (const regexLine of regexLines) {
-			const regexLineNumber = lines.indexOf(regexLine) + 1;
-			expect(hits.some((failure) => failure.line === regexLineNumber)).toBe(false);
-		}
+		// Regex bodies produce no hits; the later clear is the only rejected hit.
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: markerLine + 1 + regexLines.length,
+				owner: "handleAgentsBack",
+			},
+		]);
 	});
 
-	test("division is not consumed as a regex literal and the later forbidden clear is still reported", () => {
+	test("division stays executable and cannot swallow the later forbidden clear", () => {
 		initTheme("dark");
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
 		const original = readFileSync(filePath, "utf8");
@@ -1212,13 +1150,15 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			"\n" +
 			injectedClear +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("handleAgentsBack");
+		const hits = scanEditorContainerOwners(injected);
 		const markerLine = injected.slice(0, markerIndex).split("\n").length;
-		expect(clearFailure!.line).toBe(markerLine + 2);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: markerLine + 2,
+				owner: "handleAgentsBack",
+			},
+		]);
 	});
 
 	test("a same-line nested block arrow inside replaceEditorSurface is owned by the nested binding", () => {
@@ -1229,19 +1169,20 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 		const markerIndex = original.indexOf(marker);
 		expect(markerIndex).toBeGreaterThan(-1);
 		// The nested arrow and its clear sit on the same line as the whitelisted
-		// arrow's opening brace; the scanner must not fold them into the parent.
+		// arrow's opening brace; the parser must not fold them into the parent.
 		const injected =
 			original.slice(0, markerIndex) +
 			marker +
 			" const nested = () => { this.editorContainer.clear(); };" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("nested");
-		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
-		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length);
+		const hits = scanEditorContainerOwners(injected);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injected.slice(0, markerIndex).split("\n").length,
+				owner: "constructor > replaceEditorSurface (arrow) > nested (arrow)",
+			},
+		]);
 	});
 
 	test("a concise arrow inside replaceEditorSurface is owned by the innermost arrow, not the whitelisted parent", () => {
@@ -1256,13 +1197,14 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			"\n\t\t\t\tqueueMicrotask(() => this.editorContainer.clear());" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
-		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toContain("(arrow)");
-		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
-		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length + 1);
+		const hits = scanEditorContainerOwners(injected);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injected.slice(0, markerIndex).split("\n").length + 1,
+				owner: "constructor > replaceEditorSurface (arrow) > arrow (arrow)",
+			},
+		]);
 	});
 
 	test("with multiple arrows on one line the hit resolves to the innermost arrow, never the first", () => {
@@ -1279,28 +1221,357 @@ describe("dialog arbiter closeout: source negative oracle", () => {
 			marker +
 			" const a = () => 1; const b = () => this.editorContainer.clear();" +
 			original.slice(markerIndex + marker.length);
-		const clearFailure = scanEditorContainerOwners(injected).find(
-			(failure) => failure.label === "editorContainer.clear(",
+		const hits = scanEditorContainerOwners(injected);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injected.slice(0, markerIndex).split("\n").length,
+				owner: "constructor > replaceEditorSurface (arrow) > b (arrow)",
+			},
+		]);
+	});
+
+	test("a nested callback deliberately named replaceEditorSurface does not inherit the whitelist", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\t\t\tconst replaceEditorSurface = () => this.editorContainer.clear();" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (arrow) > replaceEditorSurface (arrow)",
+			},
+		]);
+	});
+
+	test("a same-named local arrow before the real replaceEditorSurface property is rejected while the real property stays allowed", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Inject a valid same-named local declaration BEFORE the real
+		// `replaceEditorSurface:` object property in the constructor. The unique
+		// whitelisted identity is the property arrow itself, so the earlier local
+		// arrow must be rejected at its own line while the real property's original
+		// clear/addChild stay allowed.
+		// Insert the local declaration at a valid constructor statement location
+		// (immediately before the `this.dialogArbiter = new DialogArbiter({`
+		// statement), so it is a statement in the constructor body, never inside
+		// the object literal.
+		const arbiterMarker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const arbiterIndex = original.indexOf(arbiterMarker);
+		expect(arbiterIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, arbiterIndex) +
+			"\t\tconst replaceEditorSurface = () => this.editorContainer.clear();\n" +
+			original.slice(arbiterIndex);
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, arbiterIndex).split("\n").length;
+		// Exactly the injected local write is rejected; the real property's
+		// original clear and conditional addChild are still allowed.
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (arrow)",
+			},
+		]);
+	});
+
+	test("a valid local/nested function named replaceEditorSurface in a constructor statement is rejected", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A local function declaration placed at a valid constructor statement
+		// location (immediately before the `this.dialogArbiter = new
+		// DialogArbiter({` statement) cannot inherit the whitelist.
+		const arbiterMarker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const arbiterIndex = original.indexOf(arbiterMarker);
+		expect(arbiterIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, arbiterIndex) +
+			"\t\tfunction replaceEditorSurface() {\n\t\t\tthis.editorContainer.clear();\n\t\t}\n" +
+			original.slice(arbiterIndex);
+		const hits = scanEditorContainerOwners(injected);
+		const injectedLine = injected.slice(0, arbiterIndex).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injectedLine,
+				owner: "constructor > replaceEditorSurface (function)",
+			},
+		]);
+	});
+
+	test("multiline parenthesized, object, ternary and nested-function bodies own the raw write, later parent write stays allowed", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const arrowBodies = [
+			"\n\t\t\t\tconst fn = () => (\n\t\t\t\t\tthis.editorContainer.clear()\n\t\t\t\t);\n\t\t\t\tthis.editorContainer.addChild(component);",
+			"\n\t\t\t\tconst fn = () => ({\n\t\t\t\t\tx: this.editorContainer.clear(),\n\t\t\t\t});\n\t\t\t\tthis.editorContainer.addChild(component);",
+			"\n\t\t\t\tconst fn = () => this.editorContainer.clear()\n\t\t\t\t\t? 1\n\t\t\t\t\t: 2;\n\t\t\t\tthis.editorContainer.addChild(component);",
+		];
+		for (const body of arrowBodies) {
+			const injected = original.slice(0, markerIndex) + marker + body + original.slice(markerIndex + marker.length);
+			const hits = scanEditorContainerOwners(injected);
+			const clearLine = injected.slice(0, injected.indexOf("this.editorContainer.clear()")).split("\n").length;
+			expect(hits).toEqual([
+				{
+					label: "editorContainer.clear(",
+					line: clearLine,
+					owner: "constructor > replaceEditorSurface (arrow) > fn (arrow)",
+				},
+			]);
+		}
+		// An ordinary nested function binding owns its raw write as a function.
+		const functionBody =
+			"\n\t\t\t\tfunction fn() {\n\t\t\t\t\tthis.editorContainer.clear();\n\t\t\t\t}\n\t\t\t\tthis.editorContainer.addChild(component);";
+		const functionInjected =
+			original.slice(0, markerIndex) + marker + functionBody + original.slice(markerIndex + marker.length);
+		const functionHits = scanEditorContainerOwners(functionInjected);
+		const functionClearLine = functionInjected
+			.slice(0, functionInjected.indexOf("this.editorContainer.clear()"))
+			.split("\n").length;
+		expect(functionHits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: functionClearLine,
+				owner: "constructor > replaceEditorSurface (arrow) > fn (function)",
+			},
+		]);
+	});
+
+	test("nested arrow and nested function raw writes inside setCustomEditorComponent are rejected with complete hit sets", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A nested arrow raw clear and a nested ordinary function raw addChild
+		// inside the whitelisted setCustomEditorComponent must each be rejected
+		// with their exact ancestor chains and computed lines. The method's own
+		// original direct clear/addChild remain allowed and must not appear in
+		// the hit set.
+		const marker = "\tprivate setCustomEditorComponent(factory: EditorFactory | undefined): void {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\tconst nestedArrow = () => this.editorContainer.clear();" +
+			"\n\t\tfunction nestedFunction() {\n\t\t\tthis.editorContainer.addChild(this.editor);\n\t\t}" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		// Anchor both injected lines on the mutation offsets (the first textual
+		// clear/addChild in the file belong to the real product source).
+		const arrowClearOffset = injected.indexOf("\n\t\tconst nestedArrow = () => this.editorContainer.clear();");
+		expect(arrowClearOffset).toBeGreaterThan(-1);
+		const arrowClearLine = injected.slice(0, arrowClearOffset).split("\n").length + 1;
+		const functionAddChildOffset = injected.indexOf("\t\t\tthis.editorContainer.addChild(this.editor);");
+		expect(functionAddChildOffset).toBeGreaterThan(-1);
+		const functionAddChildLine = injected.slice(0, functionAddChildOffset).split("\n").length;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: arrowClearLine,
+				owner: "setCustomEditorComponent > nestedArrow (arrow)",
+			},
+			{
+				label: "editorContainer.addChild(",
+				line: functionAddChildLine,
+				owner: "setCustomEditorComponent > nestedFunction (function)",
+			},
+		]);
+	});
+
+	test("a raw write before an arrow token is not retroactively owned by that arrow", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// The raw write precedes the `=>` token on the same line, so it must not be
+		// claimed by that arrow's body span; the write is owned by the enclosing
+		// method and still reported.
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\tthis.editorContainer.clear(); const later = () => 1;" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: injected.slice(0, markerIndex).split("\n").length + 1,
+				owner: "handleAgentsBack",
+			},
+		]);
+	});
+
+	test("a duplicate replaceEditorSurface structural property fails closed", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A second `replaceEditorSurface: (component) => ...` property inside the
+		// real `new DialogArbiter({...})` object literal must fail closed: no
+		// same-name candidate is authorized and the scan throws an explicit
+		// structural invariant error.
+		const marker = "\t\t\treplaceEditorSurface: (component) => {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\t\t\tthis.editorContainer.clear();\n\t\t\t},\n\t\t\treplaceEditorSurface: (component) => {" +
+			original.slice(markerIndex + marker.length);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(/replaceEditorSurface/);
+	});
+
+	test("a second direct-constructor new DialogArbiter host fails closed as ambiguous", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// A syntactically valid second `new DialogArbiter({ replaceEditorSurface:
+		// ... })` statement directly in the constructor body makes the host
+		// ambiguous: the scan must fail closed explicitly, authorizing neither.
+		const marker = "\t\tthis.dialogArbiter = new DialogArbiter({";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const second =
+			"\t\tconst secondArbiter = new DialogArbiter({\n" +
+			"\t\t\treplaceEditorSurface: (component) => {\n" +
+			"\t\t\t\tthis.editorContainer.clear();\n" +
+			"\t\t\t},\n" +
+			"\t\t});\n" +
+			"\t\tvoid secondArbiter;\n";
+		const injected = original.slice(0, markerIndex) + second + original.slice(markerIndex);
+		expect(() => scanEditorContainerOwners(injected)).toThrow(
+			/expected exactly one DialogArbiter host arrow in constructor, found 2/,
 		);
-		expect(clearFailure).toBeDefined();
-		expect(clearFailure!.owner).toBe("constructor > b (arrow)");
-		expect(clearFailure!.owner).not.toContain("> a (arrow)");
-		expect(clearFailure!.owner).not.toContain("replaceEditorSurface");
-		expect(clearFailure!.line).toBe(injected.slice(0, markerIndex).split("\n").length);
+	});
+
+	test("exact-pattern scope stays narrow: spaced/computed/optional variants are not counted", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\tthis.editorContainer .clear();\n" +
+			"\t\tthis.editorContainer?.clear();\n" +
+			"\t\tthis.editorContainer[" +
+			'"clear"' +
+			"]();" +
+			original.slice(markerIndex + marker.length);
+		// The spaced/computed/optional variants are outside task 10.1's exact
+		// pattern scope; no hit is produced.
+		expect(scanEditorContainerOwners(injected)).toEqual([]);
+	});
+
+	test("a bare local editorContainer alias still matches the exact executable pattern", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `const editorContainer = this.editorContainer; editorContainer.clear();`
+		// is an exact executable `editorContainer.clear(` even though the receiver
+		// is a bare identifier, not a dotted `this.editorContainer`.
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\tconst editorContainer = this.editorContainer;\n\t\teditorContainer.clear();" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		// The injected clear sits after the alias declaration; anchor the line on
+		// the injected call text, not the first textual occurrence in the file.
+		const injectedClearOffset = injected.indexOf("\n\t\teditorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const clearLine = injected.slice(0, injectedClearOffset).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: clearLine,
+				owner: "handleAgentsBack",
+			},
+		]);
+	});
+
+	test("a proxied editorContainerProxy.editorContainer receiver still matches the exact executable pattern", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// `editorContainerProxy.editorContainer.clear()` contains the exact
+		// executable `editorContainer.clear(` at the receiver's final identifier;
+		// the scanner must not anchor at the `editorContainerProxy` prefix.
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected =
+			original.slice(0, markerIndex) +
+			marker +
+			"\n\t\teditorContainerProxy.editorContainer.clear();" +
+			original.slice(markerIndex + marker.length);
+		const hits = scanEditorContainerOwners(injected);
+		// The injected call's line is derived from its own offset in the mutation
+		// source (the first textual `editorContainer.clear(` in the file belongs
+		// to the real product source, not the injected call).
+		const injectedClearOffset = injected.indexOf("\n\t\teditorContainerProxy.editorContainer.clear();");
+		expect(injectedClearOffset).toBeGreaterThan(-1);
+		const clearLine = injected.slice(0, injectedClearOffset).split("\n").length + 1;
+		expect(hits).toEqual([
+			{
+				label: "editorContainer.clear(",
+				line: clearLine,
+				owner: "handleAgentsBack",
+			},
+		]);
+	});
+
+	test("syntactically invalid mutation source is rejected with a diagnostic code and computed line/column", () => {
+		initTheme("dark");
+		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
+		const original = readFileSync(filePath, "utf8");
+		// Inject a statement that is not valid TypeScript at its location: the
+		// scanner must never turn invalid source into oracle evidence.
+		const marker = "private handleAgentsBack(): boolean {";
+		const markerIndex = original.indexOf(marker);
+		expect(markerIndex).toBeGreaterThan(-1);
+		const injected = `${original.slice(0, markerIndex) + marker}\n\t\tconst x = ;${original.slice(markerIndex + marker.length)}`;
+		const expectedLine = injected.slice(0, markerIndex).split("\n").length + 1;
+		expect(() => scanEditorContainerOwners(injected)).toThrow(
+			new RegExp(`TS1109 Expression expected\\.? at ${expectedLine}:13`),
+		);
 	});
 
 	test("teardownSessionUi body calls real this.stop before stopThemeWatcher without fixed lines", () => {
 		initTheme("dark");
 		const filePath = new URL("../src/modes/interactive/interactive-mode.ts", import.meta.url).pathname;
 		const source = readFileSync(filePath, "utf8");
-		const { range, stopCallLine, stopThemeWatcherLine } = locateTeardownSessionUi(source);
+		const { methodStartLine, methodEndLine, stopCallLine, stopThemeWatcherLine } = locateTeardownSessionUi(source);
 		// The real body order is drainInput -> releasePromptStashSession ->
 		// this.stop({ preserveAltScreen }) -> stopThemeWatcher(): the stop call
 		// must precede the theme watcher teardown inside the same method body.
 		expect(stopCallLine).toBeLessThan(stopThemeWatcherLine);
 		// Both calls live inside the located method range (no fixed lines).
-		expect(stopCallLine).toBeGreaterThanOrEqual(range.start);
-		expect(stopThemeWatcherLine).toBeLessThanOrEqual(range.end);
+		expect(stopCallLine).toBeGreaterThanOrEqual(methodStartLine);
+		expect(stopThemeWatcherLine).toBeLessThanOrEqual(methodEndLine);
 	});
 });
 
@@ -1953,4 +2224,15 @@ describe("dialog arbiter closeout: real teardownSessionUi -> real stop -> dispos
 		expect(h.ui.terminal.drainInput).toHaveBeenCalledTimes(2);
 		expect(target.releasePromptStashSession).toHaveBeenCalledTimes(2);
 	});
+});
+
+afterAll(() => {
+	if (oracleSnapshot !== undefined && !oracleSnapshot.isDisposed()) {
+		oracleSnapshot.dispose();
+		oracleSnapshot = undefined;
+	}
+	if (oracleApi !== undefined) {
+		oracleApi.close();
+		oracleApi = undefined;
+	}
 });
