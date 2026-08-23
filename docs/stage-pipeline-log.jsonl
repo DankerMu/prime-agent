@@ -1,1 +1,2 @@
 {"date":"2026-08-16","change":"tui-dialog-arbiter","grill_gate":"passed:branches=7,open=0","rounds":1,"gate_net_catch":0,"p0":{"in":1,"resolved":1,"residual":0},"p1":{"resolved":6},"regressions":0,"approx_subagent_calls":7,"verdict":"clean"}
+{"date":"2026-08-23","change":"prompt-settlement","grill_gate":"passed:branches=8,open=0","rounds":3,"gate_net_catch":3,"p0":{"in":3,"resolved":3,"residual":0},"p1":{"resolved":12},"regressions":1,"approx_subagent_calls":7,"verdict":"clean"}
