@@ -4,7 +4,7 @@
 
 ### Requirement: 稳定 promptId 与 lineage 归属
 
-session 经公共入口（`prompt`、`promptAndWait`、`promptAndSettle`、`promptUntilAccepted`、`acceptAgentMessagePrompt`、`queueAgentMessagePrompt`、`steer`、`followUp`，以及用户 `/goal` 命令触发的 goal context 入队）接受的每个 turn 类输入 MUST 在 admission 时刻获得唯一且稳定的 `promptId`；session 内部为某 prompt 排队的 autonomous threshold continuation MUST 继承该 prompt 的 `promptId`；`session_command` 类 action MUST NOT 参与结算（不分配 promptId、不取 lease、不产生 outcome）。
+session 经公共入口（`prompt`、`promptAndWait`、`promptAndSettle`、`promptUntilAccepted`、`acceptAgentMessagePrompt`、`queueAgentMessagePrompt`、`steer`、`followUp`，以及用户 `/goal` 命令触发的 goal context 入队）接受的每个 turn 类输入 MUST 在 admission accepted 时刻获得唯一且稳定的 `promptId`；公共 action 的 `promptIds` 为该单一 id，session 内部 autonomous threshold continuation 的 `promptIds` MUST 继承触发它的 run 的全部去重 owner。`steeringMode`/`followUpMode === "all"` 把多个 action 合并为一次 Agent run 时，各 promptId 保持独立，但该共享 run、retry、compaction continuation、assistant entry MUST 归属于全部 owners。`session_command` 类 action MUST NOT 参与结算（不分配 promptId、不取 lease、不产生 outcome）。
 
 #### Scenario: 公共入口每次 admission 分配新 promptId
 
@@ -19,17 +19,22 @@ session 经公共入口（`prompt`、`promptAndWait`、`promptAndSettle`、`prom
 #### Scenario: session 内部 autonomous continuation 继承 lineage
 
 - WHEN prompt A 的 run 触发 threshold compaction 且 session 为其内部排队 autonomous continuation
-- THEN 该 continuation action 的 `promptId` 等于 A 的 `promptId`，A 的 outcome 在该 continuation 完成前不产生
+- THEN 该 continuation action 的 `promptIds` 为 `[A.promptId]`，A 的 outcome 在该 continuation 完成前不产生
 
-#### Scenario: run 中 steer/followUp 不并入 lineage
+#### Scenario: run 中 steer/followUp 不合并 identity
 
 - WHEN prompt A 的 run 进行中，用户经 `steer()` 或 `followUp()` 提交输入
-- THEN 该输入获得新的 `promptId` B；A 的 outcome 只覆盖 A 自己的 run/retry/continuation，B 独立结算
+- THEN 该输入获得新的 `promptId` B；即使 `"all"` batching 使 A/B 共享一次后续 Agent run，两者仍有独立 outcome，且共享 run 的 retry/compaction/assistant entry 同时归属于 A 与 B
 
-#### Scenario: session_command 不参与结算
+#### Scenario: all batching 的共享 run 覆盖全部 owner
 
-- WHEN 经 `prompt()` 提交一条被识别为 session command 的输入（如 `/goal status`），随后提交一条普通 prompt
-- THEN session command 不产生 `prompt_outcome` 事件、`getPromptOutcome` 对其无记录，普通 prompt 正常结算
+- WHEN prompt A 与 B 以相同 delivery/execution policy 排队且 `steeringMode` 或 `followUpMode` 为 `"all"`，session 用一次 `agent.prompt` 执行两者
+- THEN A/B 各持有该共享 run 的 run lease；其 retry 与 post-compaction continuation 对 A/B 各持有对应 lease；共享 assistant entry 同时出现在两个 outcome 的 `finalMessageIds`，任一 outcome 都不得在共享 owned work 结束前产生
+
+#### Scenario: 非 turn 输入不参与结算
+
+- WHEN 经公共 prompt 入口提交 `sessionCommand`（如 `/goal status`）、`extensionCommand` 或被 extension input handler 标记为 `handled` 的输入，随后提交一条普通 turn prompt
+- THEN 非 turn 输入沿用现有 `AgentMessageOutcome.completion`/错误语义，但不分配 promptId、不产生 `prompt_outcome`、不写 ledger；普通 turn prompt 正常结算
 
 #### Scenario: 预分配 promptId
 
@@ -38,7 +43,17 @@ session 经公共入口（`prompt`、`promptAndWait`、`promptAndSettle`、`prom
 
 ### Requirement: owned-work lease 覆盖范围
 
-prompt 的结算 MUST 等待以下 owned work 全部结束：主 Agent run（含其同步等待的 tool 与子 Agent）、provider retry 等待窗口、threshold/requested compaction 的 post-compaction continuation、继承其 lineage 的 autonomous continuation。后台 auto-refine、cron、heartbeat、detached subagent、其他 prompt 的排队 action MUST NOT 阻塞该 prompt 的结算，其后续产生的消息 MUST NOT 重开已终态的 outcome。
+prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 run lease（覆盖排队、主 Agent run及同步 tool/子 Agent）、provider retry、post-compaction continuation、继承 lineage的 autonomous continuation。每次 acquire是独立实例，同 promptId/kind可并存；inherit action admission会新增 run lease。后台 auto-refine、cron、heartbeat、detached subagent、其他 prompt action不得阻塞或重开该 prompt。
+
+#### Scenario: accepted 排队 turn 从 admission 起持有 lease
+
+- WHEN turn A 被 accepted但仍排队，尚未进入 preparing
+- THEN A 已持有一个存于 action的 run lease且保持 settling；preparing不得重复 acquire，执行/取消只释放该已有 lease
+
+#### Scenario: 同 kind lease 按实例计数
+
+- WHEN A 的父 action尚持有 run lease，session又为其 accepted一个 inherited autonomous action
+- THEN tracker对同 promptId同时计数两个独立 run lease；任一单独释放都不得使 A终态
 
 #### Scenario: 同步 tool 调用阻塞结算
 
@@ -84,10 +99,15 @@ prompt 的结算 MUST 等待以下 owned work 全部结束：主 Agent run（含
 - WHEN 主 run 以 `stop` 结束且无 retry/continuation
 - THEN outcome 为 `{ status: "completed", advisor: "disabled" }`，`finalMessageIds` 含该 run 的 assistant message entry id，`sessionEpoch`/`traceGeneration` 为结算时刻值
 
-#### Scenario: abort 推导为 cancelled
+#### Scenario: abort 推导当前 run 为 cancelled 且保留可见队列
 
-- WHEN `session.abort()` 在 run 进行中被调用
-- THEN outcome 为 `cancelled`；即使 abort 前已记录 retry 失败，cancel fence 优先
+- WHEN `requestAbort()`（含 `session.abort()` 与连接层普通 abort 路径）在 A 的 run 进行中被调用，且可见 prompt B 仍在队列
+- THEN A及其所有内部 inherited autonomous actions/compaction continuations被摘除、置 cancel fence并释放各自已有 leases（即使此前有 failure，cancel优先）；真正的可见用户 prompt B不置 fence、保留 action run lease，恢复 pump后仍可执行且不因终态 A的 inherit action抛错
+
+#### Scenario: abortAndClearQueue 取消可见队列
+
+- WHEN 调用方执行 `clearQueue()`、mutate delete 或 `abortAndClearQueue()`，从 action store 实际移除已 accepted 的可见 prompt B
+- THEN B 产生一个 `cancelled` outcome；普通 abort 未移除的可见 prompt 不满足该条件
 
 #### Scenario: 终止错误推导为 failed
 
@@ -104,10 +124,20 @@ prompt 的结算 MUST 等待以下 owned work 全部结束：主 Agent run（含
 - WHEN 终态后对同一 `promptId` 调用 `acquire`
 - THEN 抛出错误，记录保持终态
 
+#### Scenario: pre-admission 拒绝不创建 outcome
+
+- WHEN 候选 turn 因 session disposing、等价 follow-up coalesce 或重复预分配 promptId 而未被 accepted
+- THEN tracker 不创建记录、不发 `prompt_outcome`，提交 API 沿用对应的现有拒绝语义；成功的非 turn 输入不属于该拒绝场景
+
 #### Scenario: admission 后未执行即被取消
 
-- WHEN prompt 已 admission（有 promptId）但在执行前被 coalesce/拒绝/清队
-- THEN 产生 `cancelled` outcome，不留下永久 `settling` 记录
+- WHEN default turn已 accepted并持有 action run lease，但执行前被 `clearQueue` 或 mutate delete移除
+- THEN cancellation先 `requestCancel`再释放已有 lease，产生 `cancelled`；禁止临时 acquire，不留 settling
+
+#### Scenario: 终态 owner 不接受 inherit action
+
+- WHEN abort与内部 autonomous continuation admission竞争，inherit owner已终态
+- THEN inherit action整项放弃、不入队、不 acquire、不抛穿 pump；终态 outcome不变
 
 ### Requirement: PromptOutcome 契约
 
@@ -139,16 +169,26 @@ prompt 的结算 MUST 等待以下 owned work 全部结束：主 Agent run（含
 
 ### Requirement: session 结算 API 与事件
 
-`AgentSession` MUST 提供 `promptAndSettle(text, options?: PromptOptions & { promptId?: string }): Promise<PromptOutcome>`（options 与 `promptAndWait` 同集，含 `streamingBehavior`、`internalPrompt`、`suppressAutonomousContinuation`）、`waitForPromptOutcome(promptId): Promise<PromptOutcome>`、`getPromptOutcome(promptId): PromptOutcome | undefined`，并在终态产生时发出 session event `{ type: "prompt_outcome", outcome }`；现有 `promptAndWait`、`AgentMessageOutcome`、`agent_end` 的语义与时序 MUST NOT 改变。
+`AgentSession` MUST 提供 `promptAndSettle(text, options?: PromptOptions & { promptId?: string }): Promise<PromptOutcome | undefined>`（options 与 `promptAndWait` 同集）。它 MUST 精确捕获本次调用是否 admit 了 turn：accepted turn 无论现有 completion resolve 或 reject 都以 tracker 为真值，返回结构化 `completed | failed | cancelled` outcome；成功 `sessionCommand`/`extensionCommand`/`handled` 在现有 completion 后返回 `undefined`，这些非 turn completion 失败仍 reject；turn admission 拒绝也 reject。候选 id 仅在本次 turn accepted 时 admit，非 turn 不占用且并发调用不得串 id。session 另提供 outcome 查询 API 并发 turn-only event；现有 `promptAndWait`、`AgentMessageOutcome`、`agent_end` 语义时序不变。
 
 #### Scenario: promptAndSettle 等到终态
 
-- WHEN 经 `promptAndSettle` 提交的 prompt 经历 retry 后完成
+- WHEN 经 `promptAndSettle` 提交的 turn 经历 retry 后完成
 - THEN 返回的 Promise 在 `prompt_outcome` 事件发出的同一时刻 resolve 为该 outcome
+
+#### Scenario: turn completion error 返回结构化 outcome
+
+- WHEN accepted turn 的现有 `AgentMessageOutcome.completion` 因 terminal run error 或 abort reject
+- THEN `promptAndSettle` 不透传该 completion error，而是等待并返回同 promptId 的 `failed/run_error` 或 `cancelled` outcome
+
+#### Scenario: 非 turn 等现有 completion 后返回 undefined
+
+- WHEN `promptAndSettle` 提交 `/goal status`、成功 extension command 或 `handled` 输入
+- THEN Promise 在对应现有 completion 时 resolve `undefined`，不产生 settlement record/event；extension command 失败时仍以原错误 reject
 
 #### Scenario: admission 失败即 reject
 
-- WHEN `promptAndSettle` 的 admission 被拒绝（session disposing 或等价 follow-up 已排队）
+- WHEN `promptAndSettle` 的 turn admission 被拒绝（session disposing、等价 follow-up 已排队或重复预分配 id）
 - THEN Promise reject，错误与 `promptAndWait` 在同条件下的错误一致，且不产生 `prompt_outcome` 事件
 
 #### Scenario: 已终态立即可得
@@ -163,7 +203,7 @@ prompt 的结算 MUST 等待以下 owned work 全部结束：主 Agent run（含
 
 ### Requirement: dispose 结算
 
-`dispose()` MUST 对全部未终态且未 released 的 prompt 原子结算 `cancelled`（`outcome.failure` 不填；原因 `session_disposed` 只写入 ledger 记录的 `settleReason`）并标记 released fence；`promptAndSettle` 的 waiter MUST 得到 `cancelled` outcome 而非悬空。
+`dispose()` MUST 通过一次 `settleAll("cancelled", "session_disposed", { released: true })` 对全部未终态且未 released 的 prompt 原子结算 `cancelled` 并同时标记 released fence（`outcome.failure` 不填；原因只写入 ledger 的 `settleReason`）；终态/released 记录 MUST 只 persist 一次，dispose MUST NOT 随后逐项 `release()` 产生第三条记录。`promptAndSettle` 的 waiter MUST 得到 `cancelled` outcome 而非悬空。
 
 #### Scenario: dispose 时在途与排队 prompt 各结算一次
 

@@ -1,12 +1,14 @@
 # Prompt Settlement 架构设计
 
-> 状态：架构方向已接受，尚未进入实现；本文从 advisor-architecture.md 拆出，作为 Advisor 与通用 `ask_user` 的公共结算地基，可先于两者独立交付
+> 状态：架构方向已接受；切片 1 OpenSpec 与实现 issues 已就绪、运行时代码尚未实现。当前实施以 `openspec/changes/prompt-settlement/` 为准，本文同时保留 Advisor/`ask_user` 接入后的完整愿景
 >
 > 日期：2026-08-16
 >
 > 范围：`packages/coding-agent` 的 TUI、daemon、Print、JSON、RPC 与 ACP 入口
 >
 > 关联：[Advisor 架构设计](advisor-architecture.md)、[通用 `ask_user` 会话能力](ask-user.md)
+>
+> 切片 1 边界：只生产 `completed | failed | cancelled`，`advisor` 恒 `disabled`；重启后未终态 lineage fail closed 为 `failed/runtime_restarted`，不重建；headless gate 使用独立 prompt outcomes 显式组合；TUI 不消费 outcome；不加 feature flag。`needs_user_input`/退出码 2 属于主题 3，Advisor coverage/correction/`unresolved_advisor` 属于主题 4。
 
 ## 1. 结论
 
@@ -60,7 +62,7 @@ prompt accepted -> PromptSettlement(admitted)
 
 当前 `AgentSession` 已有按 `agentMessageId` 记录的 `AgentMessageOutcome`，但它只区分 prompt 的 `delivery` 和当前 turn/action 的 `completion`，完成后立即删除，返回值也是 `Promise<void>`。它不是真正的结算，不能直接改名复用。
 
-首版应新增独立的 `PromptSettlementTracker`。稳定的 `promptId` 在 session 接受输入时创建，所有会影响该 prompt 最终结果的后继工作都继承该 lineage：
+首版应新增独立的 `PromptSettlementTracker`。稳定的 `promptId` 只在 session accepted 一个 turn 输入后创建；pre-admission coalesce/拒绝不创建 record，`sessionCommand`/`extensionCommand`/`handled` 非 turn 输入继续等现有 completion，但不进入 tracker。所有会影响 turn 最终结果的后继工作都继承 lineage；当 `"all"` batching 让多个独立 prompt 共享一次 Agent run 时，run/retry/compaction/assistant entry 对全部 owners 逐 id 记账，不合并 prompt identity：
 
 - 主 Agent run 及其普通 continuation；
 - provider retry；
@@ -94,10 +96,11 @@ interface PromptOutcome {
   pendingQuestions?: PendingUserQuestion[];
   sessionEpoch: number;
   traceGeneration: number;
+  failure?: { reason: string };
 }
 ```
 
-具体字段仍需在实现计划阶段核对现有 message identity 和 wire 类型；`PendingUserQuestion` 必须保留所属 `toolCallId`、原始 `question`、`options` 及其顺序，但不得再增加模型生成的 question identity。`pendingQuestions` 只在 fallback 形成 `needs_user_input` 终态时出现，并按 assistant/问题原始顺序保存当前及尚未执行的 ask；live responder 全部回答时不产生中间 outcome（见 [ask-user.md](ask-user.md)）。核心要求是终态 outcome 必须携带状态和关联 ID，而不是仅通过 Promise resolve 或最后一条文本反推成功。
+`failure` 仅在 `status === "failed"` 时出现且必填；切片 1 的原因是 `run_error | runtime_restarted`，`cancelled` 原因只留在 ledger 的 `settleReason`，不进入 outcome。`PendingUserQuestion` 必须保留所属 `toolCallId`、原始 `question`、`options` 及其顺序，但不得再增加模型生成的 question identity。`pendingQuestions` 只在 fallback 形成 `needs_user_input` 终态时出现，并按 assistant/问题原始顺序保存当前及尚未执行的 ask；live responder 全部回答时不产生中间 outcome（见 [ask-user.md](ask-user.md)）。核心要求是终态 outcome 必须携带状态和关联 ID，而不是仅通过 Promise resolve 或最后一条文本反推成功。
 
 ### 4.1 `status` 与 `advisor` 字段的组合矩阵
 
@@ -128,7 +131,7 @@ interface PromptOutcome {
 
 ### 5.2 Print
 
-- 每个输入通过 session 级 prompt outcome 等待其全部结果相关后继工作；多个 `messages` 按现有顺序组合等待。
+- 每个输入用 optional `promptAndSettle` 顺序等待；completed/成功非 turn才继续，failed/cancelled立即停止剩余inputs并跳过gate。非 turn由transcript选择command result，不伪造outcome。
 - stdout 只输出最终 settled 的主 Agent 文本，不输出被 Advisor 推翻的中间候选文本。
 - headless autonomous gate 必须加入当前外部请求的 settlement lineage，或作为子 prompt outcome 被上层显式组合；不能退回全局 idle 猜测。
 - 当前 print-mode 返回值只有 `0` 正常与 `1` 失败语义（信号退出 129/130/143 是独立路径），并会依次发送全部 `messages`。引入 `PromptOutcome(needs_user_input)` 后必须在该点短路剩余输入，并增加专用退出码 `2`：它表示需要外部输入，不是模型或运行时失败。输出完整问题后停止发送本次调用中尚未处理的后续 `messages`，避免越过未决问题；后续调用回答并正常结算后恢复现有 `0` 成功、`1` 失败语义。
@@ -145,14 +148,14 @@ interface PromptOutcome {
 ### 5.4 RPC
 
 - `prompt` command 继续在完成提交后即时返回 ACK，不把现有双向协议改造成长时间同步调用。
-- 协商支持 settlement 的 ACK 返回或确认一个稳定 `promptId`；后续 `prompt_outcome` 用该 ID 关联。
-- 当前 RPC client 的 `promptAndWait` 在第一个 `agent_end` 就 resolve，不能作为真正结算；新 client 必须等待对应 `prompt_outcome`。
+- accepted turn 的 ACK 返回稳定 `promptId`，后续 `prompt_outcome` 用该 ID 关联；非 turn ACK 无 id、不产生 outcome。
+- 当前 RPC client 的 `promptAndWait` 在第一个 `agent_end` resolve，只适用于 run 等待；新 RPC ACK 以 additive `promptSettlement: "supported"` 区分能力，再以 optional id 区分 turn/非 turn：有 id等 outcome，supported无 id返回 `undefined`，缺 marker明确拒绝。
 - `agent_end` 和其他流式事件保持现有 run 语义，不因 settlement 被隐藏。
 
 ### 5.5 ACP
 
-- `session/prompt` 等待初始 prompt outcome，并将 headless autonomous gate 的子 outcomes 组合进同一次 ACP 请求，然后才返回。
-- 保持 ACP 标准响应有效；Prime 专属状态放入可忽略的 namespaced `_meta` 或协议允许的扩展位置。
+- `session/prompt` 等 optional outcome；completed/成功非 turn才组合gate。failed维持JSON-RPC error、cancelled维持cancelled response，均不进gate。
+- 保持 ACP 标准响应有效；只有 turn 在可忽略的 namespaced `_meta` 附 outcome 摘要，非 turn省略。
 - 不要求不了解新契约的 ACP 客户端实现新的启动前握手，也不让可选元数据阻塞会话。
 
 ## 6. 持久化与恢复
@@ -178,7 +181,7 @@ pending question queue 的逐项持久化、重连展示与 admission 原子消�
 | ACP namespaced `_meta` 中的 settlement 状态 | 在 ACP 允许未知 metadata 的前提下 backward-compatible |
 | Print 退出码 `2` | 行为变化只在 `needs_user_input` 出现时触发；文档化并覆盖脚本兼容测试 |
 
-settlement 不改变现有 `agent_end` 的 run 终态含义，而是增加更高层的 prompt settlement。每个实际 daemon wire change 仍必须同步更新 `DAEMON_SCHEMA_REVISION`、命令/事件兼容映射，并覆盖 new-client/old-daemon 与 old-client/new-daemon；只有不兼容变化或启动开始依赖新行为时才按现有规则评估 `DAEMON_PROTOCOL_VERSION` bump。
+settlement 不改变 `agent_end`。daemon变化同步更新schema与兼容映射，但映射不能替代真实门控：supervisor必须按原public caller能力转发私有命令元数据并逐client过滤worker事件，直连worker同样在send path过滤；覆盖双向版本及同worker old/new并存。只有不兼容变化才评估protocol bump。
 
 ## 8. 测试与验收
 
@@ -189,7 +192,7 @@ settlement 不改变现有 `agent_end` 的 run 终态含义，而是增加更高
 3. 组合矩阵：`completed` 严格执行四条件；`needs_user_input`/`cancelled`/`failed` 不等待 Advisor 条件即结算，`advisor` 字段如实记录 `disabled`/`pending`/当时 coverage，不得用 `passed` 冒充未审查。
 4. 竞态：最后一个 owned-work lease 释放与新 correction/compaction continuation 建立并发时，outcome 只能在 generation 稳定且 review coverage 追平（或该终态不等待审查）后原子完成。
 5. 重启恢复：未终态 settlement 从 ledger、session JSONL 和 action recovery 重建；旧在途结果失效，终态 outcome 不重开，重连可查询最终状态。
-6. 模式结算：Print、JSON、RPC、ACP 在必须修正时不提前完成，允许多个 `agent_end`，只产生一个对应的 `prompt_outcome`；RPC ACK 仍即时返回，旧 `promptAndWait` 行为标记为不充分并由新等待逻辑替代。
+6. 模式结算：Print、JSON、RPC、ACP 的 turn 在必须续跑时不提前完成，允许多个 `agent_end`，只产生一个 outcome；session/extension/handled 非 turn保持原 completion/输出且不伪造 outcome；RPC ACK仍即时，并以能力 marker 区分旧底层。
 7. 退出码：Print/JSON 的 `needs_user_input` 在完整输出问题或结构化 outcome 后返回 `2`，本次后续 `messages` 未发送且保持原顺序；正常完成仍为 `0`、模型/运行时失败仍为 `1`，后续独立调用回答 pending 后可正常返回 `0`。
 8. 协议：daemon/RPC 能力协商和双向跨版本场景通过。
 9. 封口规则：prompt B 成功 admission 后，A 的在途修正自然完成且不再启动新周期；A 按 coverage 追平后的结果结算 `completed`/`unresolved_advisor`；steer 进 B 的迟到修正属于 B 的时间线，A 终态不重开；Print 顺序路径不触发封口，RPC 流水线提交触发并得到相同语义。

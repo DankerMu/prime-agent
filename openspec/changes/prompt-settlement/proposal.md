@@ -2,20 +2,20 @@
 
 ## Why
 
-`agent_end` 只是"一次底层 Agent run 结束"，但 Print/JSON/ACP 入口与 `RpcClient.promptAndWait` 都把第一个 `agent_end`（或 `AgentMessageOutcome.completion`）当作请求完成：provider retry、threshold/requested compaction 及其 post-compaction continuation 会建立新的 run，这些结果今天已经被请求方丢失（`rpc-client.ts:551/573` 在首个 `agent_end` resolve；`print-mode.ts:115-121` 逐条 `promptAndWait` 后靠 `waitForHeadlessCompletion` 的全局 `waitForIdle` 猜测）。`packages/coding-agent/docs/prompt-settlement.md` 把真正的请求结算定义为 session 级 `PromptSettlementTracker` 产生的结构化 `PromptOutcome`。它是 Advisor（主题 4）与通用 `ask_user`（主题 3）的公共地基，但独立成立，可先行交付。
+`agent_end` 只是"一次底层 Agent run 结束"，不能代表外部请求结算。现状有两类缺口：`RpcClient.promptAndWait` 在首个 `agent_end` resolve，连后续 retry run 都不覆盖（`rpc-client.ts:551/573`）；session 级 `promptAndWait` 已通过 `waitForRetry()` 覆盖配置允许的 retry chain，但不覆盖 100ms timer 持有的 post-compaction continuation，Print/JSON/ACP 只能在逐条 `promptAndWait` 后靠 `waitForHeadlessCompletion` 的全局 `waitForIdle` 猜测，既可能提前，也可能被无关 cron/heartbeat/其他队列拖住。`packages/coding-agent/docs/prompt-settlement.md` 因此把真正的请求结算定义为 session 级 `PromptSettlementTracker` 产生的结构化 `PromptOutcome`。它是 Advisor（主题 4）与通用 `ask_user`（主题 3）的公共地基，但独立成立，可先行交付。
 
 ## What Changes
 
-- 新增 session 级 `PromptSettlementTracker`：session 接受外部输入时创建稳定 `promptId`；该 prompt 的主 run、provider retry 等待窗口、threshold/requested compaction 的 post-compaction continuation、session 内部为其排队的 autonomous continuation 都以 **owned-work lease** 继承同一 lineage；最后一个 lease 释放时原子产生终态 `PromptOutcome`，settle-once，终态不重开。
+- 新增 session 级 `PromptSettlementTracker`：session accept 外部 turn 输入后创建稳定 `promptId`；该 prompt 的主 run、provider retry 等待窗口、threshold/requested compaction 的 post-compaction continuation、session 内部为其排队的 autonomous continuation 都以 **owned-work lease** 继承 lineage；`"all"` batching 让多个 prompt 共享一次 run 时，对全部独立 owners 逐 id 持有同类 lease，不合并 identity。最后一个 lease 释放时原子产生终态 `PromptOutcome`，settle-once，终态不重开。
 - 结算范围：主 run 同步等待的 tool/子 Agent 自然包含；后台 auto-refine、cron/heartbeat、detached subagent、以及任何经公共 `prompt()` 入口进入的 host 侧 prompt（含 headless gate continuation）都不并入——后者各自拿新 `promptId`，由模式入口显式组合。
 - `PromptOutcome` 契约按设计 §4 **完整定义**（`status` 五值、`advisor` 五值、`finalMessageIds`、`sessionEpoch`、`traceGeneration`、`pendingQuestions?`），wire 形状一次定型；本 change **可达**终态仅 `completed | failed | cancelled`，`advisor` 恒为 `disabled`。
-- `AgentSession` 新增 `promptAndSettle(): Promise<PromptOutcome>`、`waitForPromptOutcome(promptId)`、`getPromptOutcome(promptId)`，并发出新 session event `prompt_outcome`；现有 `promptAndWait`/`AgentMessageOutcome`/`agent_end` 语义与时序**完全不变**。
+- `AgentSession` 新增 `promptAndSettle(): Promise<PromptOutcome | undefined>`：accepted turn 等完整 settlement 并返回 outcome，现有 `sessionCommand`/`extensionCommand`/`handled` 非 turn输入继续等各自 completion 后返回 `undefined`，不分配 promptId、不写 ledger、不发 outcome。另增 `waitForPromptOutcome`/`getPromptOutcome` 与 turn-only `prompt_outcome` event；现有 `promptAndWait`/`AgentMessageOutcome`/`agent_end` 语义时序不变。
 - 最小 settlement ledger 持久化到 session JSONL（custom entry）：`promptId`、状态、`sessionEpoch`、`traceGeneration`、abort/released fence。runtime 重启后，未终态且未 released 的记录原子结算为 `failed`（`failure.reason = "runtime_restarted"`）；终态记录不重开；重启前在途结果按 epoch 作废。不做 lineage 重建（后续增强）。
-- 模式入口改为以 outcome 结算：Print/JSON 每条 `messages` 等待其 `PromptOutcome`；ACP `session/prompt` 等待初始 outcome；headless autonomous gate 的每个 continuation prompt 各自产生独立 outcome，由 `waitForHeadlessCompletion` 逐个等待而非 `waitForIdle`。Print/JSON 退出码语义不变（`0`/`1`，信号 129/130/143）。
-- daemon/RPC wire：新 server capability `prompt_settlement`；`prompt`/`prompt_and_wait` ACK 附带 `promptId`；新事件 `prompt_outcome`；新命令 `get_prompt_outcome { promptId }`；三者仅对声明该 capability 的客户端生效；`DAEMON_SCHEMA_REVISION` 16→17；`DAEMON_PROTOCOL_VERSION` 不变。`AgentConnection` 新增 `promptAndSettle()`（in-process 直连 session；daemon 连接以 ACK `promptId` + `prompt_outcome` 事件在客户端实现，不新增长运行命令）。
-- `RpcClient.promptAndWait` 语义不变（JSDoc 标注仅代表 run 终态），新增 `promptAndSettle()` 等待对应 `prompt_outcome`。
+- 模式入口用统一等待 API：普通 turn等 outcome，非 turn等现有 completion；failed/cancelled turn fail fast，不发送剩余 Print messages、不进入 gate，ACP保持 error/cancelled语义。completed/非 turn才组合 internal gate outcomes；不再依赖global idle。退出码/stopReason不变。
+- daemon/RPC wire：schema17 capability。supervisor在private envelope携带原public caller能力，worker内部产生完整结果，supervisor/直连worker在实际socket send与命令入口逐caller过滤；同worker old/new不串。prompt即时、prompt_and_wait completion，turn才有optional id。RPC ACK另带 `promptSettlement: "supported"` marker区分合法非 turn与旧底层；缺marker明确拒绝。
+- `RpcClient.promptAndWait` 语义不变；新增 `promptAndSettle()`，通过 additive `promptSettlement: "supported"` marker 区分 accepted turn、合法非 turn与不支持的底层 daemon：有 id等 outcome，supported无 id返回 undefined，缺 marker明确拒绝。
 - JSON 模式：`prompt_outcome` 作为新 session event 直接透传，定性 additive；`docs/json.md` 补事件说明与"消费者必须忽略未知事件类型"的前向兼容承诺。
-- ACP：`session/prompt` 响应在 namespaced `_meta` 中附带 outcome 摘要；不新增握手、不阻塞不识别该元数据的客户端。
+- ACP：普通 turn 的 `session/prompt` 响应在 namespaced `_meta` 中附 outcome 摘要；非 turn省略该字段；不新增握手、不阻塞不识别元数据的客户端。
 - 不加 feature flag：tracker 纯新增；模式入口改等 outcome 本身就是要修的缺陷。
 
 ### Non-goals（留给后续主题，逐条列明以防遗漏）
