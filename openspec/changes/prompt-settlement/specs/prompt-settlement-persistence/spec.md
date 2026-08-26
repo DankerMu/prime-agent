@@ -4,7 +4,7 @@
 
 ### Requirement: 最小 ledger 持久化
 
-session MUST 以 custom entry（`customType = "prime-agent.prompt-settlement"`）把每个 prompt 的 settlement 记录追加到 session JSONL：admission 时一条 `status: "settling"`，终态或 released 时一条终态记录；记录 MUST 含 `promptId`、`status`、`sessionEpoch`、`traceGeneration`、`finalMessageIds`、`cancelRequested`、`failureReason?`（仅 `failed` 记录，等于 `outcome.failure.reason`）、`settleReason?`（`settleAll` 的 reason，如 `session_disposed`/`runtime_restarted`；经 `settleAll("failed")` 产生的 failed 记录有 `failureReason === settleReason`；经 run 内 `recordFailure("run_error")` 产生的 failed 记录只有 `failureReason`、无 `settleReason`；`cancelled` 记录的 reason 不回流到 `PromptOutcome`）、`released`、`admittedAt`、`settledAt?`。Promise、lease、timer、transport request id MUST NOT 持久化。
+session MUST 以 custom entry（`customType = "prime-agent.prompt-settlement"`）把每个 accepted prompt 的 settlement 记录追加到 session JSONL：admission 时一条 `status: "settling"`，终态或终态+released 时一条终态记录；pre-admission 拒绝不写记录。记录 MUST 含 `promptId`、`status`、`sessionEpoch`、`traceGeneration`、`finalMessageIds`、`cancelRequested`、`failureReason?`（仅 `failed` 记录，等于 `outcome.failure.reason`）、`settleReason?`（`settleAll` 的 reason，如 `session_disposed`/`runtime_restarted`；经 `settleAll("failed")` 产生的 failed 记录有 `failureReason === settleReason`；经 run 内 `recordFailure("run_error")` 产生的 failed 记录只有 `failureReason`、无 `settleReason`；`cancelled` 记录的 reason 不回流到 `PromptOutcome`）、`released`、`admittedAt`、`settledAt?`。dispose MUST 以 `settleAll("cancelled", "session_disposed", { released: true })` 在一次 persist 中写出终态与 released fence，MUST NOT 先写未 released 终态再追加第三条 release 记录。Promise、lease、timer、transport request id MUST NOT 持久化。
 
 #### Scenario: 正常 prompt 写两条记录
 
@@ -15,6 +15,16 @@ session MUST 以 custom entry（`customType = "prime-agent.prompt-settlement"`�
 
 - WHEN prompt 经历 retry 与 compaction continuation
 - THEN 该 `promptId` 仍只有 admission 与终态两条记录
+
+#### Scenario: dispose 原子写终态与 released fence
+
+- WHEN accepted prompt 尚未终态时 session dispose
+- THEN JSONL 对该 prompt 只有 `settling` 与一条 `cancelled` 终态记录；终态记录同时为 `released: true`、`settleReason: "session_disposed"`，不存在 `released: false` 的中间终态或第三条 release 记录
+
+#### Scenario: pre-admission 拒绝不写盘
+
+- WHEN 候选 prompt 因 coalesce、disposing 或重复预分配 id 未被 accepted
+- THEN JSONL 中没有该候选 promptId 的 settlement custom entry
 
 ### Requirement: 重启后确定性结算
 
