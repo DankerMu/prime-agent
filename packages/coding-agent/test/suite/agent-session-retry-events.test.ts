@@ -453,6 +453,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_end:assistant",
 			"turn_end",
 			"agent_end",
+			"prompt_outcome",
 		]);
 	});
 
@@ -498,6 +499,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_end:assistant",
 			"turn_end",
 			"agent_end",
+			"prompt_outcome",
 		]);
 	});
 
@@ -528,7 +530,14 @@ describe("AgentSession retry and event characterization", () => {
 
 		await harness.session.prompt("hi");
 
-		expect(harness.events[harness.events.length - 1]?.type).toBe("agent_end");
+		// agent_end remains the terminal agent-loop event; the additive
+		// prompt_outcome settlement event follows it as failed/run_error.
+		expect(harness.events[harness.events.length - 2]?.type).toBe("agent_end");
+		const outcomeEvent = harness.events[harness.events.length - 1];
+		expect(outcomeEvent?.type).toBe("prompt_outcome");
+		if (outcomeEvent?.type === "prompt_outcome") {
+			expect(outcomeEvent.outcome).toMatchObject({ status: "failed", failure: { reason: "run_error" } });
+		}
 	});
 
 	it("emits agent_end for aborted runs and persists the aborted assistant message", async () => {
@@ -550,7 +559,15 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.abort();
 		await promptPromise;
 
-		expect(harness.events[harness.events.length - 1]?.type).toBe("agent_end");
+		expect(harness.events[harness.events.length - 2]?.type).toBe("agent_end");
+		const outcomeEvent = harness.events[harness.events.length - 1];
+		expect(outcomeEvent?.type).toBe("prompt_outcome");
+		// An aborted main run settles as cancelled with no failure, never
+		// completed and never failed.
+		if (outcomeEvent?.type === "prompt_outcome") {
+			expect(outcomeEvent.outcome).toMatchObject({ status: "cancelled" });
+			expect(outcomeEvent.outcome.failure).toBeUndefined();
+		}
 		const lastMessage = harness.session.messages[harness.session.messages.length - 1];
 		expect(lastMessage?.role).toBe("assistant");
 		if (lastMessage?.role === "assistant") {

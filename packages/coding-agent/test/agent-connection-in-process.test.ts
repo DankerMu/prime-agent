@@ -16,6 +16,7 @@ interface FakeSessionControl {
 	listenerCount(): number;
 	unsubscribeCount(): number;
 	emit(event: AgentSessionEvent): void;
+	child?: FakeSessionControl;
 }
 
 class FakeRuntime {
@@ -66,7 +67,11 @@ function userMessage(text: string, timestamp: number): AgentMessage {
 	};
 }
 
-function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionControl {
+function createFakeSession(
+	id: string,
+	messages: AgentMessage[],
+	child: FakeSessionControl | undefined = undefined,
+): FakeSessionControl {
 	const listeners = new Set<AgentSessionEventListener>();
 	let unsubscriptions = 0;
 	const thinkingLevel: AgentConnectionState["thinkingLevel"] = "medium";
@@ -127,6 +132,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 				listeners.delete(listener);
 			};
 		},
+		getRlmChildSession: () => (child?.session ?? undefined) as RuntimeSession | undefined,
 	} as unknown as RuntimeSession;
 
 	return {
@@ -138,6 +144,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 				listener(event);
 			}
 		},
+		child,
 	};
 }
 
@@ -343,5 +350,102 @@ describe("InProcessAgentConnection", () => {
 		expect(runtime.rebindSession).toBeUndefined();
 		expect(runtime.beforeSessionInvalidate).toBeUndefined();
 		expect(runtime.disposed).toBe(true);
+	});
+
+	it("does not forward prompt_outcome to AgentConnection main listeners", async () => {
+		// Runtime event filter boundary: AgentSession direct subscribers still see
+		// prompt_outcome, but the InProcessAgentConnection forwarding (main
+		// session binding) must drop it so JSON/RPC/daemon/ACP/TUI never leak it.
+		const session = createFakeSession("settlement-filter", []);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		// A direct AgentSession subscriber sees the event.
+		const directSeen: AgentSessionEvent[] = [];
+		session.session.subscribe((event) => {
+			directSeen.push(event);
+		});
+
+		const outcomeEvent: AgentSessionEvent = {
+			type: "prompt_outcome",
+			outcome: {
+				promptId: "adapter-filter-id",
+				status: "completed",
+				advisor: "disabled",
+				finalMessageIds: [],
+				sessionEpoch: 1,
+				traceGeneration: 0,
+			},
+		};
+		session.emit(outcomeEvent);
+		// A regular session event still flows through.
+		session.emit({ type: "session_action_update", actions: { queuedCount: 0, steering: [], followUps: [] } });
+
+		expect(directSeen).toContain(outcomeEvent);
+		expect(events).toEqual([
+			{
+				type: "session_event",
+				event: { type: "session_action_update", actions: { queuedCount: 0, steering: [], followUps: [] } },
+			},
+		]);
+
+		await connection.dispose();
+	});
+
+	it("does not forward prompt_outcome through a real child watcher", async () => {
+		// The child watcher path (watchSession) must drop prompt_outcome from the
+		// child session's stream too; this calls the real watchSession() seam.
+		const child = createFakeSession("child-session", []);
+		const session = createFakeSession("parent-session", [], child);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const watcher = await connection.watchSession("child-1");
+		expect(watcher).toBeDefined();
+
+		const watched: AgentConnectionEvent[] = [];
+		const unsubscribe = watcher!.subscribe((event) => {
+			watched.push(event);
+		});
+		// A direct child subscriber sees the outcome event.
+		const directSeen: AgentSessionEvent[] = [];
+		child.session.subscribe((event) => {
+			directSeen.push(event);
+		});
+
+		const outcomeEvent: AgentSessionEvent = {
+			type: "prompt_outcome",
+			outcome: {
+				promptId: "child-filter-id",
+				status: "completed",
+				advisor: "disabled",
+				finalMessageIds: [],
+				sessionEpoch: 1,
+				traceGeneration: 0,
+			},
+		};
+		child.emit(outcomeEvent);
+		// A regular child event still flows through the watcher.
+		child.emit({ type: "session_action_update", actions: { queuedCount: 1, steering: ["x"], followUps: [] } });
+
+		expect(directSeen).toContain(outcomeEvent);
+		expect(watched).toEqual([
+			{
+				type: "session_event",
+				event: { type: "session_action_update", actions: { queuedCount: 1, steering: ["x"], followUps: [] } },
+			},
+		]);
+
+		// Unsubscribe stops delivery; close is safe and idempotent.
+		unsubscribe();
+		child.emit({ type: "session_action_update", actions: { queuedCount: 2, steering: [], followUps: [] } });
+		expect(watched).toHaveLength(1);
+		await watcher!.close();
+		await watcher!.close();
+
+		await connection.dispose();
 	});
 });

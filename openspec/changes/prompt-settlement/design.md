@@ -110,7 +110,7 @@ export class PromptSettlementTracker {
 
 ### D5 `finalMessageIds` 与 `traceGeneration`
 
-- `finalMessageIds`：主 agent `message_end` 事件写入 JSONL 的 **assistant** message entry `id`，归属于 **`_currentRunOwners`**——session 在每个主 agent run 开始时设置、结束时清空的 promptId 去重数组：普通 dispatch 取本次所有 turn action 的 `promptIds`；`_runScheduledPostCompactionContinue` 调用 `agent.continue()` 前取该 continuation 调度时捕获的 owner 快照、返回/抛出后清空；retry 的续跑发生在同一次 action dispatch 内（`:5784` `waitForRetry` 先于 completion settle），owners 不清空。每条 assistant entry 对 owners 逐 id 调 `recordFinalMessage`，所以共享 run 的各 prompt 都记录同一真实输出。这样即使 prompt B 在 A 的 continuation 待执行期间先行运行（`:7398-7404` 的重排路径），B 的消息归 B、A 的 continuation 消息归 A。不以"是否持有 lease"或当前 `_lastRunPromptIds` 推断迟到 continuation 归属；run 之外（`_currentRunOwners` 为空）追加的 assistant 消息不记录。`completed` 时为完整列表；`cancelled/failed` 时为已追加的部分。
+- `finalMessageIds`：组2先建立 `_currentRunOwners` owner snapshot但不记录消息（因此组2 outcome保持空数组）；组7再在主 agent `message_end` 事件写入 JSONL 的 **assistant** message entry `id`，归属于 **`_currentRunOwners`**——session 在每个主 agent run 开始时设置、结束时清空的 promptId 去重数组：普通 dispatch 取本次所有 turn action 的 `promptIds`；`_runScheduledPostCompactionContinue` 调用 `agent.continue()` 前取该 continuation 调度时捕获的 owner 快照、返回/抛出后清空；retry 的续跑发生在同一次 action dispatch 内（`:5784` `waitForRetry` 先于 completion settle），owners 不清空。每条 assistant entry 对 owners 逐 id 调 `recordFinalMessage`，所以共享 run 的各 prompt 都记录同一真实输出。这样即使 prompt B 在 A 的 continuation 待执行期间先行运行（`:7398-7404` 的重排路径），B 的消息归 B、A 的 continuation 消息归 A。不以"是否持有 lease"或当前 `_lastRunPromptIds` 推断迟到 continuation 归属；run 之外（`_currentRunOwners` 为空）追加的 assistant 消息不记录。`completed` 时为完整列表；`cancelled/failed` 时为已追加的部分。
 - `traceGeneration`：该 prompt 持有 lease 期间每次 compaction（threshold 或 requested）完成后 +1，admission 时为 0；`bumpTraceGeneration` 在 compaction 完成回调处对当前 `_currentRunOwners` 调用，若回调位于 run 结束边界则使用为该 compaction 捕获的 owner 快照，逐 id 递增（主题 4 的 review coverage 将对比它）；本 change 只计数不消费。
 - `sessionEpoch`：取 `_sessionInputArrivalEpoch`（`:1112`）在 admission 时刻的值。
 
@@ -226,3 +226,99 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不修改 `agent-session.ts`，不做 JSONL persist 实现，不接 daemon/RPC/mode，不生产 `needs_user_input` 或 `unresolved_advisor`。
 - lineage spec 的 abort保留/清空队列、pre-admission拒绝、终态owner拒绝inherit 等 session 场景由 #27/#31 覆盖；#26 只覆盖能直接通过 tracker API 构造的终态推导、lease交接、record形状、released fence与恢复行为，不为满足“settle-once全部scenario”越界伪造 session 测试。
+
+## Issue #27 implementation fixture
+
+Fixture level: expanded（上游建议 compact；本切片首次修改共享 `AgentSession` 公共 API/event、action store schema和 admission/queue/cancellation 状态转换，命中 public API、schema 与 concurrency mandatory expanded triggers）
+Repair intensity: high（一个 admission/release 顺序错误会制造永久 settling、错误终态或重复 outcome，并污染后续全部 runtime/mode/wire 切片）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts`、`session-action-store.ts`、必要的单一类型 re-export、新 `test/suite/agent-session-prompt-settlement.test.ts`，以及两个既有 identity-forward adapter 的临时过滤边界（`in-process-agent-connection.ts` 与 `daemon-extension-binding.ts`）；不修改 tracker 状态机。
+- Must preserve: `prompt`、`promptUntilAccepted`、`promptAndWait`、`AgentMessageOutcome`、action delivery/completion、queue visibility、retry-chain completion、existing session event consumers 与 action recovery snapshot的现有语义。
+- Must add: accepted turn在 enqueue前绑定稳定 id + run lease；action完成/错误/实际移除释放其自身 lease；session optional-outcome API/query/event；`"all"` batching owner并集。
+- Staged boundary: 本切片只挂 main run lease。retry 与 compaction continuation leases（组3/4）、autonomous inherit producer（组5）、主动 `requestAbort` ownership 清理与 dispose 原子 released fence（组6）、message ids（组7）、ledger（组8）及 AgentConnection API/wire capability（组10+）不提前实现。组2必须把 provider 已返回的 `aborted` 终态判为 cancelled，避免临时生产错误的 completed outcome；只在两个无 capability 的 adapter 入口丢弃 session-only event，不扩 `AgentConnectionSessionEvent`、daemon schema或外部输出。
+- Seam under test: in-process `AgentSession` + `test/suite/harness.ts` faux provider；另以既有 fake connection与 daemon binding callback seam证明 session直接订阅可见而 adapter不可见。tracker seam已由组1覆盖；真实process/RPC/JSON/ACP/TUI不消费本事件。
+
+### Admission and ownership contract
+
+- `SessionAction` 的 serializable/recovery payload不存 settlement identity或live lease。turn action runtime字段保存候选/accepted `promptIds` 与等长 `runLeases`；session command无这些字段。`getSessionActionRecoverySnapshot()`继续只保存现有action/delivery payload，不复制promptIds、Promise、closure或lease；`restoreSessionActions()`对普通turn生成新的default id，对 primary record 为 heartbeat/RLM notice 的稳定 customType重新派生 runtime-only background exclusion（prefix/next-turn context不得改变primary owner语义），old-ledger lineage recovery留组9。
+- `_createPreparedTurnAction` 只准备 candidate id或私有 `{inherit: owners}`，不调用 tracker；明确排除的 background turn连 candidate也不生成。该私有lineage option是组2的可测seam；现有public/internal prompt callers都走default，组5才把autonomous continuation producer接到inherit。
+- `_admitSessionInput` 顺序固定：disposing/pump fence → coalesce → `ActionStore.assertCanEnqueue(action)`纯检查action lifecycle/duplicate ticket且不写store → duplicate候选/全部inherit owner检查 → default同步persist-first `admit({sessionEpoch})`+fresh identity `acquire("run")`，或inherit逐一acquire → 写入action →已preflight的no-throw enqueue安装数组/ticket → accepted callback（try/catch observer isolation）→ arrival epoch递增/wake。
+- Default admission的post-admit failure被设计为不可达：#27 deps固定`now:Date.now`、`persist:()=>{}`，fresh identity在admit成功后`acquire("run")`不能unknown/terminal/busy；enqueue的所有显式throw条件已由同一store的pure preflight证明，随后同步安装不调用外部callback。若实现无法保持该结构，必须改为单id `requestCancel`+释放本actionlease并reject；禁止用global `settleAll`或留下settling。测试以red-capable monkeypatch/preflight regression证明duplicate action在admit前reject，而非要求生产注入persist spy。
+- Inherit admission为all-or-nothing：先校验owner非空/去重且全部`isSettling`，再逐一acquire；任何owner unknown/terminal/busy或任一acquire失败时，按逆序释放本action本次已取得的sibling leases，整个action不入队；不得`requestCancel` owner，也不得释放parent action已有同-kind lease。fixture测试通过私有create/admit seam构造parent+inherit，无需提前接组5 producer。
+- Action completion/cancel helper按object identity且仅一次消费其`runLeases`，消费前把数组从action取走并清空，防止release触发reentry、pump finally、cancel capture与重复queue操作二次释放。本次run最终 assistant `stopReason` 为 `error` 时先对owners记录`run_error`、为`aborted`时先置cancel fence；pump failure同样先记录`run_error`。default actual removal先`requestCancel`；inherit非-abort removal不cancel。每批开始清空terminal signal，禁止上一失败污染下一成功；第二次clear/mutate/finally必须零额外event/outcome。
+- `"all"` batch只汇总本次active turn actions的`promptIds`到组2新建的`_lastRunPromptIds`/`_currentRunOwners` snapshots，不合并identity，不再acquire。每个action仍独立持有自己的run lease，batch共享`agent.prompt`完成后逐action释放。组7不再“新增”owner fields，而是消费它们记录message ids；组2不调用`recordFinalMessage`，所有outcome的`finalMessageIds=[]`。
+
+### Session API and callback truth table
+
+- `PromptOptions.promptId` 是候选，只在本次 accepted turn admission时占用；non-turn成功不占用，可由后续调用复用。重复候选turn reject `DuplicatePromptAdmissionError`，且无新event/record/action。
+- 一次性 `settlementAdmission` callback只由本次 `_prompt` 调用触发一次：accepted turn `{supported:true,promptId}`；成功 session/extension/handled `{supported:true}`；pre-admission或non-turn completion失败不虚报accepted id。callback本身若抛必须按observer隔离，不回滚已accepted action或串到其他调用。
+- `promptAndSettle` 必须用闭包捕获本次callback，而非查询“最新record”或共享可变field。若捕获id，无论 legacy completion resolve/reject，最终返回 tracker cached outcome；若无id，成功 non-turn返回 `undefined`，失败沿原错误reject。调用方提供的 `agentMessageId` 若已被任一unfinished action或completion waiter占用，必须在创建本次deferred前拒绝，不能同key coalesce到旧action后伪装成successful non-turn。
+- `prompt_outcome` 在tracker terminal emit的同一同步段经 `_emit`广播；`getPromptOutcome`/`waitForPromptOutcome`返回同一cached object。事件只加入 `AgentSessionEvent`：AgentSession直接订阅可见；组10+接能力前，in-process main/watcher与daemon binding在identity-forward前丢弃，JSON/RPC/daemon/ACP/TUI不可见且`AgentConnectionSessionEvent`不扩union。公共d.ts必须从唯一 `prompt-settlement.ts` 类型源引用/导出 `PromptOutcome`，不得复制shape。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: selected - 新增 `AgentSession.promptAndSettle`、query/wait与event；CLI/modes保持不变。
+- Config / project setup: not selected - 无配置变化。
+- File IO / path safety / overwrite: not selected - persist仍no-op，不读写JSONL。
+- Schema / columns / units / field names: selected - action owner/lease字段、PromptOptions callback与session event shape必须单一来源。
+- Auth / permissions / secrets: not selected - 无授权边界。
+- Concurrency / shared state / ordering: selected - admission-before-enqueue、all-or-nothing inherit、`"all"` batching、completion/cancel双触发与并发callbacks。
+- Resource limits / large input / discovery: not selected - 无外部发现/大输入；owner数组按当前batch有界。
+- Legacy compatibility / examples: selected - public prompt/promptAndWait/action queue/recovery/event consumers不得改变。
+- Error handling / rollback / partial outputs: selected - admit/acquire/enqueue/observer失败与实际queue removal必须无0-lease或重复release。
+- Release / packaging / dependency compatibility: selected - exported session declarations必须能引用唯一 PromptOutcome类型；无依赖变化。
+- Documentation / migration notes: not selected -运行时状态文档统一在组17更新。
+- TUI focus/render lifecycle: not selected - TUI不消费settlement，本切片不触碰。
+- Session/extension teardown lifecycle: selected - accepted queued cancellation、disposing拒绝与background exclusion；dispose本身明确留组6。
+
+### Required evidence
+
+- idle turn + faux `stop` -> callback捕获非空id，action在queued/selected观察点已有一条run lease且tracker query为settling；`promptAndSettle` resolve completed，query/wait/event使用同一outcome对象，`finalMessageIds=[]`，event恰一次；legacy `prompt`/`promptAndWait`时序不变。session级测试不窥探private persist计数。
+- retry disabled + faux terminal error -> owner先记录`run_error`再一次消费lease，`promptAndSettle` resolve failed outcome而不透传completion错误；注入pump throw -> 同样failed/run_error且event一次；随后finally或二次cancel不产生第二outcome。
+- 两个独立accepted prompts（第二个排队）-> 各在enqueue前有独立id/lease，各只产生一次outcome；A完成不terminal B。`"all"` 两个actions共享一次run -> mid-run只读inspection证明`_lastRunPromptIds`/`_currentRunOwners`恰为本batch action promptIds去重并集；运行结束前两者均settling，结束后各completed一次，finalMessageIds仍为空。
+- gated同步tool -> tool pending时无outcome；tool完成且后续turn结束后completed。run中steer/followUp -> 新identity，不改当前owner；后续若batch为all仍各有独立outcome。
+- 私有inherit seam：parent已有run lease时给同owner创建inherit action -> 同kind lease实例数增加，取消inherit只release其lease且parent仍settling；多owner中第二个acquire失败 -> 已取得sibling lease回滚，parents lease与cancel flag不变、action未入store；unknown/terminal/busy owner ->整action不入队且不抛穿pump。
+- session command、成功extension、handled +候选P -> 每条成功输入的settlementAdmission恰调用一次`{supported:true}`且无promptId，返回undefined、零settlement event，P仍可被下一accepted turn使用；non-turn失败仍原错误reject且不虚报accepted id。
+- accepted queued default action经clearQueue与mutate delete实际移除 -> cancellation先于stored lease release，得到cancelled且无active record；第二次clear/mutate/pump finally零额外event；普通requestAbort未移除的可见queued action不在本组错误cancel。
+- disposing、coalesce、duplicate action/candidate id -> enqueue前reject，query(candidate)仍undefined且零event/action；duplicate action preflight在tracker admission前。并发promptAndSettle callbacks只收到本次id；callback throw不影响accepted action。
+- recovery snapshot包含原action/delivery payload但无promptIds/runLeases；`restoreSessionActions()`不经public callback，测试以新session的只读action-store inspection取得restored action的fresh promptId，随后query/event只出现该新id，旧settlement id不被继承或查询到。
+- representative heartbeat或pending auto-refine与A无owned-work关系 -> A main run lease释放即outcome，不等待global idle/background completion。
+- targeted command: 新AgentSession settlement suite +现有 prompt queue/promptAndWait/recovery回归文件；`npm run check`、coding-agent build、strict OpenSpec validation均exit 0。
+
+### Invariant Matrix
+
+- Governing invariant: 每个accepted turn在可见enqueue前恰有一个稳定prompt identity和至少一个action-owned run lease；只有该action的完成、失败或实际移除才能消费该lease，最后owner lease释放时恰产生一个不串call/batch的终态。
+- Source-of-truth identity/contract: action runtime `promptIds[i] ↔ runLeases[i]`、tracker Map identity、per-call settlement callback closure与cached PromptOutcome。
+- Producers: `_createPreparedTurnAction`候选、`_admitSessionInput` accepted分支、future inherit lineage；non-turn不得成为producer。
+- Validators/preflight: disposing/pump fence、coalesce、duplicate action id、duplicate/terminal owner与all-or-nothing inherit验证，全部在enqueue前。
+- Storage/cache/query: ActionStore runtime action + tracker in-memory Map；recovery snapshot不得序列化live lease；本组persist no-op。
+- Public routes/entrypoints: prompt family、steer/followUp、`promptAndSettle`、query/wait、session subscribe event。
+- Frontend/downstream consumers: existing promptAndWait/event/action-store callers unchanged；AgentConnection API/daemon capability/RPC/modes消费仍deferred，现有in-process/daemon adapter只增加session-only event过滤以保持外部行为不变。
+- Failure paths/rollback/stale state: preflight-before-admit、inherit sibling acquire rollback、terminal provider error/aborted、pump throw、double completion/cancel、clear/mutate delete、callback throw、completion-id占用、terminal inherit owner、background primary restore与普通primary+background prefix恢复。
+- Evidence/audit/readiness: faux-provider session suite、必要的只读action-store inspection、existing queue/recovery regressions、root check/build、strict OpenSpec。
+- Regression rows:
+  - accepted single/batched/tool-blocked turn -> lease spans queued+run+sync tool；mid-run owner snapshots等于batch去重owners；settles each owner once且group2 finalMessageIds为空。
+  - pre-admission reject or successful non-turn -> no identity/lease/event; candidate remains reusable when no turn was accepted.
+  - inherit multi-owner partial failure -> only本action新acquired siblings逆序释放，parent lease/cancel不变且action不入队。
+  - actual queued removal/pump throw -> default cancelled或failed后consume once；repeated removal/finally no extra outcome。
+  - recovery snapshot/restore -> snapshot不含live identity/lease；普通turn生成fresh id，background primary仍无identity，background prefix不改变普通primary identity。
+  - callback reentry/parallel submissions/completion-id collision -> each callback sees only its own admission，occupied id在新deferred前reject，observer failure不能污染lifecycle。
+  - direct AgentSession subscribe vs identity-forward adapters -> direct看见一个outcome；in-process main/watcher与daemon broadcast丢弃，外部union/wire不变。
+  - unchanged prompt/promptUntilAccepted/promptAndWait/recovery/event consumers -> prior timing and errors remain stable.
+
+### Boundary-surface checklist
+
+- Shared helper roots: action construct/admit/batch/terminal/cancel helpers and `PromptSettlementTracker`; no duplicated state machine.
+- Public entrypoints: AgentSession prompt family/query/event；mode adapter只做兼容过滤，无 AgentConnection API或daemon public wire扩展。
+- Read/write/overwrite: in-memory action+tracker only; no JSONL/file overwrite.
+- Stale/idempotency: consumed lease arrays emptied once；每批terminal signal清零；terminal owner inherit rejected；partial inherit acquire只回滚新sibling leases；duplicate candidate/completion id不重开；recovery不复制identity/lease且只由primary稳定customType派生background marker。
+- Producer/consumer evidence: callback/event/query bind to same promptId/outcome object；action-store inspection仅证明accepted-before-enqueue ownership，不作为tracker persist oracle。
+- Unchanged downstream consumers: promptAndWait、session-action recovery和外部AgentConnection/JSON/RPC/daemon/ACP/TUI事件流保持source/runtime兼容。
+
+### Non-goals for #27
+
+- 不实现retry/compaction/autonomous producer leases、主动in-flight abort ownership清理、dispose released fence、finalMessageIds、ledger/restart、AgentConnection API/daemon capability/RPC/Print/ACP/TUI接线；两个adapter过滤只阻止session-only event提前泄漏。
+- lineage spec 的 `requestAbort` inherited-work清理、abortAndClearQueue当前run与dispose场景分别由组6处理；本组只处理实际从action store移除的accepted queued action，并把provider最终已返回的`aborted` run正确推导为cancelled。
