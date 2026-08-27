@@ -5164,6 +5164,19 @@ export class AgentSession {
 			// turn stays settlement-excluded without ever serializing the marker.
 			const restoredNoSettlementIdentity =
 				recovered.payload.kind === "turn" && this._recoveredTurnIsBackgroundInjected(recovered.payload.records);
+			// Old/replayed snapshots can serialize an identity-bearing turn policy
+			// with `completionIncludesRetryChain:false` (pre-Round 1 customTrigger
+			// timing). Restore re-admits such turns with a fresh settlement
+			// identity, so their main-run retry chain is owned work again: the
+			// policy MUST be normalized to wait it before terminal fence/release.
+			// Settlement-excluded background turns have no identity and retain the
+			// serialized timing (false is legal there).
+			const restoredRetryChain =
+				recovered.payload.kind === "turn"
+					? restoredNoSettlementIdentity
+						? recovered.payload.executionPolicy.completionIncludesRetryChain
+						: true
+					: undefined;
 			const payload: PreparedTurnPayload | PreparedCommandPayload =
 				recovered.payload.kind === "turn"
 					? {
@@ -5199,6 +5212,11 @@ export class AgentSession {
 								: {}),
 							executionPolicy: {
 								...recovered.payload.executionPolicy,
+								// Normalize only for identity-bearing restored turns;
+								// other policy fields are copied verbatim.
+								...(restoredRetryChain !== undefined
+									? { completionIncludesRetryChain: restoredRetryChain }
+									: {}),
 								preparation: {
 									...recovered.payload.executionPolicy.preparation,
 								},

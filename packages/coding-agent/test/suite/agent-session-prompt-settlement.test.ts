@@ -1631,6 +1631,182 @@ describe("AgentSession prompt settlement (group 2)", () => {
 		});
 	});
 
+	describe("restore stale retry policy (Phase 6.2 invariant closure)", () => {
+		// Old/replayed recovery snapshots may serialize an identity-bearing turn
+		// policy with `completionIncludesRetryChain:false` (pre-Round 1
+		// customTrigger). Restore re-admits such turns with a fresh settlement
+		// identity, so their main-run retry chain is owned work again and the
+		// policy must be normalized to wait it; settlement-excluded background
+		// turns have no identity and retain the serialized timing.
+
+		it("normalizes an identity-bearing restored stale false policy to true; error→stop completes once after the chain", async () => {
+			// Build a valid queued ordinary turn snapshot through the real queue.
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("seed done")]);
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("stale-policy turn", undefined, { resumeIfIdle: true });
+			const snapshot = harness.session.getSessionActionRecoverySnapshot();
+			const record = snapshot.actions.find(
+				(
+					action,
+				): action is SessionActionRecoveryAction & {
+					payload: SessionActionRecoveryPayload & { kind: "turn" };
+				} => action.payload.kind === "turn",
+			)!;
+			expect(record.payload.executionPolicy.completionIncludesRetryChain).toBe(true);
+			// Emulate a pre-fix snapshot: only the retry-chain flag goes stale.
+			record.payload.executionPolicy.completionIncludesRetryChain = false;
+			pause.release();
+			await harness.session.waitForIdle();
+
+			const restoredHarness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(restoredHarness);
+			restoredHarness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+				fauxAssistantMessage("recovered"),
+			]);
+			await restoredHarness.session.restoreSessionActions(snapshot);
+			const restoredAction = turnActions(restoredHarness).find(
+				(action) => action.payload.text === "stale-policy turn",
+			)!;
+			expect(restoredAction).toBeDefined();
+			expect(restoredAction.noSettlementIdentity).toBeUndefined();
+			// `executionPolicy` lives on the prepared-turn payload, not the base
+			// SessionTurnPayload; cast for read-only inspection.
+			const restoredPolicy = (
+				restoredAction.payload as unknown as { executionPolicy: { completionIncludesRetryChain: boolean } }
+			).executionPolicy;
+			expect(restoredPolicy.completionIncludesRetryChain).toBe(true);
+			const freshId = restoredAction.promptIds![0];
+			expect(freshId).toBeDefined();
+			expect(restoredAction.runLeases).toHaveLength(1);
+			expect(restoredHarness.session.getPromptOutcome(freshId)).toBeUndefined();
+
+			let agentEnds = 0;
+			let leaseHeldAtFirstEnd = false;
+			restoredHarness.session.subscribe((event) => {
+				if (event.type !== "agent_end") return;
+				agentEnds++;
+				if (agentEnds === 1) {
+					const action = turnActions(restoredHarness).find(
+						(candidate) => candidate.payload.text === "stale-policy turn",
+					);
+					leaseHeldAtFirstEnd = (action?.runLeases?.length ?? 0) > 0;
+				}
+			});
+
+			restoredHarness.session.resumeQueuedWork();
+			await restoredHarness.session.waitForSessionInputIdle();
+			await restoredHarness.session.waitForIdle();
+
+			expect(agentEnds).toBe(2);
+			expect(leaseHeldAtFirstEnd).toBe(true);
+			const outcomes = restoredHarness.eventsOfType("prompt_outcome");
+			expect(outcomes).toHaveLength(1);
+			expect(outcomes[0]!.outcome).toMatchObject({ promptId: freshId, status: "completed" });
+			expect(outcomes[0]!.outcome.failure).toBeUndefined();
+			expect(restoredHarness.session.getPromptOutcome(freshId)).toBe(outcomes[0]!.outcome);
+		});
+
+		it("settles the same stale restored snapshot failed/run_error when retry is disabled", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("seed done")]);
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("stale-policy disabled", undefined, { resumeIfIdle: true });
+			const snapshot = harness.session.getSessionActionRecoverySnapshot();
+			const record = snapshot.actions.find(
+				(
+					action,
+				): action is SessionActionRecoveryAction & {
+					payload: SessionActionRecoveryPayload & { kind: "turn" };
+				} => action.payload.kind === "turn",
+			)!;
+			record.payload.executionPolicy.completionIncludesRetryChain = false;
+			pause.release();
+			await harness.session.waitForIdle();
+
+			const restoredHarness = await createHarness({ settings: { retry: { enabled: false } } });
+			harnesses.push(restoredHarness);
+			restoredHarness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider failed" }),
+			]);
+			await restoredHarness.session.restoreSessionActions(snapshot);
+			restoredHarness.session.resumeQueuedWork();
+			await restoredHarness.session.waitForSessionInputIdle();
+			await restoredHarness.session.waitForIdle();
+
+			const outcomes = restoredHarness.eventsOfType("prompt_outcome");
+			expect(outcomes).toHaveLength(1);
+			expect(outcomes[0]!.outcome).toMatchObject({
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+		});
+
+		it("preserves the serialized false retry-chain timing for a restored settlement-excluded background primary", async () => {
+			// A background (heartbeat) primary restored from a stale snapshot must
+			// stay settlement-excluded and retain its serialized policy timing.
+			let releaseMain: (() => void) | undefined;
+			const mainGate = new Promise<void>((resolve) => {
+				releaseMain = resolve;
+			});
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await mainGate;
+					return fauxAssistantMessage("main done");
+				},
+			]);
+			const main = harness.session.promptAndSettle("main");
+			await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+			await harness.session.promptHeartbeat(createHeartbeatJob(), {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+			});
+			await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["heartbeat check"]));
+			const snapshot = harness.session.getSessionActionRecoverySnapshot();
+			const heartbeatRecord = snapshot.actions.find(
+				(
+					action,
+				): action is SessionActionRecoveryAction & {
+					payload: SessionActionRecoveryPayload & { kind: "turn" };
+				} => action.payload.kind === "turn" && action.payload.text === "heartbeat check",
+			)!;
+			heartbeatRecord.payload.executionPolicy.completionIncludesRetryChain = false;
+			releaseMain?.();
+			await main;
+			await harness.session.waitForIdle();
+
+			const restoredHarness = await createHarness();
+			harnesses.push(restoredHarness);
+			restoredHarness.setResponses([fauxAssistantMessage("heartbeat done")]);
+			await restoredHarness.session.restoreSessionActions(snapshot);
+			const restoredHeartbeat = turnActions(restoredHarness).find(
+				(action) => action.payload.text === "heartbeat check",
+			)!;
+			expect(restoredHeartbeat.noSettlementIdentity).toBe(true);
+			expect(restoredHeartbeat.candidatePromptId).toBeUndefined();
+			expect(restoredHeartbeat.promptIds).toBeUndefined();
+			expect(restoredHeartbeat.runLeases).toBeUndefined();
+			// The temporal policy flag is preserved verbatim for excluded work.
+			const restoredHeartbeatPolicy = (
+				restoredHeartbeat.payload as unknown as { executionPolicy: { completionIncludesRetryChain: boolean } }
+			).executionPolicy;
+			expect(restoredHeartbeatPolicy.completionIncludesRetryChain).toBe(false);
+
+			restoredHarness.session.resumeQueuedWork();
+			await restoredHarness.session.waitForSessionInputIdle();
+			await restoredHarness.session.waitForIdle();
+			expect(restoredHarness.eventsOfType("prompt_outcome")).toHaveLength(0);
+		});
+	});
+
 	describe("abort / deferred rollback boundary oracles (Round 1 test-evidence)", () => {
 		it("requestAbort preserves a visible queued accepted prompt until actual clear settles it cancelled once", async () => {
 			const gateA = new Promise<void>(() => {}); // never released: abort ends the run itself

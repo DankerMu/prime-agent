@@ -243,7 +243,7 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 ### Admission and ownership contract
 
-- `SessionAction` 的 serializable/recovery payload不存 settlement identity或live lease。turn action runtime字段保存候选/accepted `promptIds` 与等长 `runLeases`；session command无这些字段。`getSessionActionRecoverySnapshot()`继续只保存现有action/delivery payload，不复制promptIds、Promise、closure或lease；`restoreSessionActions()`对普通turn生成新的default id，对 primary record 为 heartbeat/RLM notice 的稳定 customType重新派生 runtime-only background exclusion（prefix/next-turn context不得改变primary owner语义），old-ledger lineage recovery留组9。
+- `SessionAction` 的 serializable/recovery payload不存 settlement identity或live lease。turn action runtime字段保存候选/accepted `promptIds` 与等长 `runLeases`；session command无这些字段。`getSessionActionRecoverySnapshot()`继续只保存现有action/delivery payload，不复制promptIds、Promise、closure或lease；`restoreSessionActions()`对普通turn生成新的default id，并将历史snapshot的`completionIncludesRetryChain`归一为`true`，保证fresh identity的main-run lease覆盖retry；对primary为heartbeat/RLM notice的settlement-excluded turn仅重派生runtime marker并保留历史timing flag（prefix/next-turn不得改变primary owner语义）。old-ledger lineage recovery留组9，wire/parser/formatVersion不变。
 - `_createPreparedTurnAction` 只准备 candidate id或私有 `{inherit: owners}`，不调用 tracker；它以实际 primary message 为唯一分类源：primary customType 为 heartbeat/RLM notice 或 caller显式 staging exclusion时不生成 candidate并标记 runtime-only background exclusion，prefix/next-turn不得改变该分类。所有 prompt/custom/replay callers共享此policy，`restoreSessionActions()`的primary-only重派生仅是wire backstop。该私有lineage option是组2的可测seam；普通public/internal prompt callers走default，组5才把autonomous continuation producer接到inherit。
 - `_admitSessionInput` 顺序固定：disposing/pump fence → coalesce → `ActionStore.assertCanEnqueue(action)`纯检查action lifecycle/duplicate ticket且不写store → duplicate候选/全部inherit owner检查 → default同步persist-first `admit({sessionEpoch})`+fresh identity `acquire("run")`，或inherit逐一acquire → 写入action →已preflight的no-throw enqueue安装数组/ticket → accepted callback（try/catch observer isolation）→ arrival epoch递增/wake。
 - Default admission的post-admit failure被设计为不可达：#27 deps固定`now:Date.now`、`persist:()=>{}`，fresh identity在admit成功后`acquire("run")`不能unknown/terminal/busy；enqueue的所有显式throw条件已由同一store的pure preflight证明，随后同步安装不调用外部callback。若实现无法保持该结构，必须改为单id `requestCancel`+释放本actionlease并reject；禁止用global `settleAll`或留下settling。测试以red-capable monkeypatch/preflight regression证明duplicate action在admit前reject，而非要求生产注入persist spy。
@@ -305,7 +305,7 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
   - pre-admission reject or successful non-turn -> no identity/lease/event; candidate remains reusable when no turn was accepted.
   - inherit multi-owner partial failure -> only本action新acquired siblings逆序释放，parent lease/cancel不变且action不入队。
   - actual queued removal/pump throw -> default cancelled或failed后consume once；repeated removal/finally no extra outcome。
-  - recovery snapshot/restore -> snapshot不含live identity/lease；普通turn生成fresh id，background primary仍无identity，background prefix不改变普通primary identity。
+  - recovery snapshot/restore -> snapshot不含live identity/lease；普通turn生成fresh id且历史false retry flag归一为true，background primary仍无identity并保留历史timing，background prefix不改变普通primary identity。
   - callback reentry/parallel submissions/completion-id collision -> each callback sees only its own admission，occupied id在新deferred前reject，observer failure不能污染lifecycle。
   - direct AgentSession subscribe vs identity-forward adapters -> direct看见一个outcome；in-process main/watcher与daemon broadcast丢弃，外部union/wire不变。
   - unchanged prompt/promptUntilAccepted/promptAndWait/recovery/event consumers -> prior timing and errors remain stable.
@@ -315,7 +315,7 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 - Shared helper roots: action construct/admit/batch/terminal/cancel helpers and `PromptSettlementTracker`; no duplicated state machine.
 - Public entrypoints: AgentSession prompt family/query/event；mode adapter只做兼容过滤，无 AgentConnection API或daemon public wire扩展。
 - Read/write/overwrite: in-memory action+tracker only; no JSONL/file overwrite.
-- Stale/idempotency: consumed lease arrays emptied once；每批terminal signal清零；terminal owner inherit rejected；partial inherit acquire只回滚新sibling leases；duplicate candidate/completion id不重开；recovery不复制identity/lease且只由primary稳定customType派生background marker。
+- Stale/idempotency: consumed lease arrays emptied once；每批terminal signal清零；terminal owner inherit rejected；partial inherit acquire只回滚新sibling leases；duplicate candidate/completion id不重开；recovery不复制identity/lease、只由primary稳定customType派生background marker，并为所有fresh identity归一历史retry-wait policy。
 - Producer/consumer evidence: callback/event/query bind to same promptId/outcome object；action-store inspection仅证明accepted-before-enqueue ownership，不作为tracker persist oracle。
 - Unchanged downstream consumers: promptAndWait、session-action recovery和外部AgentConnection/JSON/RPC/daemon/ACP/TUI事件流保持source/runtime兼容。
 
