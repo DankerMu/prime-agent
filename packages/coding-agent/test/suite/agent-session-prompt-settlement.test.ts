@@ -11,12 +11,12 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionActionRecoveryAction, SessionActionRecoveryPayload } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
-import { createHeartbeatPromptMessage } from "../../src/core/messages.js";
+import { createHeartbeatPromptMessage, createRlmChildFailureMessage } from "../../src/core/messages.js";
 import type { SessionAction } from "../../src/core/session-action-store.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../../src/modes/daemon/daemon-extension-binding.js";
 import { createHarness, getUserTexts, type Harness } from "./harness.js";
-import { createWaitingHarness, withStreaming } from "./scheduling.js";
+import { createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
 type TurnAction = SessionAction & { payload: { kind: "turn"; text: string } };
 
@@ -1382,6 +1382,349 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			promptId: "reusable-after-command-failure",
 		});
 		expect(reused).toMatchObject({ promptId: "reusable-after-command-failure", status: "completed" });
+	});
+
+	describe("background primary classification (Round 1 contract)", () => {
+		// A background custom primary (heartbeat / RLM child notices) must never
+		// receive a candidate, tracker admission, run lease, or prompt_outcome on
+		// ANY construction/replay entrypoint; only the primary message decides.
+		const backgroundMessages = () => [
+			createHeartbeatPromptMessage(createHeartbeatJob()),
+			createRlmChildFailureMessage({ childId: "child-1", sessionName: "child", error: "boom" }),
+		];
+
+		it.each([
+			{ name: "restoreFollowUpMessage", schedule: "followUp" as const },
+			{ name: "restoreSteeringMessage", schedule: "steer" as const },
+		])("$name keeps a heartbeat/RLM primary settlement-excluded through execution", async ({ schedule }) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			// One completed run per queued background turn (2 messages x 2 schedules).
+			harness.setResponses(backgroundMessages().flatMap(() => [fauxAssistantMessage("bg done")]));
+			for (const message of backgroundMessages()) {
+				const text = `${schedule} bg ${message.customType}`;
+				if (schedule === "followUp") {
+					await harness.session.restoreFollowUpMessage(text, undefined, { customMessage: message });
+				} else {
+					await harness.session.restoreSteeringMessage(text, undefined, { customMessage: message });
+				}
+				const action = actionByText(harness, text);
+				expect(action.noSettlementIdentity).toBe(true);
+				expect(action.candidatePromptId).toBeUndefined();
+				expect(action.promptIds).toBeUndefined();
+				expect(action.runLeases).toBeUndefined();
+			}
+			// Execute the queued background turns; zero settlement identity/outcome.
+			harness.session.resumeQueuedWork();
+			await harness.session.waitForIdle();
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+			expect(turnActions(harness)).toEqual([]);
+		});
+
+		it.each(["followUp", "steer"] as const)(
+			"sendCustomMessage streaming %s keeps a heartbeat primary settlement-excluded",
+			async (deliverAs) => {
+				const harness = await createHarness();
+				harnesses.push(harness);
+				harness.setResponses([fauxAssistantMessage("streamed bg done")]);
+				withStreaming(harness, true);
+				await harness.session.sendCustomMessage(
+					{
+						customType: "heartbeat_prompt",
+						content: `streamed heartbeat ${deliverAs}`,
+						display: true,
+						details: {},
+					},
+					{ deliverAs },
+				);
+				const action = turnActions(harness).find(
+					(candidate) => candidate.payload.text === `streamed heartbeat ${deliverAs}`,
+				)!;
+				expect(action).toBeDefined();
+				expect(action.noSettlementIdentity).toBe(true);
+				expect(action.candidatePromptId).toBeUndefined();
+				expect(action.promptIds).toBeUndefined();
+				expect(action.runLeases).toBeUndefined();
+				withStreaming(harness, false);
+				harness.session.resumeQueuedWork();
+				await harness.session.waitForIdle();
+				expect(outcomeCount(harness)).toBe(0);
+			},
+		);
+
+		it("sendCustomMessage triggerTurn keeps a heartbeat primary settlement-excluded through its run", async () => {
+			let releaseRun: (() => void) | undefined;
+			const runGate = new Promise<void>((resolve) => {
+				releaseRun = resolve;
+			});
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await runGate;
+					return fauxAssistantMessage("trigger bg done");
+				},
+			]);
+			const pending = harness.session.sendCustomMessage(
+				{ customType: "heartbeat_prompt", content: "trigger heartbeat", display: true, details: {} },
+				{ triggerTurn: true },
+			);
+			await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+			const action = actionByText(harness, "trigger heartbeat");
+			expect(action.noSettlementIdentity).toBe(true);
+			expect(action.candidatePromptId).toBeUndefined();
+			expect(action.promptIds).toBeUndefined();
+			expect(action.runLeases).toBeUndefined();
+			releaseRun?.();
+			await pending;
+			await harness.session.waitForIdle();
+			expect(outcomeCount(harness)).toBe(0);
+		});
+
+		it("_prompt with a custom heartbeat primary reports exactly one no-id settlement admission after completion", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("custom prompt done")]);
+			const reports: Array<{ supported: true; promptId?: string }> = [];
+			const settled = await harness.session.promptAndSettle("text from caller", {
+				customMessage: createHeartbeatPromptMessage(createHeartbeatJob()),
+				settlementAdmission: (info) => reports.push(info),
+			});
+			// Settlement-excluded: the call is a successful non-settlement turn, no
+			// prompt_outcome is produced, and `promptAndSettle` resolves undefined.
+			expect(settled).toBeUndefined();
+			// The one-shot no-id report fires exactly once, only after completion.
+			expect(reports).toEqual([{ supported: true }]);
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+		});
+
+		it("reports no-id settlement admission exactly once with a throwing observer and no action leak", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("custom prompt done")]);
+			let reports = 0;
+			const pending = harness.session.promptAndSettle("text from caller", {
+				customMessage: createHeartbeatPromptMessage(createHeartbeatJob()),
+				settlementAdmission: () => {
+					reports++;
+					throw new Error("observer exploded");
+				},
+			});
+			await expect(pending).resolves.toBeUndefined();
+			// Observer isolation: a throw cannot double-fire or leak the action.
+			expect(reports).toBe(1);
+			expect(turnActions(harness)).toEqual([]);
+			expect(outcomeCount(harness)).toBe(0);
+		});
+
+		it("pump terminal failure for a settlement-excluded custom primary fires zero callbacks and keeps original error semantics", async () => {
+			const harness = await createHarness({ settings: { retry: { enabled: false } } });
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("unused")]);
+			const internals = harness.session as unknown as {
+				_startPreparedTurnActions(actions: unknown[], epoch: number): Promise<void>;
+			};
+			const boom = new Error("pump exploded");
+			const spy = vi.spyOn(internals, "_startPreparedTurnActions").mockImplementation(async () => {
+				throw boom;
+			});
+			const reports: Array<{ supported: true; promptId?: string }> = [];
+			try {
+				const pending = harness.session.promptAndSettle("text from caller", {
+					customMessage: createHeartbeatPromptMessage(createHeartbeatJob()),
+					settlementAdmission: (info) => reports.push(info),
+				});
+				// The settlement-excluded turn has no tracker identity, so the
+				// original pump error is the authoritative failure (same as a
+				// non-turn failure); no no-id success report may fire.
+				await expect(pending).rejects.toThrow("pump exploded");
+			} finally {
+				spy.mockRestore();
+			}
+			expect(reports).toEqual([]);
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+			expect(turnActions(harness)).toEqual([]);
+		});
+
+		it("gives an arbitrary custom non-background primary default settlement identity", async () => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("ordinary custom done")]);
+			const settled = await harness.session.promptAndSettle("ordinary custom text", {
+				customMessage: {
+					role: "custom",
+					customType: "ordinary_custom",
+					content: "ordinary custom text",
+					display: true,
+					details: { source: "test" },
+					timestamp: Date.now(),
+				},
+			});
+			expect(settled).toMatchObject({ status: "completed", advisor: "disabled" });
+			expect(outcomeCount(harness)).toBe(1);
+		});
+	});
+
+	describe("customTrigger retry chain (Round 1 state-transition)", () => {
+		it("waits for the retry chain before terminal classification and lease release", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+				fauxAssistantMessage("recovered"),
+			]);
+			const agentEnds: string[] = [];
+			let idAtFirstEnd: string | undefined;
+			let leaseHeldAtFirstEnd = false;
+			harness.session.subscribe((event) => {
+				if (event.type !== "agent_end") return;
+				agentEnds.push("agent_end");
+				if (agentEnds.length === 1) {
+					const action = turnActions(harness).find(
+						(candidate) => candidate.payload.text === "retry custom trigger",
+					);
+					idAtFirstEnd = action?.promptIds?.[0];
+					leaseHeldAtFirstEnd = (action?.runLeases?.length ?? 0) > 0;
+				}
+			});
+
+			await harness.session.sendCustomMessage(
+				{ customType: "retry-trigger", content: "retry custom trigger", display: false },
+				{ triggerTurn: true },
+			);
+			await harness.session.waitForIdle();
+
+			// Two agent_end events; between them the sole run lease is still held
+			// and no outcome has been produced yet.
+			expect(agentEnds).toHaveLength(2);
+			expect(idAtFirstEnd).toBeDefined();
+			expect(leaseHeldAtFirstEnd).toBe(true);
+			expect(outcomeCount(harness)).toBe(1);
+			const outcomes = harness.eventsOfType("prompt_outcome");
+			expect(outcomes[0]!.outcome).toMatchObject({ promptId: idAtFirstEnd, status: "completed" });
+			expect(outcomes[0]!.outcome.failure).toBeUndefined();
+			expect(harness.session.getPromptOutcome(idAtFirstEnd!)).toMatchObject({ status: "completed" });
+		});
+
+		it("settles failed/run_error exactly once when retry is disabled", async () => {
+			const harness = await createHarness({ settings: { retry: { enabled: false } } });
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider failed" })]);
+
+			await harness.session.sendCustomMessage(
+				{ customType: "retry-disabled-trigger", content: "retry disabled trigger", display: false },
+				{ triggerTurn: true },
+			);
+			await harness.session.waitForIdle();
+
+			const outcomes = harness.eventsOfType("prompt_outcome");
+			expect(outcomes).toHaveLength(1);
+			expect(outcomes[0]!.outcome).toMatchObject({
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+		});
+	});
+
+	describe("abort / deferred rollback boundary oracles (Round 1 test-evidence)", () => {
+		it("requestAbort preserves a visible queued accepted prompt until actual clear settles it cancelled once", async () => {
+			const gateA = new Promise<void>(() => {}); // never released: abort ends the run itself
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await gateA;
+					return fauxAssistantMessage("a done");
+				},
+			]);
+
+			const a = harness.session.promptAndSettle("A streaming");
+			await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+			const aId = actionByText(harness, "A streaming").promptIds![0];
+			let bId: string | undefined;
+			const b = harness.session.promptAndSettle("visible B", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+				settlementAdmission: (info) => (bId = info.promptId),
+			});
+			await vi.waitFor(() => expect(bId).toBeDefined());
+			expect(actionByText(harness, "visible B").promptIds).toEqual([bId]);
+			expect(actionByText(harness, "visible B").runLeases).toHaveLength(1);
+			expect(outcomeCount(harness)).toBe(0);
+
+			// Ordinary abort: A is aborted (provider-returned aborted settles it),
+			// B stays visible in the store with the same identity and its one lease.
+			harness.session.requestAbort();
+			const aOutcome = await harness.session.waitForPromptOutcome(aId);
+			expect(aOutcome.status).toBe("cancelled");
+			await a; // A settles cancelled through the legacy completion too.
+			expect(aOutcome.status).toBe("cancelled");
+			expect(harness.session.getFollowUpMessages()).toEqual(["visible B"]);
+			expect(actionByText(harness, "visible B").promptIds).toEqual([bId]);
+			expect(actionByText(harness, "visible B").runLeases).toHaveLength(1);
+			expect(isPromptSettling(harness, bId!)).toBe(true);
+			expect(harness.session.getPromptOutcome(bId!)).toBeUndefined();
+			expect(outcomeCount(harness)).toBe(1); // A cancelled only; B has no outcome.
+
+			// Actual visible-queue removal consumes B exactly once as cancelled.
+			expect(harness.session.clearQueue().followUp).toEqual(["visible B"]);
+			const bOutcome = await b;
+			expect(bOutcome).toMatchObject({ promptId: bId, status: "cancelled" });
+			expect(bOutcome!.failure).toBeUndefined();
+			expect(bOutcome).toBe(harness.session.getPromptOutcome(bId!));
+			expect(isPromptSettling(harness, bId!)).toBe(false);
+			expect(outcomeCount(harness)).toBe(2);
+			expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === bId)).toHaveLength(
+				1,
+			);
+		});
+
+		it("real deferred preparation/handoff rollback retains one lease/no outcome, then exactly one completed on resume", async () => {
+			// Gate before_agent_start so the pump is deterministically inside
+			// preparation when a second pause bumps the pump epoch and defers the
+			// handoff (DeferredSessionInputError): the accepted action must roll
+			// back queued with its run lease intact and no outcome.
+			const hook = gatedHook({ prompt: "deferred turn" });
+			const harness = await createHarness({ extensionFactories: [hook.factory] });
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("deferred done")]);
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("deferred turn", undefined, { resumeIfIdle: true });
+			const deferredId = actionByText(harness, "deferred turn").promptIds![0];
+			expect(deferredId).toBeDefined();
+			expect(actionByText(harness, "deferred turn").runLeases).toHaveLength(1);
+			expect(actionByText(harness, "deferred turn").lifecycle.state).toBe("queued");
+
+			// Start the pump; it selects/prepares and parks on the gated hook.
+			pause.release();
+			await vi.waitFor(() => expect(actionByText(harness, "deferred turn").lifecycle.state).toBe("preparing"));
+			// Bump the pump epoch while preparation is parked: the epoch check at
+			// the next preparation/handoff boundary defers the dispatch.
+			const secondPause = harness.session.acquireQueuedWorkPause();
+			hook.release();
+			await vi.waitFor(() => expect(actionByText(harness, "deferred turn").lifecycle.state).toBe("queued"));
+			expect(actionByText(harness, "deferred turn").promptIds).toEqual([deferredId]);
+			expect(actionByText(harness, "deferred turn").runLeases).toHaveLength(1);
+			expect(isPromptSettling(harness, deferredId)).toBe(true);
+			expect(harness.session.getPromptOutcome(deferredId)).toBeUndefined();
+			expect(outcomeCount(harness)).toBe(0);
+
+			// Release the deferral: the same action resumes and settles completed
+			// exactly once with the same prompt id.
+			secondPause.release();
+			await harness.session.waitForIdle();
+			const outcomes = harness.eventsOfType("prompt_outcome");
+			expect(outcomes).toHaveLength(1);
+			expect(outcomes[0]!.outcome).toMatchObject({ promptId: deferredId, status: "completed" });
+			expect(harness.session.getPromptOutcome(deferredId)).toBe(outcomes[0]!.outcome);
+			expect(isPromptSettling(harness, deferredId)).toBe(false);
+		});
 	});
 
 	it("drops prompt_outcome from the daemon session-event broadcast", async () => {

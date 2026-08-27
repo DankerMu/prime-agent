@@ -4788,14 +4788,10 @@ export class AgentSession {
 					options?.executionPolicy ??
 					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
 				queueVisible: visibleQueued,
-				// Group 2 background identity exclusion: host-injected heartbeat and
-				// RLM child terminal/failure notices (and known background custom
-				// turns) are not user prompts — they must not create a default
-				// settlement identity. The `noSettlementIdentity` marker makes
-				// admission treat the turn as a non-settlement action (no tracker
-				// admit/acquire, no `prompt_outcome`), exactly like a session
-				// command. Group 5 later wires autonomous inherit lineage instead.
-				noSettlementIdentity: this._isBackgroundInjectedMessage(message),
+				// Group 2 background identity exclusion is derived centrally in
+				// `_createPreparedTurnAction` from the primary message (heartbeat /
+				// RLM notices): no caller-side flag needed here. Group 5 later wires
+				// autonomous inherit lineage instead.
 			});
 			const result = this._admitSessionInput(action, {
 				immediatelyEligible: !visibleQueued,
@@ -5433,6 +5429,10 @@ export class AgentSession {
 				completionIncludesRetryChain: true,
 			};
 		}
+		// customTrigger (sendCustomMessage triggerTurn) is an identity-bearing
+		// producer: its main run's retry chain is owned work, so terminal
+		// classification and lease release must happen only after the retry chain
+		// completes (group 3 wires the retry lease itself).
 		return {
 			preparation: {
 				initialRefineBarrier: "always",
@@ -5445,7 +5445,7 @@ export class AgentSession {
 			runBeforeAgentStart: false,
 			nextTurnContextTiming: "skip",
 			preserveEmptyExtensionPrompt: false,
-			completionIncludesRetryChain: false,
+			completionIncludesRetryChain: true,
 		};
 	}
 
@@ -5484,6 +5484,15 @@ export class AgentSession {
 				content: content.map((block) => ({ ...block })),
 				timestamp: Date.now(),
 			} satisfies UserMessage);
+		// Group 2 central background classification: a turn whose PRIMARY message
+		// is a known background-injected custom message (heartbeat / RLM child
+		// notices) is settlement-excluded on every construction entrypoint, no
+		// matter which caller built the action. An explicit caller exclusion can
+		// only ADD exclusion (autonomous threshold continuation staging); explicit
+		// false/absence never overrides a recognized custom background primary.
+		const derivedSettlementExclusion =
+			options.noSettlementIdentity === true ||
+			(message.role === "custom" && this._isBackgroundInjectedMessage(message));
 		const prefixMessages = options.prefixMessages?.map((prefix) => cloneCustomMessage(prefix)) ?? [];
 		const preview = options.previewLabel ? `${options.previewLabel}: ${text}` : undefined;
 		const payload: PreparedTurnPayload = {
@@ -5523,11 +5532,14 @@ export class AgentSession {
 			// caller's pre-allocated candidate wins over a fresh one.
 			// Background-injected turns skip settlement identity entirely and must
 			// NOT carry a candidate at all.
-			...(options.lineage === undefined && options.noSettlementIdentity !== true
+			...(options.lineage === undefined && !derivedSettlementExclusion
 				? { candidatePromptId: options.candidatePromptId ?? randomUUID() }
 				: {}),
-			// Background-injected turns skip settlement identity entirely.
-			...(options.noSettlementIdentity === true ? { noSettlementIdentity: true } : {}),
+			// Background-injected turns skip settlement identity entirely. The
+			// runtime marker is set from the centrally derived exclusion so
+			// admission (and any caller relying on the flag) sees the same
+			// classification for every construction entrypoint.
+			...(derivedSettlementExclusion ? { noSettlementIdentity: true } : {}),
 		};
 	}
 
@@ -5899,6 +5911,13 @@ export class AgentSession {
 							transitionSessionAction(action, { state: "completed" });
 							this._actionStore.ticketFor(action).settleCompleted();
 							this._settleAgentMessage(action.agentMessageId, "completion");
+							// A successfully completed settlement-excluded turn (e.g.
+							// heartbeat / RLM primary) reports its one-shot no-id
+							// settlement admission now, after the legacy completion
+							// settles — same ordering as successful non-turn inputs.
+							// Identity-bearing turns carry no stored callback (fired
+							// at admission), so the helper no-ops there.
+							this._reportNonTurnSettlementAdmission(action);
 						}
 					}
 				} catch (error) {
