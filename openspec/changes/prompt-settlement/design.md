@@ -33,6 +33,18 @@ Non-Goals：见 proposal「Non-goals」——`needs_user_input`/`pendingQuestion
 ```ts
 export type PromptOutcomeStatus = "completed" | "needs_user_input" | "unresolved_advisor" | "failed" | "cancelled";
 export type PromptAdvisorState = "passed" | "fail_open" | "unresolved" | "disabled" | "pending";
+export interface PendingUserQuestionOption {
+  label: string;
+  description?: string;
+  preview?: string;
+}
+export interface PendingUserQuestion {
+  toolCallId: string;
+  question: string;
+  options: PendingUserQuestionOption[];
+  multi?: boolean;
+  recommended?: number;
+}
 export interface PromptOutcome {
   promptId: string;
   status: PromptOutcomeStatus;
@@ -53,7 +65,7 @@ export class PromptSettlementTracker {
   bumpTraceGeneration(promptId: string): void;
   requestCancel(promptId: string): void;                                // abort fence；幂等
   recordFailure(promptId: string, reason: string): void;               // 失败意图；幂等；不覆盖 cancel
-  release(promptId: string): void;                                      // released fence：不再产生 outcome；幂等
+  release(promptId: string): void;                                      // 仅对已终态记录设置 released fence并追加一次 persist；settling/未知 id no-op；outcome/emit 不变；幂等
   settleAll(status: "cancelled" | "failed", reason: string, options?: { released?: boolean }): void; // dispose/recovery 用：对全部未终态且未 released 的记录原子结算；options.released 与终态在同一次 persist 中写入；reason 一律进 ledger settleReason；status 为 failed 时同时进 outcome.failure 与 failureReason
   outcome(promptId: string): PromptOutcome | undefined;
   waitForOutcome(promptId: string): Promise<PromptOutcome>;            // 已终态（含 released 的终态）立即 resolve；未知 promptId reject
@@ -144,3 +156,73 @@ tracker 纯新增；模式入口改等 outcome 是缺陷修复；wire 由 capabi
 - **JSONL 体积**：每 prompt 两条小 entry，可接受。
 - **JSON 外部消费者 closed union**：定性 additive（压测分支 7），以文档承诺覆盖；无版本机制。
 - **daemon 事件先于 ACK**：客户端先订阅后发送，已消除。
+
+## Issue #26 implementation fixture
+
+Fixture level: expanded（上游建议 compact；因本切片定义后续 session/wire 共用的公开状态机 API，且包含并发 lease、取消与终态顺序，按 mandatory expanded triggers 上调）
+Repair intensity: high（共享状态机根；任一转移错误会污染后续 16 个切片）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: 新增 `packages/coding-agent/src/core/prompt-settlement.ts` 与 `packages/coding-agent/test/prompt-settlement.test.ts`。
+- Must preserve: 本切片无调用方，不改变现有 session、daemon、RPC、Print、ACP、TUI 行为或 `AgentMessageOutcome` 语义。
+- Must add: D1 全部导出类型/API，以及 D2 的同步 settle-once、独立 lease 实例、terminal/released fence、snapshot/restore 行为；`PendingUserQuestion` 只定义未来 wire 占位，但必须保留 ask-user 原始问题形状：`toolCallId`、`question`、`options[{label,description?,preview?}]` 及可选 `multi`/`recommended`，不新增独立 option value/id。
+- Seam under test: `PromptSettlementTracker` 公共 API，注入假时钟、`emit` 与 `persist`；这是最少且最高的确定性 seam，可直接观察每次原子转移。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: selected - tracker 与 outcome 类型是后续模式的单一公共契约；本切片不接 CLI。
+- Config / project setup: not selected - 无配置或工程设置变化。
+- File IO / path safety / overwrite: not selected - `persist` 仅为注入回调，本切片不读写文件。
+- Schema / columns / units / field names: selected - `PromptOutcome` 与 `PromptSettlementRecord` 字段及条件字段必须一次定型。
+- Auth / permissions / secrets: not selected - 无授权或敏感数据边界。
+- Concurrency / shared state / ordering: selected - 独立 lease 计数、先 acquire 后 release、同步 1→0 结算和 settle-once 是核心不变量。
+- Resource limits / large input / discovery: not selected - 无发现、轮询、外部输入或无界资源操作。
+- Legacy compatibility / examples: not selected - 新文件无调用方；现有 userspace 不变是边界条件。
+- Error handling / rollback / partial outputs: selected - duplicate/unknown/terminal/released、cancel-over-failure 与原子 persist/emit 必须稳定。
+- Release / packaging / dependency compatibility: not selected - 无依赖、构建或发布形状变化。
+- Documentation / migration notes: not selected - 完整契约已在本 design/spec；运行时状态文档留给 #42。
+- TUI focus/render lifecycle: not selected - 不触碰 TUI。
+- Session/extension teardown lifecycle: selected - `settleAll(..., { released: true })` 必须一次性封口并保持 waiter 可读，实际 session dispose 挂线留给 #31。
+
+### Required evidence
+
+- `now=10; admit({promptId: P, sessionEpoch: 7})` -> persist 一条 `settling` record（`admittedAt=10`、`traceGeneration=0`、`finalMessageIds=[]`、`cancelRequested=false`、`released=false`），不 emit；随后 acquire、`recordFinalMessage(P, M)`、`bumpTraceGeneration(P)`、`now=20`、最后 lease release -> 再 persist 一条终态且 emit 一次同一 outcome：`{promptId:P,status:"completed",advisor:"disabled",sessionEpoch:7,traceGeneration:1,finalMessageIds:[M]}`，`settledAt=20`，无 `pendingQuestions`/`failure`/`failureReason`/`settleReason`；生命周期 persist=2、emit=1。
+- 同 P 两个独立 `run` lease -> 释放第一个仍 `isSettling(P)===true` 且无 outcome；释放第二个才结算。run→retry→compaction 交接先取后放 -> 旧 lease 释放后仍 settling；先放旧 lease至 0 再 acquire -> 已同步 `completed` 且新 acquire 抛错，不存在隐式宽限。
+- `recordFailure(P,"run_error")` 后 release -> failed，`outcome.failure.reason === record.failureReason === "run_error"` 且无 `settleReason`；先 failure 再 cancel -> cancelled，outcome 无 `failure` 且 record 无 `failureReason`；所有终态后 mutation/release lease 都不新增 persist/emit。
+- `settleAll("failed","runtime_restarted")` -> 每个 eligible P 恰好追加一条 failed record并 emit一次，`failure.reason === failureReason === settleReason === "runtime_restarted"`；`settleAll("cancelled","session_disposed",{released:true})` -> 一条 `cancelled + released:true + settleReason` record与一次 emit，无 `failure`/`failureReason`，重复调用零副作用。
+- `waitForOutcome(unknown)` -> reject；`outcome(unknown)` -> `undefined`；`isSettling` 对 unknown/terminal 为 false、active 为 true；duplicate admit -> throw且零新增 persist/emit。
+- `snapshot()` -> 深复制 records/数组，修改 snapshot 不影响 tracker；`restore` 同 promptId 多条取最后一条，终态/released record只读且 `outcome` 与 `waitForOutcome` 返回同一缓存对象，不调用 persist/emit；恢复 active record 后可重新 acquire 并按 D2 结算。
+- 三种 release API 不混淆：`PromptLease.release()` 只减少该 lease 实例并可能触发终态；`tracker.release(P)` 仅对已终态 record 设置 `released:true` 并追加一次 persist（active/unknown no-op，不 settle、不 emit，重复 no-op）；`settleAll(...,{released:true})` 对 active record在单次 persist/emit 中同时终态并置 released。
+- `npx tsx ../../node_modules/vitest/dist/cli.js --run test/prompt-settlement.test.ts`（在 `packages/coding-agent`）与 `npm run check` 均退出 0。
+
+### Invariant Matrix
+
+- Governing invariant: 每个 admitted prompt 的全部独立 lease 在同步 1→0 边界只产生一个由 cancel、failure、completed 优先级确定的不可重开终态。
+- Source-of-truth identity/contract: `promptId` 对应的单一内部 record、独立 lease 实例集合、terminal/released fences 与 D1 导出类型。
+- Producers: `admit`、`restore`；未知或重复 identity 不得隐式创建/覆盖。
+- Validators/preflight: `acquire`、所有 mutation/query 方法对 unknown、terminal、released 状态的分支。
+- Storage/cache/query: tracker 内存 map、`snapshot` 深复制与 `restore` 最后一条记录恢复；本切片无 JSONL。
+- Public routes/entrypoints: `PromptSettlementTracker` D1 公共方法与 `PromptLease.release()`。
+- Frontend/downstream consumers: 本切片无运行时调用方；测试锁定后续 session/wire 将消费的单一类型与对象语义。
+- Failure paths/rollback/stale state: duplicate admit、unknown wait/query、terminal acquire、重复 release/mutation、`settleAll` 与 released restore。
+- Evidence/audit/readiness: tracker focused tests、TypeScript check、strict OpenSpec validation。
+- Regression rows:
+  - 同一 prompt 的多个同 kind/异 kind lease按任意非终态顺序释放 -> 最后一次 release 才按优先级恰好 settle 一次。
+  - 旧 lease 先释放至 0 后再 acquire -> 已产生终态且 acquire 抛错，不允许重开或空窗宽限。
+  - cancelled/failed settleAll 与 released restore -> 条件字段、settleReason、wait/query 对象及 persist/emit 次数保持契约。
+  - 现有 session/daemon/RPC/TUI 消费者 -> 本切片无接线，行为与编译保持不变。
+
+### Boundary-surface checklist
+
+- Shared helper root: 新 tracker 由单一实现与单一测试套件拥有，不复制状态枚举。
+- Public entrypoints: 仅 D1 导出 API；不接入现有模式。
+- Read/write/stale-state boundaries: query/snapshot 与 mutation/restore/terminal fences 全部列入 regression rows。
+- File publish/rollback and external evidence boundaries: 无，本切片只调用注入的同步 callbacks。
+- Unchanged downstream consumers: `AgentSession`、daemon/RPC、Print/ACP/TUI 不修改。
+
+### Non-goals for #26
+
+- 不修改 `agent-session.ts`，不做 JSONL persist 实现，不接 daemon/RPC/mode，不生产 `needs_user_input` 或 `unresolved_advisor`。
+- lineage spec 的 abort保留/清空队列、pre-admission拒绝、终态owner拒绝inherit 等 session 场景由 #27/#31 覆盖；#26 只覆盖能直接通过 tracker API 构造的终态推导、lease交接、record形状、released fence与恢复行为，不为满足“settle-once全部scenario”越界伪造 session 测试。
