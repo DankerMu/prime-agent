@@ -6,9 +6,9 @@
 
 ## Signal
 
-After PR #23, `docs/review-loop-log.jsonl` contains nine merged multi-round PRs with lens attribution. Later-round verified catches are pinned-core `2`, rotated-in `0`. PR #23 used `invariant-state` as its rotated follow-up lens and its second round was clean, so the closeout sample added no distinct rotated-lens catch.
+After PR #44, `docs/review-loop-log.jsonl` contains ten merged multi-round PRs with lens attribution. Later-round verified catches remain pinned-core `2`, rotated-in `0`. PR #44's second comprehensive round was clean and added no distinct later-round catch, so the additional sample does not change the prior signal.
 
-This meets the configured decision threshold and favors reverting follow-up rounds to the round-1 lens mix: every later-round catch came from a round-1 lens on fix-touched test evidence.
+This remains above the configured decision threshold and favors reverting follow-up rounds to the round-1 lens mix: every later-round catch came from a round-1 lens on fix-touched test evidence.
 
 ## Deferral
 
