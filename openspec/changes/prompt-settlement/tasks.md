@@ -20,11 +20,12 @@ Minimal mergeable slice: atomic - 只覆盖主 run 一种 lease；retry/compacti
 
 ## 3. retry lease
 
-- [ ] 3.1 `_retryPromise` 建立的两处（`:3396`、`:10241`）对 `_lastRunPromptIds` 的每个去重 owner `acquire("retry")`，在 `_retryResolve` 置空处逐个 release；顺序保证：先为全部 owners 获取 retry lease，再释放各自 run lease
-- [ ] 3.2 行为测试：单 prompt faux provider 先 error 后成功 → 一个 promptId、两个 `agent_end`、一个 `completed` 且在 retry 完成后才产生；retry 耗尽 → `failed/run_error`；`"all"` batching 的两个 prompt 共享 retry 时，两者都不在 retry 前结算且各仅一个 outcome
+- [x] 3.1 将同步 `agent_end` pre-arm 与 `_handleRetryableError` defensive fallback 两处 retry-window 建立收敛到同一 idempotent helper：仅在 `_retryPromise` 不存在时捕获当下 `_lastRunPromptIds` 去重 owner 快照，先对全部 identity-bearing owners逐个 `acquire("retry")`，成功后才发布 Promise/resolve/lease state；部分 acquire 失败逆序释放本次 siblings且不留下半开window。一个 retry chain（含多个 error `agent_end`）每owner恰一份retry lease。所有成功、耗尽、禁用、sleep cancel、overflow/compaction结束和 `abortRetry` 路径继续只经 `_resolveRetry`，由其先detach Promise/resolve/captured leases，再逐实例release恰一次并唤醒原waiters；重复resolve/abort为no-op。excluded/background或无action owner时允许零lease retry window。不得读取后续可能变化的owner snapshot，不改retry event/attempt/backoff/AgentMessageOutcome语义
+- [x] 3.2 faux-provider与focused lifecycle测试必须直接证明retry lease存在，而非只凭group-2 run lease遮蔽：单owner error→success在首个/第二个 `agent_end` 之间恰有一次`acquire(id,"retry")`、无outcome，最终release一次且一个completed；`"all"` A/B共享run时两owner各恰一retry lease、期间均无outcome、最终各completed一次；连续多个retryable errors仍不重复acquire；max retry耗尽release后各自failed/run_error；defensive fallback走同一owner/acquire逻辑；abortRetry/sleep-cancel与重复resolve释放captured leases恰一次、无retry lease残留。保留现有retry/auth/overflow-compaction/accepted-agent-message事件、attempt、backoff与queue时序测试
 
-Suggested fixture level: compact - 涉及 lease 交接顺序，是设计 §8 第 4 条竞态的真实路径
-Minimal mergeable slice: atomic - 单一挂点 + 配套测试，独立合并保绿
+Suggested fixture level: expanded - 上游建议compact；retry与shared-state transition属于mandatory expanded trigger，且两处建立/多处结束共享mutable lifecycle
+Repair intensity: high - 任一owner漏acquire、重复acquire或resolve漏release会造成提前终态或永久settling，并污染后续compaction/abort/persistence切片
+Minimal mergeable slice: atomic - 单一retry-window helper、唯一release funnel与配套faux-provider oracle，独立合并保绿
 
 ## 4. post-compaction continuation lease 与 traceGeneration
 

@@ -1171,6 +1171,15 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+	/**
+	 * Runtime-only retry-window tuple (group 3): the deduped identity-bearing
+	 * owner snapshot captured at first window creation and the parallel
+	 * counted `retry` lease instances (`capturedPromptIds[i]` owns
+	 * `leases[i]`). Never re-read from the mutable `_lastRunPromptIds` and
+	 * never serialized; `_resolveRetry` detaches and releases exactly these
+	 * instances once. Tests observe the tuple through the private seam.
+	 */
+	private _retryWindow: { capturedPromptIds: string[]; leases: PromptLease[] } | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
@@ -3527,9 +3536,53 @@ export class AgentSession {
 			this._captureRetryAuthFailureSource(lastAssistant);
 		}
 
+		this._createRetryWindow();
+	}
+
+	/**
+	 * Idempotent retry-window create helper shared by the synchronous
+	 * `agent_end` pre-arm (`_createRetryPromiseForAgentEnd`) and the defensive
+	 * fallback in `_handleRetryableError`. Only creates a window while NO
+	 * window exists: at first creation it captures the deduped current
+	 * `_lastRunPromptIds` owner snapshot and all-or-nothing acquires one
+	 * counted `"retry"` lease per identity-bearing owner (group 3). A
+	 * zero-owner window (background / no-action defensive path) is valid and
+	 * preserves the legacy retry Promise timing with no settlement lease. On
+	 * partial acquire failure the newly acquired sibling leases are
+	 * reverse-released and NO Promise/resolve/owner/lease tuple is published,
+	 * so the next error still retries from a clean world.
+	 *
+	 * The captured snapshot is immutable for the window's lifetime: resolve
+	 * and close never re-read the mutable `_lastRunPromptIds`, and later runs
+	 * cannot change this window's release targets.
+	 */
+	private _createRetryWindow(): boolean {
+		if (this._retryPromise) {
+			return false;
+		}
+		// Capture before creating the Promise so a reentrant acquire/emit
+		// (first lease's release cannot happen yet, but a synchronous tracker
+		// callback can) never observes a half-published tuple.
+		const capturedPromptIds = [...new Set(this._lastRunPromptIds)];
+		const leases: PromptLease[] = [];
+		try {
+			for (const owner of capturedPromptIds) {
+				leases.push(this._promptSettlementTracker.acquire(owner, "retry"));
+			}
+		} catch {
+			// All-or-nothing: reverse-release only the leases this window just
+			// acquired. Never cancel an owner, never touch parent run leases,
+			// and never publish a half-open Promise/resolve/owner/lease tuple.
+			for (let index = leases.length - 1; index >= 0; index -= 1) {
+				leases[index]!.release();
+			}
+			return false;
+		}
+		this._retryWindow = { capturedPromptIds, leases };
 		this._retryPromise = new Promise((resolve) => {
 			this._retryResolve = resolve;
 		});
+		return true;
 	}
 
 	private _findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
@@ -3741,14 +3794,33 @@ export class AgentSession {
 		);
 	}
 
-	/** Resolve the pending retry promise */
+	/**
+	 * Single retry-window close funnel (group 3): every window end path —
+	 * retry success, exhaustion, disabled/no-message, sleep cancel,
+	 * overflow/compaction terminal, cancelled dispatch and `abortRetry` —
+	 * converges here. Detaches Promise/resolve/captured ids/leases FIRST so a
+	 * lease release that synchronously settles an owner and re-enters
+	 * (pump/abort/resolve) sees an empty window; then releases each captured
+	 * lease instance exactly once; only then resolves the captured waiter and
+	 * schedules the pump. Repeated close/abort/re-resolve is a no-op.
+	 */
 	private _resolveRetry(): void {
-		if (this._retryResolve) {
-			this._retryResolve();
-			this._retryResolve = undefined;
-			this._retryPromise = undefined;
-			this._scheduleSessionInputPump();
+		const resolve = this._retryResolve;
+		this._retryResolve = undefined;
+		this._retryPromise = undefined;
+		const window = this._retryWindow;
+		// Detach the whole tuple first: the captured owner ids are never re-read
+		// for close (the leases captured at creation are the release targets)
+		// and repeated close/abort/resolve sees an empty window.
+		this._retryWindow = undefined;
+		if (!resolve) {
+			return;
 		}
+		for (const lease of window?.leases ?? []) {
+			lease.release();
+		}
+		resolve();
+		this._scheduleSessionInputPump();
 	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
@@ -10699,12 +10771,19 @@ export class AgentSession {
 			return false;
 		}
 
-		// Retry promise is created synchronously in _handleAgentEvent for agent_end.
-		// Keep a defensive fallback here in case a future refactor bypasses that path.
-		if (!this._retryPromise) {
-			this._retryPromise = new Promise((resolve) => {
-				this._retryResolve = resolve;
-			});
+		// Retry window is created synchronously in _handleAgentEvent for
+		// agent_end via the shared create helper. Keep a defensive fallback here
+		// in case a future refactor bypasses that path: it goes through the SAME
+		// idempotent `_createRetryWindow`, so owner snapshot, all-or-nothing
+		// acquire and zero-owner legacy timing are identical to the pre-arm path
+		// (group 3). On a partial owner-acquire failure the helper publishes no
+		// Promise/resolve/owner/lease tuple at all and this fallback FAILS
+		// CLOSED: without a window there is no settlement lease holding the run
+		// open, so initiating retry would let group-2 run ownership terminal at
+		// the first error while `agent.continue()` runs later. No increment,
+		// no event, no backoff and no continue is scheduled.
+		if (!this._retryPromise && !this._createRetryWindow()) {
+			return false;
 		}
 
 		this._retryAttempt++;

@@ -1,17 +1,29 @@
 /**
- * Issue #27 / OpenSpec prompt-settlement group 2: action promptId + main run
- * lease + promptAndSettle API.
+ * OpenSpec prompt-settlement, groups 2-3, shared session-level suite.
  *
- * Seam 2: in-process AgentSession + faux provider (retry disabled). Tests
- * observe behavior through the public callback / query / event APIs and
- * read-only action-store inspection. The tracker's private persist count is
- * never observed; `finalMessageIds` stays empty (group 7 records them).
+ * Group 2 (issue #27): action promptId + main run lease + promptAndSettle
+ * API. These tests use the retry-disabled faux provider so each error is
+ * terminal and the settlement classification is observable directly.
+ *
+ * Group 3 (issue #28): retry lease. These tests run retry-enabled and
+ * instrument the tracker's `acquire(id, "retry")` and the returned
+ * `PromptLease.release` by object identity — outcome-only assertions cannot
+ * see group-3 leases because the group-2 run lease already spans the retry
+ * chain.
+ *
+ * Seam 2: in-process AgentSession + faux provider. Tests observe behavior
+ * through the public callback / query / event APIs and read-only action-store
+ * inspection. The tracker's private persist count is never observed;
+ * `finalMessageIds` stays empty (group 7 records them).
  */
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+
+import type { AgentEvent } from "@earendil-works/pi-agent-core";
+import { type AssistantMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionActionRecoveryAction, SessionActionRecoveryPayload } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { createHeartbeatPromptMessage, createRlmChildFailureMessage } from "../../src/core/messages.js";
+import type { PromptLease, PromptLeaseKind } from "../../src/core/prompt-settlement.js";
 import type { SessionAction } from "../../src/core/session-action-store.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../../src/modes/daemon/daemon-extension-binding.js";
@@ -46,6 +58,89 @@ function isPromptSettling(harness: Harness, promptId: string): boolean {
 
 function outcomeCount(harness: Harness): number {
 	return harness.eventsOfType("prompt_outcome").length;
+}
+
+interface RetryLeaseRecord {
+	promptId: string;
+	kind: "retry";
+	releaseCalls: number;
+}
+
+/**
+ * Direct group-3 instrumentation: spy the tracker's `acquire` and wrap every
+ * returned `PromptLease.release` so a retry lease's acquisition and each
+ * release are observed by object identity. Outcome-only assertions cannot see
+ * group-3 leases because the group-2 run lease already spans the retry chain.
+ */
+function installRetryLeaseObserver(harness: Harness): {
+	acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }>;
+	retryLeases: RetryLeaseRecord[];
+	restore: () => void;
+	acquiresOfKind: (kind: "retry") => Array<{ promptId: string; kind: "retry" }>;
+} {
+	const internals = harness.session as unknown as {
+		_promptSettlementTracker: { acquire(promptId: string, kind: PromptLeaseKind): PromptLease };
+	};
+	const tracker = internals._promptSettlementTracker;
+	const originalAcquire = tracker.acquire.bind(tracker);
+	const acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }> = [];
+	const retryLeases: RetryLeaseRecord[] = [];
+	const spy = vi.spyOn(tracker, "acquire").mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+		acquireLog.push({ promptId, kind });
+		const lease = originalAcquire(promptId, kind);
+		if (kind === "retry") {
+			const record: RetryLeaseRecord = { promptId, kind: "retry", releaseCalls: 0 };
+			// Capture the base release BEFORE wrapping: the lease object is
+			// mutated in place, so `lease.release()` after the wrap would recurse.
+			const baseRelease = lease.release.bind(lease);
+			const wrapped = lease as PromptLease & { release: () => void };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				baseRelease();
+			};
+			retryLeases.push(record);
+		}
+		return lease;
+	});
+	return {
+		acquireLog,
+		retryLeases,
+		acquiresOfKind: (kind) =>
+			acquireLog.filter((entry) => entry.kind === kind) as Array<{
+				promptId: string;
+				kind: "retry";
+			}>,
+		restore: () => {
+			spy.mockRestore();
+		},
+	};
+}
+
+interface RetryWindowTuple {
+	capturedPromptIds: string[];
+	leases: unknown[];
+}
+
+interface RetryInternals {
+	_lastRunPromptIds: string[];
+	_currentRunOwners: string[];
+	_retryWindow: RetryWindowTuple | undefined;
+	_retryAttempt: number;
+	_retryPromise: Promise<void> | undefined;
+	_retryResolve: (() => void) | undefined;
+	_resolveRetry: () => void;
+	_createRetryWindow: () => boolean;
+	_handleRetryableError: (message: AssistantMessage) => Promise<boolean>;
+	_handleAgentEvent: (event: AgentEvent) => void;
+	_promptSettlementTracker: { acquire(promptId: string, kind: PromptLeaseKind): PromptLease };
+}
+
+function retryInternals(harness: Harness): RetryInternals {
+	return harness.session as unknown as RetryInternals;
+}
+
+function retryableError(): AssistantMessage {
+	return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
 }
 
 function createHeartbeatJob() {
@@ -1955,5 +2050,615 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			.filter((type): type is string => typeof type === "string");
 		expect(broadcastedTypes).not.toContain("prompt_outcome");
 		expect(broadcastedTypes).toContain("agent_end");
+	});
+
+	describe("retry lease (group 3)", () => {
+		it("acquires one retry lease synchronously at the first agent_end, holds it across the retry, releases once on success", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 100 } },
+			});
+			harnesses.push(harness);
+			const observer = installRetryLeaseObserver(harness);
+			harness.setResponses([retryableError(), fauxAssistantMessage("recovered")]);
+
+			const agentEnds: string[] = [];
+			let heldAtFirstEnd = false;
+			let heldAtSecondEnd = false;
+			let noOutcomeAtFirstEnd = false;
+			harness.session.subscribe((event) => {
+				if (event.type !== "agent_end") return;
+				agentEnds.push(event.type);
+				const held = observer.retryLeases.filter((lease) => lease.releaseCalls === 0).length;
+				if (agentEnds.length === 1) {
+					// The synchronous agent_end pre-arm already published the window
+					// before any listener observes the event: one retry lease exists
+					// for the owner and is still held.
+					heldAtFirstEnd = held === 1 && observer.retryLeases.length === 1;
+					const ownerId = observer.acquiresOfKind("retry")[0]?.promptId;
+					noOutcomeAtFirstEnd = ownerId !== undefined && harness.session.getPromptOutcome(ownerId) === undefined;
+				} else if (agentEnds.length === 2) {
+					heldAtSecondEnd = held === 1;
+				}
+			});
+
+			let ownerId: string | undefined;
+			const settled = harness.session.promptAndSettle("retry single", {
+				settlementAdmission: (info) => (ownerId = info.promptId),
+			});
+			await vi.waitFor(() => expect(ownerId).toBeDefined());
+			await vi.waitFor(() => expect(agentEnds).toHaveLength(1));
+			expect(heldAtFirstEnd).toBe(true);
+			expect(noOutcomeAtFirstEnd).toBe(true);
+			expect(harness.session.isRetrying).toBe(true);
+
+			await vi.waitFor(() => expect(agentEnds).toHaveLength(2));
+			expect(heldAtSecondEnd).toBe(true);
+			// One retry lease for the whole window: never one per error agent_end.
+			expect(observer.acquiresOfKind("retry")).toEqual([{ promptId: ownerId, kind: "retry" }]);
+			expect(observer.retryLeases).toHaveLength(1);
+
+			const outcome = await settled;
+			expect(outcome).toMatchObject({ promptId: ownerId, status: "completed" });
+			expect(outcome!.failure).toBeUndefined();
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(outcomeCount(harness)).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId!)).toBe(outcome);
+			expect(harness.session.isRetrying).toBe(false);
+			expect(retryInternals(harness)._retryWindow).toBeUndefined();
+
+			observer.restore();
+		});
+
+		it('acquires one retry lease per "all" batch owner and releases the captured targets even after the mutable snapshot is clobbered', async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.session.setFollowUpMode("all");
+			harness.setResponses([retryableError(), fauxAssistantMessage("recovered")]);
+
+			// Queue both follow-ups while the pump is paused so "all" batching merges
+			// them into one shared run.
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("all A", undefined, { resumeIfIdle: true });
+			await harness.session.followUp("all B", undefined, { resumeIfIdle: true });
+			const ids = [actionByText(harness, "all A").promptIds![0], actionByText(harness, "all B").promptIds![0]];
+			expect(new Set(ids).size).toBe(2);
+
+			const observer = installRetryLeaseObserver(harness);
+			let clobbered = false;
+			let noOutcomeMidRetry = false;
+			let acquiresAtFirstEnd: unknown[] = [];
+			harness.session.subscribe((event) => {
+				if (event.type !== "agent_end" || clobbered) return;
+				clobbered = true;
+				// The window is already created; the mutable snapshot must no longer
+				// matter. Clobber it to prove the captured leases are the release
+				// targets, never a later re-read of _lastRunPromptIds.
+				retryInternals(harness)._lastRunPromptIds = ["clobbered-owner"];
+				retryInternals(harness)._currentRunOwners = ["clobbered-owner"];
+				// Mid-retry: both owners still settling, no outcome yet.
+				noOutcomeMidRetry =
+					harness.session.getPromptOutcome(ids[0]) === undefined &&
+					harness.session.getPromptOutcome(ids[1]) === undefined;
+				acquiresAtFirstEnd = [...observer.acquiresOfKind("retry")];
+			});
+
+			pause.release();
+			const [outcomeA, outcomeB] = await Promise.all([
+				harness.session.waitForPromptOutcome(ids[0]),
+				harness.session.waitForPromptOutcome(ids[1]),
+			]);
+			expect(clobbered).toBe(true);
+			expect(noOutcomeMidRetry).toBe(true);
+			// The window established both owners exactly once at first creation.
+			expect([...acquiresAtFirstEnd].map((entry) => (entry as { promptId: string }).promptId).sort()).toEqual(
+				[...ids].sort(),
+			);
+			expect(outcomeA).toMatchObject({ promptId: ids[0], status: "completed" });
+			expect(outcomeB).toMatchObject({ promptId: ids[1], status: "completed" });
+			// Each owner acquired exactly once and its captured lease released once.
+			expect(
+				observer
+					.acquiresOfKind("retry")
+					.map((entry) => entry.promptId)
+					.sort(),
+			).toEqual([...ids].sort());
+			expect(observer.retryLeases).toHaveLength(2);
+			for (const lease of observer.retryLeases) {
+				expect(lease.releaseCalls).toBe(1);
+			}
+			// No owner was alienated: the clobbered id was never acquired/released.
+			expect(observer.acquireLog.some((entry) => entry.promptId === "clobbered-owner")).toBe(false);
+			expect(outcomeCount(harness)).toBe(2);
+			observer.restore();
+		});
+
+		it("does not re-acquire for a second error in the same window; one release and one completed after error→error→success", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 50 } },
+			});
+			harnesses.push(harness);
+			const observer = installRetryLeaseObserver(harness);
+			harness.setResponses([retryableError(), retryableError(), fauxAssistantMessage("finally ok")]);
+
+			const agentEnds: string[] = [];
+			harness.session.subscribe((event) => {
+				if (event.type !== "agent_end") return;
+				agentEnds.push(event.type);
+			});
+
+			let ownerId: string | undefined;
+			const settled = harness.session.promptAndSettle("triple retry", {
+				settlementAdmission: (info) => (ownerId = info.promptId),
+			});
+			await vi.waitFor(() => expect(ownerId).toBeDefined());
+			await vi.waitFor(() => expect(agentEnds).toHaveLength(3));
+
+			// Three agent_end, but the whole chain holds exactly one window/lease.
+			expect(observer.acquiresOfKind("retry")).toEqual([{ promptId: ownerId, kind: "retry" }]);
+			expect(observer.retryLeases).toHaveLength(1);
+
+			const outcome = await settled;
+			expect(outcome).toMatchObject({ promptId: ownerId, status: "completed" });
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(outcomeCount(harness)).toBe(1);
+			observer.restore();
+		});
+
+		it("releases exactly once on max-retry exhaustion with no residue; repeated abort/close adds nothing", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			const observer = installRetryLeaseObserver(harness);
+			harness.setResponses([retryableError(), retryableError(), retryableError()]);
+
+			const settled = harness.session.promptAndSettle("exhausted");
+			const outcome = await settled;
+			expect(outcome).toMatchObject({ status: "failed", failure: { reason: "run_error" } });
+			expect(outcomeCount(harness)).toBe(1);
+
+			// One acquire for the whole window; the exact lease released once.
+			expect(observer.acquiresOfKind("retry")).toHaveLength(1);
+			expect(observer.retryLeases).toHaveLength(1);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(retryInternals(harness)._retryWindow).toBeUndefined();
+
+			expect(harness.session.isRetrying).toBe(false);
+
+			// Repeated abort / direct close / abort again: no extra release/outcome.
+			harness.session.abortRetry();
+			retryInternals(harness)._resolveRetry();
+			harness.session.abortRetry();
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(outcomeCount(harness)).toBe(1);
+			observer.restore();
+		});
+
+		it('releases every captured owner once and fails each identity on "all" shared-run exhaustion', async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.session.setFollowUpMode("all");
+			harness.setResponses([retryableError(), retryableError(), retryableError()]);
+
+			// Queue both follow-ups while the pump is paused so "all" batching merges
+			// them into one shared run with a deduped two-owner snapshot.
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("exhaust A", undefined, { resumeIfIdle: true });
+			await harness.session.followUp("exhaust B", undefined, { resumeIfIdle: true });
+			const ids = [
+				actionByText(harness, "exhaust A").promptIds![0],
+				actionByText(harness, "exhaust B").promptIds![0],
+			];
+			expect(new Set(ids).size).toBe(2);
+
+			const observer = installRetryLeaseObserver(harness);
+			pause.release();
+			const [outcomeA, outcomeB] = await Promise.all([
+				harness.session.waitForPromptOutcome(ids[0]),
+				harness.session.waitForPromptOutcome(ids[1]),
+			]);
+			expect(outcomeA).toMatchObject({ promptId: ids[0], status: "failed", failure: { reason: "run_error" } });
+			expect(outcomeB).toMatchObject({ promptId: ids[1], status: "failed", failure: { reason: "run_error" } });
+			expect(outcomeCount(harness)).toBe(2);
+			expect(harness.eventsOfType("prompt_outcome").filter((e) => e.outcome.promptId === ids[0])).toHaveLength(1);
+			expect(harness.eventsOfType("prompt_outcome").filter((e) => e.outcome.promptId === ids[1])).toHaveLength(1);
+
+			// Exact dedup owners each acquired exactly once for the whole chain, and
+			// each captured lease released exactly once on exhaustion.
+			expect(
+				observer
+					.acquiresOfKind("retry")
+					.map((entry) => entry.promptId)
+					.sort(),
+			).toEqual([...ids].sort());
+			expect(observer.retryLeases).toHaveLength(2);
+			for (const lease of observer.retryLeases) {
+				expect(lease.releaseCalls).toBe(1);
+			}
+			// No retry tuple residue; duplicate close does nothing.
+			expect(retryInternals(harness)._retryWindow).toBeUndefined();
+			expect(harness.session.isRetrying).toBe(false);
+			harness.session.abortRetry();
+			retryInternals(harness)._resolveRetry();
+			harness.session.abortRetry();
+			for (const lease of observer.retryLeases) {
+				expect(lease.releaseCalls).toBe(1);
+			}
+			expect(outcomeCount(harness)).toBe(2);
+			observer.restore();
+		});
+
+		it("creates the same window through the defensive fallback when the pre-arm was bypassed", async () => {
+			let releaseParent: (() => void) | undefined;
+			const parentGate = new Promise<void>((resolve) => {
+				releaseParent = resolve;
+			});
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await parentGate;
+					return fauxAssistantMessage("fallback parent done");
+				},
+			]);
+			const pending = harness.session.promptAndSettle("fallback parent");
+			await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+			const ownerId = actionByText(harness, "fallback parent").promptIds![0];
+
+			const observer = installRetryLeaseObserver(harness);
+			const internals = retryInternals(harness);
+			// Stable owner snapshot with NO pre-armed window: a refactor that
+			// bypassed the agent_end pre-arm hits the defensive fallback.
+			internals._lastRunPromptIds = [ownerId];
+			expect(harness.session.isRetrying).toBe(false);
+			expect(observer.acquiresOfKind("retry")).toEqual([]);
+
+			// The fallback schedules `agent.continue()` on a 0ms timer: keep the
+			// spy installed until after that timer fires so no real continuation
+			// (which would consume the gated provider response) can start.
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue(undefined as never);
+			try {
+				const didRetry = await internals._handleRetryableError(retryableError());
+				expect(didRetry).toBe(true);
+				// The fallback went through the same idempotent create helper with
+				// the same owner/acquire semantics.
+				expect(observer.acquiresOfKind("retry")).toEqual([{ promptId: ownerId, kind: "retry" }]);
+				expect(observer.retryLeases).toHaveLength(1);
+				expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+				expect(internals._retryWindow?.capturedPromptIds ?? "missing-window").toEqual([ownerId]);
+				expect(internals._retryWindow?.leases).toHaveLength(1);
+			} finally {
+				internals._resolveRetry();
+				// Let the scheduled 0ms continue timer fire against the mock first.
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				continueSpy.mockRestore();
+			}
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(internals._retryWindow).toBeUndefined();
+
+			expect(harness.session.isRetrying).toBe(false);
+
+			// The parent run still finishes normally with one completed outcome.
+			releaseParent?.();
+			const outcome = await pending;
+			expect(outcome).toMatchObject({ promptId: ownerId, status: "completed" });
+			expect(outcomeCount(harness)).toBe(1);
+			observer.restore();
+		});
+
+		it("fails closed through _handleRetryableError when all-or-nothing retry acquisition keeps failing", async () => {
+			let releaseA: (() => void) | undefined;
+			let releaseB: (() => void) | undefined;
+			const gateA = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			const gateB = new Promise<void>((resolve) => {
+				releaseB = resolve;
+			});
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await gateA;
+					return fauxAssistantMessage("failclosed a done");
+				},
+				async () => {
+					await gateB;
+					return fauxAssistantMessage("failclosed b done");
+				},
+			]);
+
+			let parentAId: string | undefined;
+			let parentBId: string | undefined;
+			const parentA = harness.session.promptAndSettle("failclosed-a", {
+				settlementAdmission: (info) => (parentAId = info.promptId),
+			});
+			await vi.waitFor(() => expect(parentAId).toBeDefined());
+			const parentB = harness.session.promptAndSettle("failclosed-b", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+				settlementAdmission: (info) => (parentBId = info.promptId),
+			});
+			await vi.waitFor(() => expect(parentBId).toBeDefined());
+			const parentALeases = actionByText(harness, "failclosed-a").runLeases!.length;
+			const parentBLeases = actionByText(harness, "failclosed-b").runLeases!.length;
+
+			const internals = retryInternals(harness);
+			// Stable two-owner snapshot with NO pre-armed window: the defensive
+			// fallback must fail closed, not emit/schedule a retry without leases.
+			internals._lastRunPromptIds = [parentAId!, parentBId!];
+
+			// One self-contained spy (the acquire method must not already be
+			// mocked, or bind() would capture a nested spy): it fails every retry
+			// window attempt at the second owner and counts each sibling release.
+			const tracker = internals._promptSettlementTracker;
+			const originalAcquire = tracker.acquire.bind(tracker);
+			let acquireCalls = 0;
+			const retryReleaseCalls: number[] = [];
+			const acquiredRetryIds: string[] = [];
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					acquireCalls += 1;
+					// The SECOND retry owner's acquire fails persistly: every
+					// window attempt must roll back and fail closed.
+					if (acquireCalls === 2 && kind === "retry") {
+						throw new Error("simulated persistent second retry owner acquire failure");
+					}
+					const lease = originalAcquire(promptId, kind);
+					if (kind === "retry") {
+						acquiredRetryIds.push(promptId);
+						const wrapped = lease as PromptLease & { release: () => void };
+						const baseRelease = lease.release.bind(lease);
+						const index = retryReleaseCalls.length;
+						retryReleaseCalls.push(0);
+						wrapped.release = () => {
+							retryReleaseCalls[index] = (retryReleaseCalls[index] ?? 0) + 1;
+							baseRelease();
+						};
+					}
+					return lease;
+				});
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue(undefined as never);
+			const sawRetryStart: string[] = [];
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") sawRetryStart.push(event.type);
+			});
+			try {
+				const didRetry = await internals._handleRetryableError(retryableError());
+				expect(didRetry).toBe(false);
+				// Failed closed: no window tuple, no waiter, nothing scheduled.
+				expect(internals._retryPromise).toBeUndefined();
+				expect(internals._retryResolve).toBeUndefined();
+				expect(internals._retryWindow).toBeUndefined();
+				expect(harness.session.isRetrying).toBe(false);
+				expect(sawRetryStart).toEqual([]);
+				expect(continueSpy).not.toHaveBeenCalled();
+				expect(internals._retryAttempt).toBe(0);
+				// All-or-nothing: the first sibling was reverse-released exactly once
+				// and the second owner was never acquired into a published tuple.
+				expect(acquireCalls).toBe(2);
+				expect(acquiredRetryIds).toEqual([parentAId]);
+				expect(retryReleaseCalls).toEqual([1]);
+			} finally {
+				unsubscribe();
+				continueSpy.mockRestore();
+				acquireSpy.mockRestore();
+			}
+
+			// No owner was cancelled or terminaled and no parent run lease touched.
+			expect(actionByText(harness, "failclosed-a").runLeases).toHaveLength(parentALeases);
+			expect(actionByText(harness, "failclosed-b").runLeases).toHaveLength(parentBLeases);
+			expect(harness.session.getPromptOutcome(parentAId!)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(parentBId!)).toBeUndefined();
+			expect(isPromptSettling(harness, parentAId!)).toBe(true);
+			expect(isPromptSettling(harness, parentBId!)).toBe(true);
+			expect(outcomeCount(harness)).toBe(0);
+
+			// Both parents still complete normally afterwards.
+			releaseA?.();
+			releaseB?.();
+			const [outcomeA, outcomeB] = await Promise.all([parentA, parentB]);
+			expect(outcomeA).toMatchObject({ promptId: parentAId, status: "completed" });
+			expect(outcomeB).toMatchObject({ promptId: parentBId, status: "completed" });
+			expect(outcomeCount(harness)).toBe(2);
+		});
+
+		it("rolls back the first sibling lease on a partial second-owner retry acquire and publishes no half-open window", async () => {
+			let releaseA: (() => void) | undefined;
+			let releaseB: (() => void) | undefined;
+			const gateA = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			const gateB = new Promise<void>((resolve) => {
+				releaseB = resolve;
+			});
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					await gateA;
+					return fauxAssistantMessage("a done");
+				},
+				async () => {
+					await gateB;
+					return fauxAssistantMessage("b done");
+				},
+			]);
+
+			let parentAId: string | undefined;
+			let parentBId: string | undefined;
+			const parentA = harness.session.promptAndSettle("retry-parent-a", {
+				settlementAdmission: (info) => (parentAId = info.promptId),
+			});
+			await vi.waitFor(() => expect(parentAId).toBeDefined());
+			const parentB = harness.session.promptAndSettle("retry-parent-b", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+				settlementAdmission: (info) => (parentBId = info.promptId),
+			});
+			await vi.waitFor(() => expect(parentBId).toBeDefined());
+			const parentALeases = actionByText(harness, "retry-parent-a").runLeases!.length;
+			const parentBLeases = actionByText(harness, "retry-parent-b").runLeases!.length;
+
+			const internals = retryInternals(harness);
+			internals._lastRunPromptIds = [parentAId!, parentBId!];
+
+			// Deterministic seam: the tracker's SECOND retry acquire throws so the
+			// create helper must reverse-release the first sibling and publish
+			// nothing.
+			const tracker = internals._promptSettlementTracker;
+			const originalAcquire = tracker.acquire.bind(tracker);
+			let acquireCalls = 0;
+			const retryReleaseCalls: number[] = [];
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					acquireCalls += 1;
+					if (acquireCalls === 2 && kind === "retry") {
+						throw new Error("simulated second retry owner acquire failure");
+					}
+					const lease = originalAcquire(promptId, kind);
+					if (kind === "retry") {
+						const wrapped = lease as PromptLease & { release: () => void };
+						const baseRelease = lease.release.bind(lease);
+						const index = retryReleaseCalls.length;
+						retryReleaseCalls.push(0);
+						wrapped.release = () => {
+							retryReleaseCalls[index] = (retryReleaseCalls[index] ?? 0) + 1;
+							baseRelease();
+						};
+					}
+					return lease;
+				});
+			try {
+				const created = internals._createRetryWindow();
+				expect(created).toBe(false);
+				expect(acquireCalls).toBe(2);
+				// The first sibling's lease was reverse-released exactly once.
+				expect(retryReleaseCalls).toEqual([1]);
+				// No half-open tuple is published.
+				expect(internals._retryPromise).toBeUndefined();
+				expect(internals._retryResolve).toBeUndefined();
+				expect(internals._retryWindow).toBeUndefined();
+
+				expect(harness.session.isRetrying).toBe(false);
+			} finally {
+				acquireSpy.mockRestore();
+			}
+
+			// No owner was cancelled or terminaled and no parent run lease touched.
+			expect(actionByText(harness, "retry-parent-a").runLeases).toHaveLength(parentALeases);
+			expect(actionByText(harness, "retry-parent-b").runLeases).toHaveLength(parentBLeases);
+			expect(harness.session.getPromptOutcome(parentAId!)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(parentBId!)).toBeUndefined();
+			expect(isPromptSettling(harness, parentAId!)).toBe(true);
+			expect(isPromptSettling(harness, parentBId!)).toBe(true);
+			expect(outcomeCount(harness)).toBe(0);
+
+			// Both parents complete normally afterwards.
+			releaseA?.();
+			releaseB?.();
+			const [outcomeA, outcomeB] = await Promise.all([parentA, parentB]);
+			expect(outcomeA).toMatchObject({ promptId: parentAId, status: "completed" });
+			expect(outcomeB).toMatchObject({ promptId: parentBId, status: "completed" });
+			expect(outcomeCount(harness)).toBe(2);
+		});
+
+		it("releases the captured retry lease exactly once on abortRetry during the sleep and on duplicate close", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+			});
+			harnesses.push(harness);
+			const observer = installRetryLeaseObserver(harness);
+			harness.setResponses([retryableError()]);
+
+			const sawRetryStart = new Promise<void>((resolve) => {
+				const unsubscribe = harness.session.subscribe((event) => {
+					if (event.type === "auto_retry_start") {
+						unsubscribe();
+						resolve();
+					}
+				});
+			});
+
+			const promptPromise = harness.session.prompt("sleepy retry");
+			await sawRetryStart;
+			await vi.waitFor(() => expect(observer.retryLeases).toHaveLength(1));
+			// The window is armed and the retry lease is held during the sleep.
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+			expect(harness.session.isRetrying).toBe(true);
+
+			harness.session.abortRetry();
+			// abortRetry only aborts the sleep signal; the window is closed by the
+			// retry handler's catch, so the release is observed asynchronously.
+			await vi.waitFor(() => expect(observer.retryLeases[0]!.releaseCalls).toBe(1));
+			expect(harness.session.isRetrying).toBe(false);
+			expect(retryInternals(harness)._retryWindow).toBeUndefined();
+
+			// Duplicate abort / direct close: no second release.
+			harness.session.abortRetry();
+			retryInternals(harness)._resolveRetry();
+			await vi.waitFor(() => expect(observer.retryLeases[0]!.releaseCalls).toBe(1));
+
+			await promptPromise;
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			observer.restore();
+		});
+
+		it("preserves legacy retry events/timing for a zero-owner background retry window with zero settlement lease/outcome", async () => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 100 } },
+			});
+			harnesses.push(harness);
+			const observer = installRetryLeaseObserver(harness);
+			harness.setResponses([retryableError(), fauxAssistantMessage("bg recovered")]);
+
+			// Heartbeat primary: settlement-excluded background turn, so the run
+			// has zero prompt owners. The retry window is still created (legacy
+			// timing preserved) but holds zero retry leases and settles nothing.
+			const sawRetryStart = new Promise<void>((resolve) => {
+				const unsubscribe = harness.session.subscribe((event) => {
+					if (event.type === "auto_retry_start") {
+						unsubscribe();
+						resolve();
+					}
+				});
+			});
+			const pending = harness.session.sendCustomMessage(
+				{ customType: "heartbeat_prompt", content: "zero-owner retry", display: false },
+				{ triggerTurn: true },
+			);
+			await sawRetryStart;
+			// Mid-retry: a window exists with ZERO captured owners/leases (the
+			// zero-owner window is valid and keeps legacy retry timing alive).
+			expect(retryInternals(harness)._retryWindow).toEqual({ capturedPromptIds: [], leases: [] });
+			expect(observer.acquiresOfKind("retry")).toEqual([]);
+			expect(observer.retryLeases).toEqual([]);
+			expect(harness.session.isRetrying).toBe(true);
+
+			await pending;
+			await harness.session.waitForIdle();
+
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
+			expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
+			expect(harness.session.isRetrying).toBe(false);
+			expect(retryInternals(harness)._retryWindow).toBeUndefined();
+
+			observer.restore();
+		});
 	});
 });
