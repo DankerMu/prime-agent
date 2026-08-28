@@ -568,7 +568,10 @@ export class InProcessAgentConnection implements AgentConnection {
 			getMessages: async () => child.messages,
 			getCommands: async () => createAgentConnectionCommands(child),
 			subscribe: (listener) => {
-				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
+				const unsubscribe = child.subscribe((event) => {
+					if (event.type === "prompt_outcome") return;
+					void listener({ type: "session_event", event });
+				});
 				unsubscribes.add(unsubscribe);
 				return () => {
 					unsubscribes.delete(unsubscribe);
@@ -603,6 +606,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	private bindCurrentSessionEvents(): void {
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = this.session.subscribe((event) => {
+			if (event.type === "prompt_outcome") return;
 			void this.emit({ type: "session_event", event });
 		});
 	}

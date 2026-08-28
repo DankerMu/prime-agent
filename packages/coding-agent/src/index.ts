@@ -148,6 +148,7 @@ export type {
 	ResolvedResource,
 } from "./core/package-manager.js";
 export { DefaultPackageManager } from "./core/package-manager.js";
+export type { PromptOutcome } from "./core/prompt-settlement.js";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.js";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.js";
 // SDK for programmatic usage

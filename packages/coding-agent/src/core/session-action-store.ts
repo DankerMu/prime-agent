@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, UserMessage } from "@earendil-works/pi-ai";
 import type { InputSource } from "./extensions/index.js";
 import type { CustomMessage } from "./messages.js";
+import type { PromptLease } from "./prompt-settlement.js";
 import type { SessionSlashCommand } from "./slash-commands.js";
 
 export type DeliveryPolicy = "next_turn_boundary" | "when_run_idle";
@@ -74,6 +75,43 @@ export interface SessionAction<TPayload extends SessionActionPayload = SessionAc
 	queueKey?: string;
 	agentMessageId?: string;
 	suppressAutonomousContinuation?: boolean;
+	/**
+	 * Prompt settlement identity: one entry per owned promptId, in lockstep with
+	 * `runLeases`. Set only on accepted turn actions (default single owner,
+	 * internal inherit multi-owner); session commands never carry these fields.
+	 * These are runtime-only state and MUST NOT appear in the serializable
+	 * recovery snapshot.
+	 */
+	promptIds?: string[];
+	runLeases?: PromptLease[];
+	/**
+	 * Candidate settlement id prepared at action creation (default lineage).
+	 * Occupied only when the action is admitted as an accepted turn; the private
+	 * `{ inherit: owners }` lineage path carries no candidate.
+	 */
+	candidatePromptId?: string;
+	/**
+	 * Settlement lineage prepared at action creation (before admission).
+	 * Public/internal callers use the default (fresh candidate id); the private
+	 * `{ inherit: owners }` seam is the group 2 test hook for future autonomous
+	 * continuation producers and is never written by current callers.
+	 */
+	lineage?: { inherit: string[] };
+	/**
+	 * One-shot settlement-admission observer for the admitting call. Fires
+	 * `{ supported: true }` (no id) when a non-turn action completes
+	 * successfully. Runtime-only; never serialized into the recovery snapshot.
+	 */
+	settlementAdmission?: (info: { supported: true; promptId?: string }) => void;
+	/**
+	 * Background-injected turn (heartbeat / RLM notices / known background
+	 * custom turns) that MUST NOT participate in settlement: no tracker
+	 * admit/acquire, no candidate, no `prompt_outcome`. Runtime-only: the flag
+	 * itself is never serialized into the recovery snapshot, but recovery
+	 * re-derives it from the durable custom message (customType), so a restored
+	 * queued background turn stays settlement-excluded.
+	 */
+	noSettlementIdentity?: boolean;
 }
 
 export interface RollbackProof {
@@ -210,14 +248,24 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 	private readonly whenRunIdle: TAction[] = [];
 	private readonly tickets = new Map<string, ActionTicketController>();
 
-	enqueue(action: TAction): void {
+	/**
+	 * Pure no-write enqueue preflight: proves the action passes every explicit
+	 * throw condition of `enqueue`/`enqueueFront` without mutating the store.
+	 * Session admission runs this synchronously immediately before tracker
+	 * admission so a default post-admit enqueue failure is unreachable.
+	 */
+	assertCanEnqueue(action: TAction): void {
 		this.assertNewAction(action);
+	}
+
+	enqueue(action: TAction): void {
+		this.assertCanEnqueue(action);
 		this.list(action.delivery).push(action);
 		this.tickets.set(action.id, new ActionTicketController(action.id));
 	}
 
 	enqueueFront(action: TAction): void {
-		this.assertNewAction(action);
+		this.assertCanEnqueue(action);
 		const list = this.list(action.delivery);
 		const firstQueued = list.findIndex((item) => item.lifecycle.state === "queued");
 		list.splice(firstQueued < 0 ? list.length : firstQueued, 0, action);

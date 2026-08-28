@@ -60,6 +60,7 @@ export async function bindActiveSessionState(
 	state.unsubscribe?.();
 	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
 	state.unsubscribe = session.subscribe((event) => {
+		if (event.type === "prompt_outcome") return;
 		callbacks.broadcast(state, {
 			type: "session_event",
 			activeSessionId: state.activeSessionId,

@@ -187,9 +187,12 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
+import { type PromptLease, type PromptOutcome, PromptSettlementTracker } from "./prompt-settlement.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
 	type AutoRefineReason,
@@ -386,7 +389,8 @@ export type AgentSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| { type: "prompt_outcome"; outcome: PromptOutcome };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -569,6 +573,22 @@ export interface PromptOptions {
 	signal?: AbortSignal;
 	/** Internal host hook fired at the direct-turn ownership commit point. */
 	admissionCommitted?: () => void;
+	/**
+	 * Candidate prompt settlement id. Occupied only when this call admits a
+	 * turn; successful non-turn inputs do not occupy it and a later call may
+	 * reuse it. A duplicate candidate on an accepted turn rejects with
+	 * `DuplicatePromptAdmissionError`.
+	 */
+	promptId?: string;
+	/**
+	 * One-shot settlement admission observer. Fired exactly once per `_prompt`
+	 * call after admission: `{ supported: true, promptId }` for an accepted
+	 * turn, `{ supported: true }` for a successful non-turn input. Pre-admission
+	 * failures and non-turn completion failures never report an accepted id.
+	 * A throwing callback is observer-isolated and cannot roll back the
+	 * accepted action.
+	 */
+	settlementAdmission?: (info: { supported: true; promptId?: string }) => void;
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
@@ -1156,6 +1176,30 @@ export class AgentSession {
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedCompactionOutcomes: CustomMessage[] = [];
+	/**
+	 * Session-level prompt settlement state machine. `now` is wall-clock
+	 * `Date.now`, `persist` is a no-op (ledger writing is group 8) and `emit`
+	 * broadcasts the additive `prompt_outcome` session event through `_emit`.
+	 */
+	private readonly _promptSettlementTracker = new PromptSettlementTracker({
+		now: () => Date.now(),
+		persist: () => {},
+		emit: (outcome) => this._emit({ type: "prompt_outcome", outcome }),
+	});
+	/**
+	 * Deduplicated owner promptIds of the current shared Agent run (group 2
+	 * snapshot; group 7 consumes it to record final message ids). Cleared when
+	 * the run's dispatch completes.
+	 */
+	private _lastRunPromptIds: string[] = [];
+	private _currentRunOwners: string[] = [];
+	/**
+	 * `stopReason` of the assistant message that ended the most recent agent
+	 * run. Captured at assistant `message_end`; consumed by the pump's terminal
+	 * classification before leases are released. Not a `Promise`/lease/closure,
+	 * so it is never part of the recovery snapshot.
+	 */
+	private _lastRunTerminalStopReason: AssistantMessage["stopReason"] | undefined = undefined;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -1761,10 +1805,86 @@ export class AgentSession {
 			if (!dispatched) {
 				this._actionStore.releaseTerminal(action);
 			}
+			// Actual removal of an accepted turn action consumes its stored run
+			// leases exactly once (idempotent helper): default lineage sets the
+			// cancel fence before release so the owner settles `cancelled`;
+			// inherit non-abort removal only releases so the parent derives its
+			// natural status (no requestCancel, no parent lease touch).
+			if (action.payload.kind === "turn") {
+				if (action.lineage === undefined && action.promptIds) {
+					for (const owner of action.promptIds) {
+						this._promptSettlementTracker.requestCancel(owner);
+					}
+				}
+				this._consumeActionRunLeases(action);
+			}
 		}
 		this._pendingNextTurnMessages.unshift(...restorableMessages);
 		if (actions.length > 0) this._notifySessionInputCheckpointChange();
 		return actions;
+	}
+
+	/**
+	 * Clear the current run's owner snapshot at dispatch completion. Reads both
+	 * owner fields so the shared-run ownership contract is observable and group
+	 * 7 can extend this seam to attribute final message ids per owner.
+	 */
+	private _clearRunOwnerSnapshot(): void {
+		// Read the snapshot before clearing: group 7 will consume the owners
+		// here to record final message ids at message_end.
+		const consumedOwners = this._currentRunOwners;
+		const consumedRunIds = this._lastRunPromptIds;
+		if (consumedOwners.length > 0 || consumedRunIds.length > 0) {
+			this._lastRunPromptIds = [];
+			this._currentRunOwners = [];
+		}
+	}
+
+	/**
+	 * Single idempotent consumer of an action's stored run leases. Detaches and
+	 * clears the lease array by object identity before any release, so reentry
+	 * from a release-triggered terminal (pump finally, cancel capture, repeated
+	 * clear/mutate) cannot double-release or produce a second outcome.
+	 * Returns the consumed owners for callers that need to record failure or
+	 * cancel fences around the release.
+	 */
+	private _consumeActionRunLeases(action: QueuedSessionAction): string[] {
+		const leases = action.runLeases ?? [];
+		action.runLeases = undefined;
+		const owners = action.promptIds ?? [];
+		action.promptIds = undefined;
+		for (const lease of leases) {
+			lease.release();
+		}
+		return owners;
+	}
+
+	/** Fire a successful non-turn action's one-shot settlement observer (no id), exactly once. */
+	private _reportNonTurnSettlementAdmission(action: QueuedSessionAction): void {
+		const callback = action.settlementAdmission;
+		action.settlementAdmission = undefined;
+		if (!callback) return;
+		try {
+			callback({ supported: true });
+		} catch {
+			// Observer isolation: a throwing callback must not affect the action lifecycle.
+		}
+	}
+
+	/** Fire a successful extension-command / handled input's one-shot settlement observer (no id), exactly once. */
+	private _reportNonTurnSettlementAdmissionFromOptions(options: InternalPromptOptions | undefined): void {
+		const callback = options?.settlementAdmission;
+		if (!callback) return;
+		try {
+			callback({ supported: true });
+		} catch {
+			// Observer isolation.
+		}
+	}
+
+	/** Drop a non-turn action's settlement observer when its completion failed (never report an accepted id). */
+	private _clearSettlementAdmission(action: QueuedSessionAction): void {
+		action.settlementAdmission = undefined;
 	}
 
 	private _clearQueuedGoalContexts(): void {
@@ -2754,6 +2874,11 @@ export class AgentSession {
 		this._admitSessionInput(
 			this._createPreparedTurnAction("followUp", text, undefined, {
 				message: autonomousMessage,
+				// Group 2 background identity exclusion: the session-internal
+				// autonomous continuation is background owned work, not a user
+				// prompt. It must not create a default settlement identity; group
+				// 5 wires the inherit lineage producer instead.
+				noSettlementIdentity: true,
 			}),
 		);
 		return autonomousMessage;
@@ -3338,6 +3463,15 @@ export class AgentSession {
 				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
 			}
 		}
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			// Terminal run classification for prompt settlement: the assistant
+			// message that ends the run determines whether the run's owners are
+			// fenced as failed (provider error) or cancelled (aborted) before the
+			// run leases are consumed. Retry/compaction are not wired yet (group
+			// 3/4); if one ever ends a run with `error`/`aborted`, its own
+			// classification applies at that run's completion point.
+			this._lastRunTerminalStopReason = event.message.stopReason;
+		}
 		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom")) {
 			for (const action of this._actionStore.actionsForMessage(event.message)) {
 				const record =
@@ -3627,6 +3761,29 @@ export class AgentSession {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * Classify the just-settled run from its terminal assistant message and
+	 * apply the matching settlement fence to every owner BEFORE their run
+	 * leases are consumed: `stopReason === "error"` records `run_error`
+	 * (failed), `stopReason === "aborted"` sets the cancel fence (cancelled);
+	 * a normal completion applies no fence. Reads the per-run stop reason
+	 * captured at assistant `message_end`, so a later unrelated run or stale
+	 * `agent.state` cannot misclassify this run.
+	 */
+	private _applyRunTerminalSettlementFence(owners: string[]): void {
+		const stopReason = this._lastRunTerminalStopReason;
+		this._lastRunTerminalStopReason = undefined;
+		if (stopReason === "error") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.recordFailure(owner, "run_error");
+			}
+		} else if (stopReason === "aborted") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.requestCancel(owner);
+			}
+		}
 	}
 
 	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
@@ -4476,6 +4633,75 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Submit a prompt and settle with a structured `PromptOutcome` for an
+	 * accepted turn, or `undefined` after the existing completion for a
+	 * successful non-turn input. The private one-shot settlement-admission
+	 * callback captures THIS call's accepted turn id; when captured, the
+	 * tracker's terminal outcome is authoritative regardless of whether the
+	 * legacy `AgentMessageOutcome.completion` resolves or rejects. Non-turn
+	 * completion failures and turn admission rejections reject with their
+	 * original errors. A duplicate candidate on an accepted turn rejects with
+	 * `DuplicatePromptAdmissionError`.
+	 */
+	async promptAndSettle(
+		text: string,
+		options?: PromptOptions & { promptId?: string },
+	): Promise<PromptOutcome | undefined> {
+		const agentMessageId = options?.agentMessageId ?? `prompt-settle:${randomUUID()}`;
+		// Per-call isolation: the id is taken not only when a completion deferred
+		// exists, but also while ANY unfinished action owns it (a prior plain
+		// prompt()/promptAndWait() may own the queued action without a completion
+		// deferred). Rejecting here prevents this call from coalescing into the old
+		// action (same key) or admitting a duplicate owner (different key), which
+		// would otherwise masquerade as a successful non-turn.
+		if (
+			this._agentMessageOutcomes.get(agentMessageId)?.completion ||
+			this._actionStore.unfinishedActions().some((action) => action.agentMessageId === agentMessageId)
+		) {
+			throw new Error(`Prompt completion id is already in use: ${agentMessageId}`);
+		}
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		outcome.completion = createAgentMessageDeferred();
+		const completion = outcome.completion.promise;
+		// Closure-private capture of this call's accepted turn id; never a
+		// shared "latest record" field, so concurrent calls cannot cross ids.
+		let acceptedPromptId: string | undefined;
+		try {
+			await this.promptUntilAccepted(text, {
+				...options,
+				agentMessageId,
+				settlementAdmission: (info) => {
+					if (info.promptId !== undefined) acceptedPromptId = info.promptId;
+					options?.settlementAdmission?.(info);
+				},
+			});
+			await completion;
+		} catch (error) {
+			this._settleAgentMessage(agentMessageId, "completion", this._asError(error));
+			if (acceptedPromptId === undefined) throw error;
+			// Accepted turn whose legacy completion rejected: the tracker is
+			// authoritative (failed/cancelled outcome). The terminal may still be
+			// in flight (the pump consumes leases in its finally, after settling
+			// the completion), so wait for the terminal rather than reading it
+			// synchronously.
+		}
+		if (acceptedPromptId !== undefined) {
+			return this._promptSettlementTracker.waitForOutcome(acceptedPromptId);
+		}
+		return undefined;
+	}
+
+	/** Terminal outcome for a prompt id, or `undefined` when unknown or still settling. */
+	getPromptOutcome(promptId: string): PromptOutcome | undefined {
+		return this._promptSettlementTracker.outcome(promptId);
+	}
+
+	/** Resolve with the terminal outcome; rejects for unknown prompt ids. */
+	waitForPromptOutcome(promptId: string): Promise<PromptOutcome> {
+		return this._promptSettlementTracker.waitForOutcome(promptId);
+	}
+
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
@@ -4562,6 +4788,10 @@ export class AgentSession {
 					options?.executionPolicy ??
 					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
 				queueVisible: visibleQueued,
+				// Group 2 background identity exclusion is derived centrally in
+				// `_createPreparedTurnAction` from the primary message (heartbeat /
+				// RLM notices): no caller-side flag needed here. Group 5 later wires
+				// autonomous inherit lineage instead.
 			});
 			const result = this._admitSessionInput(action, {
 				immediatelyEligible: !visibleQueued,
@@ -4624,8 +4854,13 @@ export class AgentSession {
 				if (normalized.kind === "extensionCommand") {
 					commitFence?.release();
 					reportPreflight(true);
+					// Successful non-turn completion reports settlement support
+					// once with no accepted id; failure never reports an id.
 					void normalized.completion.then(
-						() => this._settleAgentMessage(options?.agentMessageId, "completion"),
+						() => {
+							this._settleAgentMessage(options?.agentMessageId, "completion");
+							this._reportNonTurnSettlementAdmissionFromOptions(options);
+						},
 						(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
 					);
 					void normalized.completion.catch(() => undefined);
@@ -4636,6 +4871,7 @@ export class AgentSession {
 					commitFence?.release();
 					reportPreflight(true);
 					this._settleAgentMessage(options?.agentMessageId, "completion");
+					this._reportNonTurnSettlementAdmissionFromOptions(options);
 					return;
 				}
 
@@ -4656,6 +4892,7 @@ export class AgentSession {
 					);
 					const result = this._admitSessionInput(action, {
 						immediatelyEligible: !wasBusy && this._canStartSessionActionImmediately(),
+						settlementAdmission: options?.settlementAdmission,
 					});
 					commitFence?.release();
 					reportPreflight(result.accepted, result.disposition === "queued");
@@ -4715,12 +4952,14 @@ export class AgentSession {
 					queueVisible: visibleQueued,
 					acceptedAgentMessage,
 					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
+					candidatePromptId: options?.promptId,
 				});
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
 				const result = this._admitSessionInput(action, {
 					immediatelyEligible: !visibleQueued && this._canStartSessionActionImmediately(),
+					settlementAdmission: options?.settlementAdmission,
 				});
 				commitFence?.release();
 				if (!result.accepted || !result.ticket) {
@@ -4920,6 +5159,24 @@ export class AgentSession {
 			) {
 				throw new Error(`Session action ${recovered.id} has invalid delivery correlation`);
 			}
+			// Re-derive the background-injected marker from the durable custom
+			// message (heartbeat / RLM notices) so a restored queued background
+			// turn stays settlement-excluded without ever serializing the marker.
+			const restoredNoSettlementIdentity =
+				recovered.payload.kind === "turn" && this._recoveredTurnIsBackgroundInjected(recovered.payload.records);
+			// Old/replayed snapshots can serialize an identity-bearing turn policy
+			// with `completionIncludesRetryChain:false` (pre-Round 1 customTrigger
+			// timing). Restore re-admits such turns with a fresh settlement
+			// identity, so their main-run retry chain is owned work again: the
+			// policy MUST be normalized to wait it before terminal fence/release.
+			// Settlement-excluded background turns have no identity and retain the
+			// serialized timing (false is legal there).
+			const restoredRetryChain =
+				recovered.payload.kind === "turn"
+					? restoredNoSettlementIdentity
+						? recovered.payload.executionPolicy.completionIncludesRetryChain
+						: true
+					: undefined;
 			const payload: PreparedTurnPayload | PreparedCommandPayload =
 				recovered.payload.kind === "turn"
 					? {
@@ -4955,6 +5212,11 @@ export class AgentSession {
 								: {}),
 							executionPolicy: {
 								...recovered.payload.executionPolicy,
+								// Normalize only for identity-bearing restored turns;
+								// other policy fields are copied verbatim.
+								...(restoredRetryChain !== undefined
+									? { completionIncludesRetryChain: restoredRetryChain }
+									: {}),
 								preparation: {
 									...recovered.payload.executionPolicy.preparation,
 								},
@@ -4985,10 +5247,29 @@ export class AgentSession {
 				...(recovered.queueKey ? { queueKey: recovered.queueKey } : {}),
 				...(recovered.agentMessageId ? { agentMessageId: recovered.agentMessageId } : {}),
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
+				// The runtime background marker is deterministically re-derived
+				// (never serialized on the recovery wire).
+				...(restoredNoSettlementIdentity ? { noSettlementIdentity: true } : {}),
 			};
 		});
 		for (const action of actions) this._admitSessionInput(action, { restore: true });
 		return actions.length;
+	}
+
+	/**
+	 * True when a recovered turn's PRIMARY record is a background-injected custom
+	 * message (heartbeat / RLM child notices). Identity classification depends
+	 * only on the primary record; prefix / next_turn context never changes owner
+	 * semantics, so a normal user-primary turn keeps its settlement identity even
+	 * when a background custom message restores beside it as prefix context. Only
+	 * messages whose customType is stably re-derivable are classified; autonomous
+	 * threshold continuations are plain user messages with their own group-5
+	 * bookkeeping and are not reconstructed here.
+	 */
+	private _recoveredTurnIsBackgroundInjected(records: readonly SessionActionRecoveryRecord[]): boolean {
+		const primary = records.find((record) => record.role === "primary");
+		if (!primary || primary.message.role !== "custom") return false;
+		return this._isBackgroundInjectedMessage(primary.message);
 	}
 
 	private _restoreSessionCommand(
@@ -5166,6 +5447,10 @@ export class AgentSession {
 				completionIncludesRetryChain: true,
 			};
 		}
+		// customTrigger (sendCustomMessage triggerTurn) is an identity-bearing
+		// producer: its main run's retry chain is owned work, so terminal
+		// classification and lease release must happen only after the retry chain
+		// completes (group 3 wires the retry lease itself).
 		return {
 			preparation: {
 				initialRefineBarrier: "always",
@@ -5178,7 +5463,7 @@ export class AgentSession {
 			runBeforeAgentStart: false,
 			nextTurnContextTiming: "skip",
 			preserveEmptyExtensionPrompt: false,
-			completionIncludesRetryChain: false,
+			completionIncludesRetryChain: true,
 		};
 	}
 
@@ -5200,6 +5485,12 @@ export class AgentSession {
 			queueVisible?: boolean;
 			acceptedAgentMessage?: boolean;
 			acceptedBeforeCompletion?: boolean;
+			/** Candidate settlement id (default) or private `{ inherit: owners }` lineage. */
+			lineage?: { inherit: string[] };
+			/** Pre-allocated candidate settlement id (from public `PromptOptions.promptId`). */
+			candidatePromptId?: string;
+			/** Background-injected turn that must NOT participate in settlement. */
+			noSettlementIdentity?: boolean;
 		},
 	): QueuedSessionAction {
 		const id = randomUUID();
@@ -5211,6 +5502,15 @@ export class AgentSession {
 				content: content.map((block) => ({ ...block })),
 				timestamp: Date.now(),
 			} satisfies UserMessage);
+		// Group 2 central background classification: a turn whose PRIMARY message
+		// is a known background-injected custom message (heartbeat / RLM child
+		// notices) is settlement-excluded on every construction entrypoint, no
+		// matter which caller built the action. An explicit caller exclusion can
+		// only ADD exclusion (autonomous threshold continuation staging); explicit
+		// false/absence never overrides a recognized custom background primary.
+		const derivedSettlementExclusion =
+			options.noSettlementIdentity === true ||
+			(message.role === "custom" && this._isBackgroundInjectedMessage(message));
 		const prefixMessages = options.prefixMessages?.map((prefix) => cloneCustomMessage(prefix)) ?? [];
 		const preview = options.previewLabel ? `${options.previewLabel}: ${text}` : undefined;
 		const payload: PreparedTurnPayload = {
@@ -5244,7 +5544,40 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+			lineage: options.lineage,
+			// Default lineage prepares a candidate id without touching the
+			// tracker; only accepted turns occupy it at admission. A public
+			// caller's pre-allocated candidate wins over a fresh one.
+			// Background-injected turns skip settlement identity entirely and must
+			// NOT carry a candidate at all.
+			...(options.lineage === undefined && !derivedSettlementExclusion
+				? { candidatePromptId: options.candidatePromptId ?? randomUUID() }
+				: {}),
+			// Background-injected turns skip settlement identity entirely. The
+			// runtime marker is set from the centrally derived exclusion so
+			// admission (and any caller relying on the flag) sees the same
+			// classification for every construction entrypoint.
+			...(derivedSettlementExclusion ? { noSettlementIdentity: true } : {}),
 		};
+	}
+
+	/**
+	 * Background-injected message discriminator (group 2). Heartbeat prompts,
+	 * RLM child terminal/failure notices and other known background custom
+	 * turns are not user prompts: they must run as turns WITHOUT a settlement
+	 * identity so they never create a default `promptId`/lease/outcome and never
+	 * block a main prompt's settlement. Ordinary user/agent-session turns are
+	 * unaffected.
+	 */
+	private _isBackgroundInjectedMessage(message: CustomMessage): boolean {
+		switch (message.customType) {
+			case HEARTBEAT_PROMPT_CUSTOM_TYPE:
+			case RLM_CHILD_FAILURE_CUSTOM_TYPE:
+			case RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE:
+				return true;
+			default:
+				return false;
+		}
 	}
 
 	private _createSessionCommandAction(
@@ -5297,6 +5630,8 @@ export class AgentSession {
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
+			/** One-shot settlement admission observer for the calling `_prompt`. */
+			settlementAdmission?: (info: { supported: true; promptId?: string }) => void;
 		} = {},
 	): {
 		accepted: boolean;
@@ -5316,9 +5651,70 @@ export class AgentSession {
 			}
 			return { accepted: false, disposition: "queued" };
 		}
+		const isTurn = action.payload.kind === "turn";
+		// Group 2 background identity exclusion: injected heartbeat / RLM notices
+		// never admit a settlement identity. The turn runs without a tracker
+		// record, lease, candidate or `prompt_outcome`.
+		const settlementIdentity = isTurn && action.noSettlementIdentity !== true;
+		// Pre-admission settlement validation (before any tracker admission):
+		// the pure store preflight proves every explicit enqueue throw, and the
+		// default candidate / inherit owners are checked against the tracker.
+		this._actionStore.assertCanEnqueue(action);
+		let inheritOwners: string[] | undefined;
+		if (settlementIdentity && action.lineage !== undefined) {
+			inheritOwners = [...new Set(action.lineage.inherit)];
+			if (inheritOwners.length === 0) {
+				throw new Error("Inherit lineage requires at least one prompt owner.");
+			}
+			for (const owner of inheritOwners) {
+				if (!this._promptSettlementTracker.isSettling(owner)) {
+					// Unknown / terminal / busy owner: the whole inherit action is
+					// dropped without entering the store or throwing through the pump.
+					return { accepted: false, disposition: "queued" };
+				}
+			}
+		}
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
 			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
+		// Settlement admission (default: fresh candidate occupied now; inherit:
+		// all-or-nothing sibling leases) happens strictly before the store write.
+		let admittedTurnId: string | undefined;
+		if (settlementIdentity) {
+			if (inheritOwners !== undefined) {
+				const acquired: PromptLease[] = [];
+				try {
+					for (const owner of inheritOwners) {
+						acquired.push(this._promptSettlementTracker.acquire(owner, "run"));
+					}
+				} catch {
+					// All-or-nothing: release only the sibling leases this action
+					// just acquired, in reverse; never cancel or release parent
+					// leases, and never enter the store.
+					for (let index = acquired.length - 1; index >= 0; index -= 1) {
+						acquired[index]!.release();
+					}
+					return { accepted: false, disposition: "queued" };
+				}
+				action.promptIds = inheritOwners;
+				action.runLeases = acquired;
+				action.candidatePromptId = undefined;
+			} else {
+				// Default: the preflight above guarantees a fresh candidate can be
+				// admitted and immediately acquire a run lease (Date.now + no-op
+				// persist make post-admit failure unreachable).
+				const candidate = action.candidatePromptId ?? randomUUID();
+				this._promptSettlementTracker.admit({
+					promptId: candidate,
+					sessionEpoch: this._sessionInputArrivalEpoch,
+				});
+				const lease = this._promptSettlementTracker.acquire(candidate, "run");
+				action.promptIds = [candidate];
+				action.runLeases = [lease];
+				action.candidatePromptId = undefined;
+				admittedTurnId = candidate;
+			}
+		}
 		if (options.front) this._actionStore.enqueueFront(action);
 		else this._actionStore.enqueue(action);
 		let disposition: "starts_when_admitted" | "queued" = "queued";
@@ -5329,6 +5725,21 @@ export class AgentSession {
 			actionId: action.id,
 			disposition,
 		});
+		// The one-shot settlement-admission observer fires only after the action
+		// is durably enqueued; a throwing observer is isolated and cannot roll
+		// back the accepted action or corrupt sibling calls. For non-turn actions
+		// and background-injected turns (session commands / heartbeat / RLM
+		// notices) the observer is retained on the action and fired exactly once
+		// when the action completes successfully.
+		if (isTurn && settlementIdentity) {
+			try {
+				options.settlementAdmission?.({ supported: true, promptId: admittedTurnId });
+			} catch {
+				// Observer isolation.
+			}
+		} else {
+			action.settlementAdmission = options.settlementAdmission;
+		}
 		this._sessionInputArrivalEpoch++;
 		this._emitQueueUpdate();
 		if (
@@ -5480,8 +5891,29 @@ export class AgentSession {
 				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
+				// Group 2 owner snapshot: deduplicated owners of this shared run's
+				// turn actions. No additional acquire happens here; each action
+				// already holds its own run lease from admission.
+				const batchOwners = [
+					...new Set(
+						actions.flatMap((action) => (action.payload.kind === "turn" ? (action.promptIds ?? []) : [])),
+					),
+				];
+				this._lastRunPromptIds = batchOwners;
+				this._currentRunOwners = batchOwners;
+				// Each batch starts with a fresh terminal-stop-reason slot: the run
+				// that follows sets it at its assistant message_end, so a stale
+				// classification from a prior batch can never leak in.
+				this._lastRunTerminalStopReason = undefined;
 				try {
 					await this._startPreparedTurnActions(actions, epoch);
+					// Classify this run's terminal assistant message and fence the
+					// batch owners before their leases are consumed: provider error
+					// -> failed/run_error, aborted -> cancelled, normal -> completed.
+					const batchOwnersForSettlement = actions.flatMap((action) =>
+						action.payload.kind === "turn" ? (action.promptIds ?? []) : [],
+					);
+					this._applyRunTerminalSettlementFence([...new Set(batchOwnersForSettlement)]);
 					for (const action of actions) {
 						if (action.lifecycle.state === "committing") {
 							const primary = primaryDeliveryRecord(action);
@@ -5497,6 +5929,13 @@ export class AgentSession {
 							transitionSessionAction(action, { state: "completed" });
 							this._actionStore.ticketFor(action).settleCompleted();
 							this._settleAgentMessage(action.agentMessageId, "completion");
+							// A successfully completed settlement-excluded turn (e.g.
+							// heartbeat / RLM primary) reports its one-shot no-id
+							// settlement admission now, after the legacy completion
+							// settles — same ordering as successful non-turn inputs.
+							// Identity-bearing turns carry no stored callback (fired
+							// at admission), so the helper no-ops there.
+							this._reportNonTurnSettlementAdmission(action);
 						}
 					}
 				} catch (error) {
@@ -5530,6 +5969,17 @@ export class AgentSession {
 						continue;
 					}
 					const terminalError = this._asError(error);
+					// Pump terminal failure: record `run_error` for every owner
+					// before any action lease is consumed so the terminal derives
+					// `failed/run_error`; the `finally` consumes the leases exactly
+					// once.
+					for (const action of actions) {
+						if (action.payload.kind === "turn" && action.promptIds) {
+							for (const owner of action.promptIds) {
+								this._promptSettlementTracker.recordFailure(owner, "run_error");
+							}
+						}
+					}
 					for (const action of actions) {
 						if (action.lifecycle.state === "cancelled") continue;
 						if (action.lifecycle.state !== "completed" && action.lifecycle.state !== "failed") {
@@ -5550,6 +6000,10 @@ export class AgentSession {
 						this._surfaceSessionInputError(error);
 					}
 				} finally {
+					// Group 2 owner snapshot is consumed (cleared) at dispatch
+					// completion; group 7 reads it at message_end to attribute
+					// assistant entries per owner.
+					this._clearRunOwnerSnapshot();
 					for (const action of actions) {
 						const retainedCancelledDispatch =
 							action.lifecycle.state === "cancelled" &&
@@ -5561,6 +6015,12 @@ export class AgentSession {
 								action.lifecycle.state === "failed" ||
 								action.lifecycle.state === "cancelled")
 						) {
+							// Consume this action's run leases exactly once. For a
+							// default turn this releases the admission lease and
+							// synchronously settles the owner (completed/failed/
+							// cancelled); for a retained cancelled dispatch the
+							// leases stay until the dispatch cleanup (group 6).
+							if (action.payload.kind === "turn") this._consumeActionRunLeases(action);
 							this._actionStore.releaseTerminal(action);
 						}
 					}
@@ -5606,6 +6066,9 @@ export class AgentSession {
 					transitionSessionAction(action, { state: "completed" });
 					this._actionStore.ticketFor(action).settleCompleted();
 					this._settleAgentMessage(action.agentMessageId, "completion");
+					// Successful non-turn command: report settlement support exactly
+					// once with no accepted id.
+					this._reportNonTurnSettlementAdmission(action);
 				} catch (error) {
 					const commandError = this._asError(error);
 					transitionSessionAction(action, {
@@ -5616,6 +6079,7 @@ export class AgentSession {
 					ticket.rejectDelivered(commandError);
 					ticket.settleCompleted(commandError);
 					this._rejectAgentMessage(action.agentMessageId, commandError);
+					this._clearSettlementAdmission(action);
 				} finally {
 					this._actionStore.releaseTerminal(action);
 					this._notifySessionInputCheckpointChange();
