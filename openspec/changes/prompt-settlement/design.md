@@ -91,7 +91,7 @@ export class PromptSettlementTracker {
 | owned work | acquire | release | 备注 |
 | --- | --- | --- | --- |
 | 主 run（含排队期、同步 tool/子 Agent） | `_admitSessionInput` accepted分支在 enqueue前，以 action每个 promptIds owner取独立 `"run"` lease并存到 action；preparing不再 acquire。`"all"` 合并时共享 run owners为 action promptIds并集 | action completion/terminal error/实际取消时各自释放已存 leases；错误先逐 owner `recordFailure("run_error")`。排队期lease保证 accepted action无0-lease limbo | 同 owner可因父 action+inherit action并存多个 run lease。session command无 promptIds/lease；`:5608`不参与；`:6036`只释放实际 removed accepted turn的已有 lease |
-| provider retry 窗口 | 建立 `_retryPromise`（`:3396`、`:10241`）时，对 `_lastRunPromptIds` 中每个 owner 取 `"retry"` lease | `_retryResolve` 置空（`:3614`）时逐个释放 | retry 属于共享 run 的全部 prompt owner；先全部 acquire，再释放对应 run lease |
+| provider retry 窗口 | 同步 `agent_end` pre-arm与`_handleRetryableError` defensive fallback共用一个idempotent helper：首次建立window时捕获当下 `_lastRunPromptIds` 去重快照，对每个owner all-or-nothing取一份 `"retry"` lease，全部成功后才发布Promise/resolve/lease state | 唯一 `_resolveRetry` 漏斗先detach Promise/resolve/captured leases，再逐实例release并resolve原waiters；成功、耗尽、禁用、sleep cancel、overflow/compaction结束与abort均复用 | retry属于该共享run的全部prompt owner；同一chain多个error `agent_end`不重复acquire；snapshot随后变化不串owner；background/no-owner window允许零lease；先全部acquire再允许旧run lease释放 |
 | post-compaction continuation | `_schedulePostCompactionContinue`（`:7377`）置 `Scheduled=true` 时，对 `_lastRunPromptIds` 中每个 owner 取 `"compaction_continuation"` lease | `_cancelPostCompactionContinue`（`:7277`）、继续路径 `agent.continue()` 返回/抛出后、以及各提前 return 分支逐个释放 | 重排（`:7400-7404` 的 reschedule）沿用同一组 lease，不重复 acquire。非 abort 的取消路径（`_clearQueuedAutonomousContinuations` `:2802`、auto-refine 分支失效）只 release、不 `requestCancel`：此时主 run 已正常结束、continuation 不再需要，推导为 `completed` 是**预期结果**，不是误判 |
 | autonomous threshold continuation（session 内部入队） | `_queueAutonomousContinuationForThresholdCompaction` 创建 action 时标 `lineage: { inherit: promptIds }`，其中 promptIds 是触发它的共享 run owner 快照；后续按"主 run"行逐 owner 挂 lease | 同主 run | 一个 continuation action 可以继承多个 promptId，但只执行一次；不得为每个 owner 重复入队同一 continuation，也不得任意选择一个 owner |
 
@@ -323,3 +323,84 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不实现retry/compaction/autonomous producer leases、主动in-flight abort ownership清理、dispose released fence、finalMessageIds、ledger/restart、AgentConnection API/daemon capability/RPC/Print/ACP/TUI接线；两个adapter过滤只阻止session-only event提前泄漏。
 - lineage spec 的 `requestAbort` inherited-work清理、abortAndClearQueue当前run与dispose场景分别由组6处理；本组只处理实际从action store移除的accepted queued action，并把provider最终已返回的`aborted` run正确推导为cancelled。
+
+## Issue #28 implementation fixture
+
+Fixture level: expanded（上游建议compact；本切片直接修改retry与共享state-transition生命周期，命中mandatory expanded trigger）
+Repair intensity: high（retry lease与run lease的同步交接是settle-once临界区；漏owner、重复acquire或漏release分别导致提前终态或永久settling）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts` 的同步`agent_end` retry pre-arm、`_handleRetryableError` defensive fallback、`_resolveRetry`唯一结束漏斗，以及focused settlement/retry harness测试；tracker API不变。
+- Must preserve: retry eligibility/auth stale判定、attempt/backoff、`auto_retry_start/end`顺序与字段、AgentMessageOutcome/prompt timing、accepted agent-message queue semantics、overflow-compaction retry continuation、background exclusion与group-2 outcome classification。
+- Must add: 一个retry window捕获建立时的去重owner snapshot并为每owner持有一份独立`retry` lease；所有结束路径detach/release一次；同window多个error不重复acquire；snapshot变化不串owner。
+- Staged boundary: compaction continuation lease/traceGeneration（#29）、autonomous inherit（#30）、active abort/dispose终态语义（#31）、message ids（#32）与persistence/wire/modes（#33+）不实现。`abortRetry()`在本组只关闭当前retry window并释放其retry leases；它是否对prompt置cancel fence由#31决定。
+- Seam under test: in-process AgentSession + faux provider；测试可spy tracker `acquire`及captured `PromptLease.release`，并从action/runtime只读观察owner/outcome。只看最终outcome不足以证明本组实现，因为group-2 run lease已覆盖retry chain。
+
+### Retry-window ownership contract
+
+- 建立helper必须idempotent：已有`_retryPromise`时不读新owner、不acquire；首次建立时复制`_lastRunPromptIds`去重数组。零owner合法（background或defensive路径），仍建立原retry Promise以保持legacy timing。
+- Owner acquire为all-or-nothing：按captured顺序取得`retry` leases；任一失败只逆序release本次已取得siblings，且不得发布新的Promise/resolve/lease字段或触碰action run leases。正常identity-bearing owner在group-2 run lease仍存在时可稳定acquire；异常失败不得留下半开window。
+- Promise、resolve、captured owner/lease属于同一个runtime-only window，不进入recovery snapshot。`_lastRunPromptIds`之后可被清空/覆盖；resolve严禁回读它。
+- `_resolveRetry`是唯一close helper：先把Promise/resolve/owners/leases从session字段detach并清空，再release每个captured lease，最后resolve已捕获waiter并schedule pump。detach-first保证lease最后释放触发同步outcome/event/reentry时，重复abort/resolve看见empty window且不二次release。若legacy waiter ordering要求先resolve Promise，必须用测试证明不会允许pump/settlement观察未释放retry lease；默认采用release-before-resolve。
+- retry成功、耗尽、disabled/fallback、无last assistant、sleep cancel、overflow/compaction terminal、cancelled dispatch与`abortRetry`均继续调用该close helper；不得新增旁路release。一个chain的多个`agent_end`只持一组leases，最终一次close全部释放。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: not selected - 无签名、CLI、AgentConnection或wire变化。
+- Config / project setup: not selected - retry配置shape/default不变。
+- File IO / path safety / overwrite: not selected - 无文件或JSONL操作。
+- Schema / columns / units / field names: not selected - tracker/outcome/action recovery schema不变；仅新增private runtime fields/helper。
+- Auth / permissions / secrets: not selected - 不新增权限/secret；既有provider auth retry判定必须回归。
+- Concurrency / shared state / ordering: selected - 两处window建立、multi-owner all-or-nothing acquire、唯一detach-first close与run→retry无空窗是核心。
+- Resource limits / large input / discovery: not selected - owner数受当前batch限制；不新增polling或外部发现。
+- Legacy compatibility / examples: selected - retry attempt/event/backoff、prompt timing、auth/overflow/accepted-message与background路径必须不变。
+- Error handling / rollback / partial outputs: selected - partial owner acquire、exhaustion、sleep cancel、abort、重复close都必须无leak/双release。
+- Release / packaging / dependency compatibility: not selected - 无public export或dependency变化。
+- Documentation / migration notes: not selected - shared runtime status文档由#42统一更新；本fixture记录staged状态。
+- TUI focus/render lifecycle: not selected - 不触碰TUI。
+- Session/extension teardown lifecycle: selected - `abortRetry`和cancelled dispatch会关闭window；prompt cancel/dispose终态留#31。
+
+### Required evidence
+
+- single owner error→success：spy证明首个`agent_end`同步建立一次`acquire(owner,"retry")`，第二个`agent_end`前lease未release且outcome absent；最终release一次、两个`agent_end`、一个completed同promptId。
+- `"all"` A/B error→success：首次window为exact dedup owners各acquire一次；中途两owner均settling且无outcome；最终每owner各completed一次。将`_lastRunPromptIds`在window建立后改写/清空不得改变captured release targets。
+- 连续error→error→success：同window内每owner`acquire("retry")`仍恰一次，三次`agent_end`后release一次与一个completed。
+- max retries exhausted：window最终detach/release每owner一次，run最终failure fence后各failed/run_error；zero retry lease residue、重复`abortRetry`/resolve无额外release/event。
+- defensive fallback：直接在无pre-arm Promise但有稳定owner snapshot的`_handleRetryableError` seam建立相同window/leases；partial second-owner acquire failure回滚第一lease且不发布window。
+- cancellation/unchanged siblings：retry sleep时`abortRetry`只关闭window并release一次；existing auth-stale、overflow-compaction、accepted-agent-message、retry-disabled和event-order tests保持原结果。prompt cancel fence语义不在本组断言。
+- focused commands: settlement group3 tests + `agent-session-retry-events.test.ts` + auth regression `4491-provider-stale-after-401.test.ts`，再跑受影响session siblings、root check/build、strict OpenSpec。
+
+### Invariant Matrix
+
+- Governing invariant: 每个active retry window对建立时全部identity-bearing run owners各持有且仅持有一份counted retry lease，先于旧owned-work release获取，并在任一window结束路径exactly-once释放后才允许settlement继续。
+- Source-of-truth identity/contract: private retry-window tuple `{ promise, resolve, capturedPromptIds, leases }`，其中`capturedPromptIds[i] ↔ leases[i]`；owner来源是建立时`_lastRunPromptIds`快照。
+- Producers: synchronous `_createRetryPromiseForAgentEnd` pre-arm和`_handleRetryableError` defensive fallback共享create helper。
+- Validators/preflight: existing-window idempotency、owner dedup/settling acquire、multi-owner all-or-nothing rollback；零owner合法。
+- Storage/cache/query: runtime-only session fields；action recovery、tracker record/persist与wire均不变。
+- Public routes/entrypoints: prompt family与sendCustomMessage只间接触发；无新public API。
+- Frontend/downstream consumers: retry events、TUI/extension listeners、AgentMessageOutcome、queue pump、auth stale与overflow compaction保持兼容。
+- Failure paths/rollback/stale state: partial acquire、multiple errors、exhaustion、disabled/no-message、sleep cancel、abortRetry、cancelled dispatch、compaction结束、duplicate close与stale `_lastRunPromptIds`。
+- Evidence/audit/readiness: direct acquire/release spies + faux-provider outcomes/events + existing retry/auth/compaction suites + check/build/OpenSpec。
+- Regression rows:
+  - single/multi-owner retry success -> exact owner leases established once, no early outcome, exact release, one completed per identity。
+  - repeated error then exhaustion/abort -> no duplicate acquire/release, final failed or existing abort semantics, no lease residue。
+  - partial owner acquire failure -> rollback only newly acquired siblings, no half-open retry tuple or owner cancellation。
+  - owner snapshot changes after create -> releases original captured leases only, no cross-run ownership。
+  - no-owner background/defensive retry -> legacy retry Promise/events continue with zero settlement lease/outcome。
+  - unchanged auth/overflow/accepted-message consumers -> prior event, attempt, queue and continuation behavior unchanged。
+
+### Boundary-surface checklist
+
+- Shared helper roots: retry-window create/close plus tracker acquire/release; one implementation, no per-caller lease logic。
+- Public entrypoints: unchanged；prompt/sendCustomMessage behavior only gains internal lease accounting。
+- Staging/rollback: all-or-nothing owner acquire before publishing tuple；detach-first close before callback/reentry。
+- Producer/consumer evidence: tests directly observe acquire/release and outcomes；not outcome-only。
+- Stale/idempotency: window snapshot immutable for lifetime；multiple agent_end/resolve/abort cannot duplicate ownership。
+- Unchanged downstream consumers: auth stale、overflow compaction、retry events、accepted agent-message queue、AgentConnection/wire。
+
+### Non-goals for #28
+
+- 不实现compaction/autonomous leases、traceGeneration、active abort/dispose fence、finalMessageIds、ledger/recovery或任何mode/wire变化。
+- 不改变哪些provider错误可retry、maxRetries算法、backoff、event payload/order或error-message清理；发现这些问题只报告不顺手修。

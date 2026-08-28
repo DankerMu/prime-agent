@@ -63,7 +63,17 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 #### Scenario: retry 不提前结算
 
 - WHEN run 因 provider 错误进入 retry 等待窗口，随后 retry 成功完成
-- THEN outcome 在 retry 完成后才产生，状态 `completed`，期间只有一个 `promptId`、可能出现多个 `agent_end`
+- THEN session 在释放旧 owned work 前对该 run 的每个去重 owner取得一份独立 `retry` lease；outcome 在 retry 完成并释放这些 captured leases 后才产生，状态 `completed`，期间每个 owner只有原 `promptId`、可能出现多个 `agent_end`
+
+#### Scenario: shared retry window 按 owner 计数且不重复 acquire
+
+- WHEN `"all"` batching 的 A/B 共享 run 连续经历多个 retryable error `agent_end` 后成功
+- THEN 同一个 retry window 只在首次建立时为 A/B各 acquire一份 `retry` lease，后续 error不得重复 acquire；A/B均在最终 retry结束后各自产生一次 outcome，不合并identity
+
+#### Scenario: retry window 所有结束路径只释放一次
+
+- WHEN retry成功、耗尽、sleep被取消、overflow/compaction恢复结束或调用 `abortRetry()` 中任一路径关闭 retry window，并可能发生重复resolve/abort
+- THEN window建立时捕获的每个retry lease只release一次，Promise/resolve/lease引用先被detach，重复结束为no-op；不得留下永久settling或对后续run的owner错放lease
 
 #### Scenario: compaction continuation 不提前结算
 
@@ -78,7 +88,7 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 #### Scenario: lease 交接无空窗
 
 - WHEN 主 run 的 lease 释放与 retry/compaction continuation 的 lease 获取在同一同步段发生
-- THEN tracker 不在交接间隙产生终态；获取新 lease 先于释放旧 lease 的顺序被 session 保证，单测以交错顺序覆盖
+- THEN tracker 不在交接间隙产生终态；retry window在同步 `agent_end` handling中先捕获全部owner并完成all-or-nothing acquire，之后旧 lease才可释放，单测直接观察retry lease而非依赖现有run lease推断
 
 #### Scenario: 无关后台工作不阻塞
 
