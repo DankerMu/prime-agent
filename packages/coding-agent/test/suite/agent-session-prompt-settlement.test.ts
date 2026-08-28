@@ -1,5 +1,5 @@
 /**
- * OpenSpec prompt-settlement, groups 2-3, shared session-level suite.
+ * OpenSpec prompt-settlement, groups 2-4, shared session-level suite.
  *
  * Group 2 (issue #27): action promptId + main run lease + promptAndSettle
  * API. These tests use the retry-disabled faux provider so each error is
@@ -29,8 +29,8 @@ import type { SessionAction } from "../../src/core/session-action-store.js";
 import type { ExtensionFactory } from "../../src/index.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../../src/modes/daemon/daemon-extension-binding.js";
-import { createHarness, getUserTexts, type Harness } from "./harness.js";
-import { createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
 type TurnAction = SessionAction & { payload: { kind: "turn"; text: string } };
 
@@ -133,6 +133,7 @@ function installContinuationObserver(harness: Harness): {
 	acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }>;
 	acquireContexts: Array<{ promptId: string; runLeasesHeld: number; outcomeAtAcquire: unknown }>;
 	continuationLeases: ContinuationLeaseRecord[];
+	retryLeases: RetryLeaseRecord[];
 	generationBumps: string[];
 	timeline: string[];
 	acquiresOfContinuation: () => Array<{ promptId: string; kind: "compaction_continuation" }>;
@@ -150,6 +151,7 @@ function installContinuationObserver(harness: Harness): {
 	const acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }> = [];
 	const acquireContexts: Array<{ promptId: string; runLeasesHeld: number; outcomeAtAcquire: unknown }> = [];
 	const continuationLeases: ContinuationLeaseRecord[] = [];
+	const retryLeases: RetryLeaseRecord[] = [];
 	const generationBumps: string[] = [];
 	const timeline: string[] = [];
 	const acquireSpy = vi.spyOn(tracker, "acquire").mockImplementation((promptId: string, kind: PromptLeaseKind) => {
@@ -178,6 +180,15 @@ function installContinuationObserver(harness: Harness): {
 				baseRelease();
 			};
 			continuationLeases.push(record);
+		} else if (kind === "retry") {
+			const record: RetryLeaseRecord = { promptId, kind: "retry", releaseCalls: 0 };
+			const baseRelease = lease.release.bind(lease);
+			const wrapped = lease as PromptLease & { release: () => void };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				baseRelease();
+			};
+			retryLeases.push(record);
 		}
 		return lease;
 	});
@@ -189,6 +200,7 @@ function installContinuationObserver(harness: Harness): {
 		acquireLog,
 		acquireContexts,
 		continuationLeases,
+		retryLeases,
 		generationBumps,
 		timeline,
 		acquiresOfContinuation: () =>
@@ -213,6 +225,8 @@ interface ContinuationInternals {
 	_continuationSchedulingPause: { release(): void } | undefined;
 	_continuationPumpOwnerAction: unknown | undefined;
 	_lastRunTerminalStopReason: AssistantMessage["stopReason"] | undefined;
+	_pendingRequestedCompaction: { customInstructions?: string } | undefined;
+	_pendingThresholdCompactionAutonomousMessages: AgentMessage[];
 	_continuationSettlementWindow:
 		| {
 				owners: string[];
@@ -221,9 +235,13 @@ interface ContinuationInternals {
 				revision: number;
 				state: "scheduled" | "running" | "parked";
 				pumpOwned: boolean;
+				protectQueuedWork?: boolean;
+				overflowRecovery?: boolean;
 		  }
 		| undefined;
 	_runAutoCompaction(reason: "overflow" | "threshold" | "requested", willRetry: boolean): Promise<boolean>;
+	_runPreTurnCompaction(): Promise<void>;
+	_invalidatePendingAutoRefineForBranchChange(): Promise<void>;
 	_continueAfterThresholdCompaction: boolean;
 	_schedulePostCompactionContinue(): void;
 	_scheduleContinuationForObligation(owners: string[], obligationMessages: AgentMessage[]): boolean;
@@ -302,6 +320,61 @@ function seedSessionForCompaction(harness: Harness): void {
 	harness.sessionManager.appendMessage(user as never);
 	harness.sessionManager.appendMessage(assistant as never);
 	harness.session.agent.state.messages = [user, assistant] as AgentMessage[];
+}
+
+function appendCompactionTurn(harness: Harness, text: string): void {
+	const message = {
+		role: "user",
+		content: [{ type: "text", text }],
+		timestamp: Date.now(),
+	} as AgentMessage;
+	harness.sessionManager.appendMessage(message as never);
+	harness.session.agent.state.messages = [...harness.session.agent.state.messages, message];
+}
+
+function continuationMessage(text: string): AgentMessage {
+	return {
+		role: "user",
+		content: [{ type: "text", text }],
+		timestamp: Date.now(),
+	} as AgentMessage;
+}
+
+function compactRequestTool(getHarness: () => Harness): AgentTool {
+	return {
+		name: "request-compact",
+		label: "Request compact",
+		description: "Requests model-driven compaction for the active turn",
+		parameters: Type.Object({}),
+		execute: async () => {
+			const result = getHarness().session.handleCompactHostRequest("compact.run");
+			if (result.scheduled !== true) throw new Error(`compact.run was not scheduled: ${String(result.reason)}`);
+			return { content: [{ type: "text", text: "compaction requested" }], details: {} };
+		},
+	};
+}
+
+function admitTrackedContinuationAction(harness: Harness, message: AgentMessage, wake = false): void {
+	const session = harness.session as unknown as {
+		_createPreparedTurnAction(
+			schedule: "followUp",
+			text: string,
+			images: undefined,
+			options: { message: AgentMessage; resumeIfIdle: boolean; noSettlementIdentity: boolean },
+		): unknown;
+		_admitSessionInput(action: unknown, options: { wake: boolean }): { accepted: boolean };
+	};
+	const text = getMessageText(message);
+	expect(
+		session._admitSessionInput(
+			session._createPreparedTurnAction("followUp", text, undefined, {
+				message,
+				resumeIfIdle: true,
+				noSettlementIdentity: true,
+			}),
+			{ wake },
+		),
+	).toMatchObject({ accepted: true });
 }
 
 interface RetryWindowTuple {
@@ -2958,7 +3031,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("only bumps generation for a successful compaction and never for no-compaction or overflow", async () => {
+		it("[round-1 fix 5] successful overflow never bumps generation", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -2979,6 +3052,163 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._provisionalOverflowContinuationOwners).toEqual([ownerA]);
 			internals._cancelPostCompactionContinue({ owners: "fail" });
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			observer.restore();
+		});
+
+		it("[round-1 fix 5] public requested compaction with post-work bumps one generation, owns the continuation, and completes", async () => {
+			vi.useFakeTimers();
+			let harness!: Harness;
+			harness = await createHarness({
+				tools: [compactRequestTool(() => harness)],
+				settings: { compaction: { enabled: false, keepRecentTokens: 10 } },
+				extensionFactories: [compactSummaryExtension("public requested post-work summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			appendCompactionTurn(harness, "retained turn before public requested compaction");
+			harness.sessionManager.appendMessage({
+				...fauxAssistantMessage("retained assistant before public requested compaction"),
+				timestamp: Date.now(),
+			} as never);
+			const observer = installContinuationObserver(harness);
+			const ownerIds: string[] = [];
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("request-compact", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("public requested continuation completed"),
+			]);
+
+			const settled = harness.session.promptAndSettle("request compaction from the active turn", {
+				settlementAdmission: (info) => ownerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => expect(harness.eventsOfType("compaction_end")).toHaveLength(1));
+			const requestedEnd = harness.eventsOfType("compaction_end")[0]!;
+			expect(requestedEnd).toMatchObject({
+				reason: "requested",
+				aborted: false,
+				result: expect.objectContaining({ summary: "public requested post-work summary" }),
+			});
+			expect(observer.generationBumps).toEqual(ownerIds);
+			expect(observer.acquiresOfContinuation()).toEqual([
+				{ promptId: ownerIds[0], kind: "compaction_continuation" },
+			]);
+			expect(harness.session.getPromptOutcome(ownerIds[0]!)).toBeUndefined();
+			await vi.advanceTimersByTimeAsync(100);
+			const outcome = await settled;
+			expect(outcome).toMatchObject({ promptId: ownerIds[0], status: "completed", traceGeneration: 1 });
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+			observer.restore();
+		});
+
+		it("[round-1 fix 5] requested success with post-work bumps one generation, owns the continuation, and completes", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("requested post-work summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "requested-post-work";
+			admitOwners(harness, ownerId);
+			const runLease = internals._promptSettlementTracker.acquire(ownerId, "run");
+			const message = continuationMessage("requested post-work obligation");
+			internals._postCompactionContinuationMessages = [message];
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerId];
+
+			expect(await internals._runAutoCompaction("requested", false)).toBe(false);
+			expect(observer.generationBumps).toEqual([ownerId]);
+			expect(observer.acquiresOfContinuation()).toEqual([{ promptId: ownerId, kind: "compaction_continuation" }]);
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerId],
+				obligationMessages: [message],
+				revision: 1,
+				state: "scheduled",
+			});
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			expect(internals._postCompactionContinuationTimer).toBeDefined();
+			runLease.release();
+			expect(harness.session.getPromptOutcome(ownerId)).toBeUndefined();
+
+			const window = internals._continuationSettlementWindow!;
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			await internals._runDirectContinuation([message], window);
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				status: "completed",
+				traceGeneration: 1,
+			});
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[round-1 fix 5] requested success without post-work bumps one generation and creates no window or timer", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("requested no-work summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "requested-no-post-work";
+			admitOwners(harness, ownerId);
+			const runLease = internals._promptSettlementTracker.acquire(ownerId, "run");
+			internals._lastRunPromptIds = [ownerId];
+			internals._postCompactionContinuationMessages = [];
+
+			expect(await internals._runAutoCompaction("requested", false)).toBe(false);
+			expect(observer.generationBumps).toEqual([ownerId]);
+			expect(observer.acquiresOfContinuation()).toEqual([]);
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			runLease.release();
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				status: "completed",
+				traceGeneration: 1,
+			});
+			observer.restore();
+		});
+
+		it('[round-1 fix 5] requested success for "all" owners bumps and owns each exactly once', async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("requested all summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const owners = ["requested-all-a", "requested-all-b"];
+			admitOwners(harness, ...owners);
+			const runLeases = owners.map((owner) => internals._promptSettlementTracker.acquire(owner, "run"));
+			const message = continuationMessage("requested all post-work");
+			internals._postCompactionContinuationMessages = [message];
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [...owners];
+
+			expect(await internals._runAutoCompaction("requested", false)).toBe(false);
+			expect(observer.generationBumps).toEqual(owners);
+			expect(observer.acquiresOfContinuation()).toEqual(
+				owners.map((promptId) => ({ promptId, kind: "compaction_continuation" as const })),
+			);
+			expect(internals._continuationSettlementWindow?.owners).toEqual(owners);
+			for (const lease of runLeases) lease.release();
+			for (const owner of owners) expect(harness.session.getPromptOutcome(owner)).toBeUndefined();
+			internals._cancelPostCompactionContinue();
+			expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual([1, 1]);
+			for (const owner of owners) {
+				expect(harness.session.getPromptOutcome(owner)).toMatchObject({ status: "completed", traceGeneration: 1 });
+			}
 			observer.restore();
 		});
 
@@ -3241,6 +3471,96 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			await busyRun;
 			internals._cancelPostCompactionContinue();
 			expect(lease.releaseCalls).toBe(1);
+			observer.restore();
+		});
+
+		it("[round-1 fix 1] matching retry already streaming waits without a duplicate continue call", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness();
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "matching-retry-streaming";
+			admitOwners(harness, ownerId);
+			const message = continuationMessage("matching retry already streaming");
+			internals._postCompactionContinuationMessages = [message];
+			expect(internals._scheduleContinuationForObligation([ownerId], [message])).toBe(true);
+			internals._continuationSettlementWindow!.overflowRecovery = true;
+			internals._schedulePostCompactionContinue();
+			internals._lastRunPromptIds = [ownerId];
+			const retryInternals = internals as unknown as RetryInternals;
+			expect(retryInternals._createRetryWindow()).toBe(true);
+			withStreaming(harness, true);
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+			const scheduledRun = internals._runScheduledPostCompactionContinue();
+			await Promise.resolve();
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(internals._continuationSettlementWindow?.state).toBe("running");
+
+			internals._lastRunTerminalStopReason = "stop";
+			retryInternals._resolveRetry();
+			withStreaming(harness, false);
+			await scheduledRun;
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({ status: "completed" });
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[round-1 fix 6] direct continuation retry keeps queued B behind A fence, then wakes B once", async () => {
+			vi.useRealTimers();
+			const bGate = gatedHook({ prompt: "queued B after direct retry" });
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+				extensionFactories: [bGate.factory],
+			});
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "direct-retry-a";
+			admitOwners(harness, ownerA);
+			const message = continuationMessage("direct retry obligation");
+			internals._postCompactionContinuationMessages = [message];
+			expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			harness.session.agent.state.messages = [continuationMessage("continue direct retry")];
+			const retryRecovery = createDeferred();
+			let retryRecoveryStarted = false;
+			harness.setResponses([
+				retryableError(),
+				async () => {
+					retryRecoveryStarted = true;
+					await retryRecovery.promise;
+					return fauxAssistantMessage("direct retry recovered");
+				},
+				fauxAssistantMessage("queued B done"),
+			]);
+			await harness.session.followUp("queued B after direct retry", undefined, { resumeIfIdle: true });
+			const ownerB = actionByText(harness, "queued B after direct retry").promptIds![0]!;
+
+			await vi.waitFor(() => expect(retryRecoveryStarted).toBe(true));
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(observer.retryLeases).toHaveLength(1);
+			expect(observer.retryLeases[0]!.promptId).toBe(ownerA);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+
+			retryRecovery.resolve();
+			await vi.waitFor(() => expect(harness.session.getPromptOutcome(ownerA)).toBeDefined());
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ status: "completed" });
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			await bGate.reached;
+			expect(harness.faux.state.callCount).toBe(2);
+			bGate.release();
+			const outcomeB = await harness.session.waitForPromptOutcome(ownerB);
+			expect(harness.faux.state.callCount).toBe(3);
+			expect(outcomeB).toMatchObject({ promptId: ownerB, status: "completed" });
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
 			observer.restore();
 		});
 
@@ -3708,7 +4028,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("cancels then closes exactly once when ordinary manual compaction fails", async () => {
+		it("[round-1 fix 7] ordinary manual failure cancels and closes exactly once", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -3736,6 +4056,12 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			// The window was cancelled (cancel fence before release) and closed once.
 			expect(internals._continuationSettlementWindow).toBeUndefined();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				promptId: ownerId,
+				status: "cancelled",
+			});
+			expect(harness.session.getPromptOutcome(ownerId)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			observer.restore();
 		});
 
@@ -3887,10 +4213,82 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("bumps only the installed next-batch owners for an owned pre-turn compaction", async () => {
+		it("[round-1 fix 5] failed, cancelled, manual, skipAbort, overflow, and ownerless pre-turn compactions never bump", async () => {
+			vi.useFakeTimers();
+			const ownerId = "generation-negative-owner";
+
+			const failedHarness = await createHarness({ withConfiguredAuth: false });
+			continuationHarnesses.push(failedHarness);
+			admitOwners(failedHarness, ownerId);
+			const failedObserver = installContinuationObserver(failedHarness);
+			continuationInternals(failedHarness)._lastRunPromptIds = [ownerId];
+			await continuationInternals(failedHarness)._runAutoCompaction("threshold", false);
+			expect(failedObserver.generationBumps).toEqual([]);
+			failedObserver.restore();
+
+			const cancelledHarness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [(pi) => pi.on("session_before_compact", async () => ({ cancel: true }))],
+			});
+			continuationHarnesses.push(cancelledHarness);
+			seedSessionForCompaction(cancelledHarness);
+			admitOwners(cancelledHarness, ownerId);
+			const cancelledObserver = installContinuationObserver(cancelledHarness);
+			continuationInternals(cancelledHarness)._lastRunPromptIds = [ownerId];
+			await continuationInternals(cancelledHarness)._runAutoCompaction("threshold", false);
+			expect(cancelledObserver.generationBumps).toEqual([]);
+			cancelledObserver.restore();
+
+			const manualHarness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("manual generation negative")],
+			});
+			continuationHarnesses.push(manualHarness);
+			seedSessionForCompaction(manualHarness);
+			admitOwners(manualHarness, ownerId);
+			const manualObserver = installContinuationObserver(manualHarness);
+			continuationInternals(manualHarness)._lastRunPromptIds = [ownerId];
+			await manualHarness.session.compact();
+			expect(manualObserver.generationBumps).toEqual([]);
+			appendCompactionTurn(manualHarness, "after manual compact");
+			await manualHarness.session.compact(undefined, { skipAbort: true });
+			expect(manualObserver.generationBumps).toEqual([]);
+			manualObserver.restore();
+
+			const overflowHarness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("overflow generation negative")],
+			});
+			continuationHarnesses.push(overflowHarness);
+			seedSessionForCompaction(overflowHarness);
+			admitOwners(overflowHarness, ownerId);
+			const overflowObserver = installContinuationObserver(overflowHarness);
+			continuationInternals(overflowHarness)._lastRunPromptIds = [ownerId];
+			await continuationInternals(overflowHarness)._runAutoCompaction("overflow", true);
+			expect(overflowObserver.generationBumps).toEqual([]);
+			continuationInternals(overflowHarness)._cancelPostCompactionContinue({ owners: "fail" });
+			overflowObserver.restore();
+
+			const ownerlessHarness = await createHarness({
+				settings: { compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 } },
+				models: [{ id: "faux-1", contextWindow: 20 }],
+				extensionFactories: [compactSummaryExtension("ownerless pre-turn generation negative")],
+			});
+			continuationHarnesses.push(ownerlessHarness);
+			seedSessionForCompaction(ownerlessHarness);
+			const ownerlessObserver = installContinuationObserver(ownerlessHarness);
+			continuationInternals(ownerlessHarness)._lastRunPromptIds = [];
+			await continuationInternals(ownerlessHarness)._runPreTurnCompaction();
+			expect(ownerlessObserver.generationBumps).toEqual([]);
+			expect(ownerlessObserver.acquiresOfContinuation()).toEqual([]);
+			ownerlessObserver.restore();
+		});
+
+		it("[round-1 fix 5] production pre-turn compaction bumps only the installed next-batch owners", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
-				settings: { compaction: { keepRecentTokens: 1 } },
+				settings: { compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 } },
+				models: [{ id: "faux-1", contextWindow: 20 }],
 				extensionFactories: [compactSummaryExtension()],
 			});
 			continuationHarnesses.push(harness);
@@ -3901,8 +4299,8 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			admitOwners(harness, ...nextBatchOwners);
 			internals._lastRunPromptIds = [...nextBatchOwners];
 
-			// Pre-turn compaction runs after the pump installed the next batch.
-			await internals._runAutoCompaction("threshold", false);
+			// Drive the actual pre-turn caller after the pump has installed the next batch.
+			await internals._runPreTurnCompaction();
 			expect(observer.generationBumps.sort()).toEqual([...nextBatchOwners].sort());
 			// No post-work: no window/timer.
 			expect(internals._continuationSettlementWindow).toBeUndefined();
@@ -4043,6 +4441,188 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			acquireSpy.mockRestore();
 		});
 
+		it("[round-1 fix 2] production threshold create failure drops the failed action and never arms unowned work", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("create failure summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "production-create-failure";
+			admitOwners(harness, ownerId);
+			const tracker = internals._promptSettlementTracker;
+			const runLease = tracker.acquire(ownerId, "run");
+			const message = continuationMessage("failed threshold obligation");
+			internals._postCompactionContinuationMessages = [message];
+			internals._pendingThresholdCompactionAutonomousMessages = [message];
+			admitTrackedContinuationAction(harness, message);
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerId];
+			const originalAcquire = tracker.acquire.bind(tracker);
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					if (kind === "compaction_continuation") throw new Error("continuation acquire rejected");
+					return originalAcquire(promptId, kind);
+				});
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+			harness.setResponses([fauxAssistantMessage("failed work must never execute")]);
+
+			await internals._runAutoCompaction("threshold", false);
+			runLease.release();
+			await vi.advanceTimersByTimeAsync(200);
+			await harness.session.waitForSessionInputIdle();
+
+			expect({
+				window: internals._continuationSettlementWindow,
+				scheduled: internals._postCompactionContinuationScheduled,
+				timer: internals._postCompactionContinuationTimer,
+				messages: internals._postCompactionContinuationMessages,
+				pending: internals._pendingThresholdCompactionAutonomousMessages,
+				failedActionStillOwned: turnActions(harness).some(
+					(action) => action.payload.text === "failed threshold obligation",
+				),
+				providerCalls: harness.faux.state.callCount,
+				continueCalls: continueSpy.mock.calls.length,
+			}).toEqual({
+				window: undefined,
+				scheduled: false,
+				timer: undefined,
+				messages: [],
+				pending: [],
+				failedActionStillOwned: false,
+				providerCalls: 0,
+				continueCalls: 0,
+			});
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				status: "failed",
+				traceGeneration: 1,
+				failure: { reason: "run_error" },
+			});
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+			continueSpy.mockRestore();
+			acquireSpy.mockRestore();
+		});
+
+		it("[round-1 fix 2] production threshold extend failure preserves A and removes only B before any rearm", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("extend failure summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const internals = continuationInternals(harness);
+			const [ownerA, ownerB] = ["extend-kept-a", "extend-failed-b"];
+			admitOwners(harness, ownerA, ownerB);
+			const tracker = internals._promptSettlementTracker;
+			const runLeaseA = tracker.acquire(ownerA, "run");
+			const runLeaseB = tracker.acquire(ownerB, "run");
+			const messageA = continuationMessage("existing A obligation");
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			const oldWindow = internals._continuationSettlementWindow!;
+			const oldRevision = oldWindow.revision;
+			const oldLeases = oldWindow.leases;
+			const oldObligationMessages = oldWindow.obligationMessages;
+			const oldTimer = internals._postCompactionContinuationTimer;
+			const oldSnapshot = internals._scheduledPostCompactionContinuationMessages;
+			const messageB = continuationMessage("failed B obligation");
+			internals._postCompactionContinuationMessages.push(messageB);
+			internals._pendingThresholdCompactionAutonomousMessages = [messageB];
+			admitTrackedContinuationAction(harness, messageB);
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerA, ownerB];
+			const originalAcquire = tracker.acquire.bind(tracker);
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					if (kind === "compaction_continuation" && promptId === ownerB) {
+						throw new Error("B continuation acquire rejected");
+					}
+					return originalAcquire(promptId, kind);
+				});
+
+			await internals._runAutoCompaction("threshold", false);
+			expect(internals._continuationSettlementWindow).toBe(oldWindow);
+			expect(oldWindow.revision).toBe(oldRevision);
+			expect(oldWindow.leases).toBe(oldLeases);
+			expect(oldWindow.obligationMessages).toBe(oldObligationMessages);
+			expect(oldWindow.obligationMessages).toEqual([messageA]);
+			expect(internals._postCompactionContinuationTimer).toBe(oldTimer);
+			expect(internals._scheduledPostCompactionContinuationMessages).toBe(oldSnapshot);
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([messageA]);
+			expect(internals._postCompactionContinuationMessages).toEqual([messageA]);
+			expect(internals._pendingThresholdCompactionAutonomousMessages).toEqual([]);
+			expect(turnActions(harness).some((action) => action.payload.text === "failed B obligation")).toBe(false);
+			expect(oldWindow.pumpOwned).toBe(false);
+			expect(internals._continuationPumpOwnerAction).toBeUndefined();
+
+			// A later internal busy rearm must still snapshot only A; failed B can
+			// never enter A's direct runner under A's surviving lease.
+			withStreaming(harness, true);
+			await vi.advanceTimersByTimeAsync(100);
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([messageA]);
+			expect(internals._continuationSettlementWindow).toBe(oldWindow);
+			expect(oldWindow.revision).toBe(oldRevision);
+			withStreaming(harness, false);
+			internals._cancelPostCompactionContinue();
+			runLeaseA.release();
+			runLeaseB.release();
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ status: "completed", traceGeneration: 1 });
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				status: "failed",
+				traceGeneration: 1,
+				failure: { reason: "run_error" },
+			});
+			acquireSpy.mockRestore();
+		});
+
+		it("[round-1 fix 2] requested-failure acquire rejection drops the same-run resume instead of running it unowned", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({ withConfiguredAuth: false });
+			continuationHarnesses.push(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "requested-failure-acquire-rejected";
+			admitOwners(harness, ownerId);
+			const tracker = internals._promptSettlementTracker;
+			const runLease = tracker.acquire(ownerId, "run");
+			const message = continuationMessage("failed requested resume");
+			internals._postCompactionContinuationMessages = [message];
+			admitTrackedContinuationAction(harness, message);
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerId];
+			const originalAcquire = tracker.acquire.bind(tracker);
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					if (kind === "compaction_continuation") throw new Error("resume acquire rejected");
+					return originalAcquire(promptId, kind);
+				});
+			harness.setResponses([fauxAssistantMessage("unowned requested resume must not run")]);
+
+			await expect(internals._runAutoCompaction("requested", false)).resolves.toBe(false);
+			runLease.release();
+			await vi.advanceTimersByTimeAsync(200);
+			await harness.session.waitForSessionInputIdle();
+
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._postCompactionContinuationMessages).toEqual([]);
+			expect(turnActions(harness).some((action) => action.payload.text === "failed requested resume")).toBe(false);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				status: "failed",
+				traceGeneration: 0,
+				failure: { reason: "run_error" },
+			});
+			acquireSpy.mockRestore();
+		});
+
 		it("fails closed and resolves the old retry window when overflow willRetry acquisition fails", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
@@ -4086,7 +4666,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("keeps legacy ownerless 100ms timer behavior with zero settlement leases", async () => {
+		it("[round-1 fix 3] public abortRetry leaves an ownerless generic 100ms wake intact", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness();
 			continuationHarnesses.push(harness);
@@ -4102,10 +4682,45 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			];
 			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue(undefined as never);
 			internals._schedulePostCompactionContinue();
+			harness.session.abortRetry();
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
 			await vi.advanceTimersByTimeAsync(100);
 			expect(continueSpy).toHaveBeenCalledTimes(1);
 			expect(observer.acquiresOfContinuation()).toEqual([]);
 			expect(internals._continuationSettlementWindow).toBeUndefined();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[round-1 fix 3] public abortRetry leaves a threshold continuation window and timer intact", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness();
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "threshold-survives-abort-retry";
+			admitOwners(harness, ownerId);
+			const message = continuationMessage("threshold continuation survives abortRetry");
+			internals._postCompactionContinuationMessages = [message];
+			expect(internals._scheduleContinuationForObligation([ownerId], [message])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			const window = internals._continuationSettlementWindow;
+			const timer = internals._postCompactionContinuationTimer;
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+
+			harness.session.abortRetry();
+			expect(internals._continuationSettlementWindow).toBe(window);
+			expect(internals._postCompactionContinuationTimer).toBe(timer);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerId)).toBeUndefined();
+
+			await vi.advanceTimersByTimeAsync(100);
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({ status: "completed" });
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			continueSpy.mockRestore();
 			observer.restore();
 		});
@@ -4145,6 +4760,44 @@ describe("AgentSession prompt settlement (group 2)", () => {
 				status: "completed",
 			});
 			expect(outcomeCount(harness)).toBe(1);
+			observer.restore();
+		});
+
+		it("[round-1 fix 6] direct continuation throw keeps queued B behind the failed close, then wakes B once", async () => {
+			vi.useRealTimers();
+			const gate = gatedHook({ prompt: "queued B after direct throw" });
+			const harness = await createHarness({ extensionFactories: [gate.factory] });
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "direct-throw-a";
+			admitOwners(harness, ownerA);
+			const message = continuationMessage("direct throw obligation");
+			internals._postCompactionContinuationMessages = [message];
+			expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			await harness.session.followUp("queued B after direct throw", undefined, { resumeIfIdle: true });
+			const ownerB = actionByText(harness, "queued B after direct throw").promptIds![0]!;
+			const continueSpy = vi
+				.spyOn(harness.session.agent, "continue")
+				.mockRejectedValueOnce(new Error("direct continuation provider exploded"));
+			harness.setResponses([fauxAssistantMessage("queued B done")]);
+
+			await vi.waitFor(() => expect(continueSpy).toHaveBeenCalledTimes(1));
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			await gate.reached;
+			expect(harness.faux.state.callCount).toBe(0);
+			gate.release();
+			const outcomeB = await harness.session.waitForPromptOutcome(ownerB);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(outcomeB).toMatchObject({ promptId: ownerB, status: "completed" });
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
+			continueSpy.mockRestore();
 			observer.restore();
 		});
 
@@ -4398,7 +5051,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("requestAbort cancels window owners before an exact-once release", async () => {
+		it("[round-1 fix 7] requestAbort cancels window owners before an exact-once release", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -4423,10 +5076,13 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			// Repeated abort/cancel: no second release, no second outcome.
 			harness.session.requestAbort();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({ status: "cancelled" });
+			expect(harness.session.getPromptOutcome(ownerId)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			observer.restore();
 		});
 
-		it("abortForUpdateRestart cancels window owners before an exact-once release", async () => {
+		it("[round-1 fix 7] abortForUpdateRestart cancels window owners before an exact-once release", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -4449,10 +5105,13 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._continuationSettlementWindow).toBeUndefined();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
 			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({ status: "cancelled" });
+			expect(harness.session.getPromptOutcome(ownerId)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			observer.restore();
 		});
 
-		it("dispose cancels window owners then closes so waiters do not hang", async () => {
+		it("[round-1 fix 7] dispose cancels window owners then resolves the waiter exactly once", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -4471,14 +5130,19 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._scheduleContinuationForObligation([ownerId], [obligationMessage])).toBe(true);
 			internals._schedulePostCompactionContinue();
 
+			const outcomePromise = harness.session.waitForPromptOutcome(ownerId);
 			harness.session.dispose();
+			const outcome = await outcomePromise;
 			expect(internals._continuationSettlementWindow).toBeUndefined();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
 			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+			expect(outcome.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			observer.restore();
 		});
 
-		it("abortRetry marks overflow continuation owners failed (not cancelled) and closes exactly once", async () => {
+		it("[round-1 fix 3] abortRetry marks overflow continuation owners failed (not cancelled) and closes exactly once", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
@@ -4494,6 +5158,8 @@ describe("AgentSession prompt settlement (group 2)", () => {
 				timestamp: Date.now(),
 			} as AgentMessage;
 			expect(internals._scheduleContinuationForObligation([ownerId], [obligationMessage])).toBe(true);
+			internals._continuationSettlementWindow!.protectQueuedWork = true;
+			internals._continuationSettlementWindow!.overflowRecovery = true;
 			internals._schedulePostCompactionContinue();
 			internals._retryAttempt = 1;
 			internals._retryPromise = new Promise<void>((resolve) => {
@@ -4553,7 +5219,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("close policies: branch/no-work non-abort close releases without cancel and never emits a second outcome", async () => {
+		it("[round-1 fix 7] production branch invalidation release-closes completed once", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -4573,15 +5239,83 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._scheduleContinuationForObligation([ownerId], [obligationMessage])).toBe(true);
 			internals._schedulePostCompactionContinue();
 
-			// Branch invalidation / confirmed no-work: release-only close — no
-			// cancel fence, no failure fence — so the owner settles completed when
-			// its last lease (the continuation lease) releases.
-			internals._cancelPostCompactionContinue();
+			// Drive the real branch-change caller. It release-closes this obligation
+			// without a cancel/failure fence, so the already-successful owner completes.
+			await internals._invalidatePendingAutoRefineForBranchChange();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
 			expect(internals._continuationSettlementWindow).toBeUndefined();
 			expect(outcomeCount(harness)).toBe(1);
 			expect(harness.session.getPromptOutcome(ownerId)?.status).toBe("completed");
 			expect(harness.session.getPromptOutcome(ownerId)?.failure).toBeUndefined();
+			await internals._invalidatePendingAutoRefineForBranchChange();
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(outcomeCount(harness)).toBe(1);
+			observer.restore();
+		});
+
+		it("[round-1 fix 1] retryable error then overflow drives one recovery, closes retry/window, and wakes queued B once", async () => {
+			vi.useRealTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("retry-then-overflow summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			let releaseRecovery = () => {};
+			const recoveryGate = new Promise<void>((resolve) => {
+				releaseRecovery = resolve;
+			});
+			let recoveryStarted = false;
+			harness.setResponses([
+				retryableError(),
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" }),
+				async () => {
+					recoveryStarted = true;
+					await recoveryGate;
+					return fauxAssistantMessage("retry-then-overflow recovered");
+				},
+				fauxAssistantMessage("queued B completed"),
+			]);
+			const ownerAIds: string[] = [];
+			const A = harness.session.promptAndSettle("retry then overflow A", {
+				settlementAdmission: (info) => ownerAIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(2));
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow?.owners).toEqual(ownerAIds));
+			expect(internals._retryPromise).toBeDefined();
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+			await harness.session.followUp("queued B after retry-overflow", undefined, { resumeIfIdle: true });
+			const ownerB = actionByText(harness, "queued B after retry-overflow").promptIds![0]!;
+
+			await vi.waitFor(() => expect(recoveryStarted).toBe(true));
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(harness.faux.state.callCount).toBe(3);
+			expect(harness.session.getPromptOutcome(ownerAIds[0]!)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(observer.retryLeases).toHaveLength(1);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+			expect(observer.continuationLeases).toHaveLength(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+
+			releaseRecovery();
+			const outcomeA = await A;
+			await vi.waitFor(() => expect(harness.faux.state.callCount).toBe(4));
+			const outcomeB = await harness.session.waitForPromptOutcome(ownerB);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryResolve).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(outcomeA).toMatchObject({ promptId: ownerAIds[0], status: "completed" });
+			expect(outcomeA?.failure).toBeUndefined();
+			expect(outcomeB).toMatchObject({ promptId: ownerB, status: "completed" });
+			expect(harness.faux.state.callCount).toBe(4);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerAIds[0]),
+			).toHaveLength(1);
+			continueSpy.mockRestore();
 			observer.restore();
 		});
 
@@ -4708,7 +5442,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			observer.restore();
 		});
 
-		it("pump handoff: a tracked continuation action consumed by the pump closes A after its terminal, never by the direct runner", async () => {
+		it("[round-1 fix 4] tracked pump continuation success completes captured A exactly once", async () => {
 			vi.useFakeTimers();
 			const harness = await createHarness({
 				settings: { compaction: { keepRecentTokens: 1 } },
@@ -4729,22 +5463,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			internals._postCompactionContinuationMessages = [continuationMessage];
 			expect(internals._scheduleContinuationForObligation([ownerId], [continuationMessage])).toBe(true);
 			internals._schedulePostCompactionContinue();
-			const accepted = harness.session as unknown as {
-				_createPreparedTurnAction(
-					schedule: string,
-					text: string,
-					images: undefined,
-					options: { message: AgentMessage; resumeIfIdle: boolean },
-				): unknown;
-				_admitSessionInput(action: unknown, options: { wake: boolean }): { accepted: boolean };
-			};
-			accepted._admitSessionInput(
-				accepted._createPreparedTurnAction("followUp", "tracked continuation", undefined, {
-					message: continuationMessage,
-					resumeIfIdle: true,
-				}),
-				{ wake: true },
-			);
+			admitTrackedContinuationAction(harness, continuationMessage, true);
 			harness.setResponses([fauxAssistantMessage("tracked done")]);
 
 			// The timer fires; the pump owns the tracked action, so the direct
@@ -4753,11 +5472,101 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			await vi.advanceTimersByTimeAsync(100);
 			await vi.advanceTimersByTimeAsync(200);
 			expect(continueSpy).not.toHaveBeenCalled();
-			// The pump consumed the tracked action: window closed release-only.
+			// The pump consumed the tracked action and terminal-fenced captured A.
 			expect(internals._continuationSettlementWindow).toBeUndefined();
 			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
 			expect(internals._postCompactionContinuationMessages).toEqual([]);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({ status: "completed" });
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it.each([
+			{
+				label: "error",
+				assistant: fauxAssistantMessage("", { stopReason: "error", errorMessage: "tracked continuation failed" }),
+				expected: { status: "failed", failure: { reason: "run_error" } },
+			},
+			{
+				label: "aborted",
+				assistant: fauxAssistantMessage("", { stopReason: "aborted" }),
+				expected: { status: "cancelled" },
+			},
+		])(
+			"[round-1 fix 4] tracked pump continuation $label fences captured A before exact close",
+			async ({ assistant, expected }) => {
+				vi.useFakeTimers();
+				const harness = await createHarness({ settings: { retry: { enabled: false } } });
+				continuationHarnesses.push(harness);
+				const observer = installContinuationObserver(harness);
+				const internals = continuationInternals(harness);
+				const ownerId = `tracked-terminal-${assistant.stopReason}`;
+				admitOwners(harness, ownerId);
+				const message = continuationMessage(`tracked ${assistant.stopReason}`);
+				internals._postCompactionContinuationMessages = [message];
+				expect(internals._scheduleContinuationForObligation([ownerId], [message])).toBe(true);
+				admitTrackedContinuationAction(harness, message);
+				internals._schedulePostCompactionContinue();
+				harness.setResponses([assistant]);
+				const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+				await vi.advanceTimersByTimeAsync(300);
+
+				expect(continueSpy).not.toHaveBeenCalled();
+				expect(internals._continuationSettlementWindow).toBeUndefined();
+				expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+				const outcome = harness.session.getPromptOutcome(ownerId);
+				expect(outcome).toMatchObject(expected);
+				if (expected.status === "cancelled") expect(outcome?.failure).toBeUndefined();
+				expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+				continueSpy.mockRestore();
+				observer.restore();
+			},
+		);
+
+		it("[round-1 fix 4] mixed tracked/direct window fences tracked error but retains the direct remainder", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({ settings: { retry: { enabled: false } } });
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const [ownerA, ownerB] = ["mixed-direct-a", "mixed-tracked-b"];
+			admitOwners(harness, ownerA, ownerB);
+			const messageA = continuationMessage("mixed direct A");
+			const messageB = continuationMessage("mixed tracked B");
+			internals._postCompactionContinuationMessages = [messageA, messageB];
+			expect(internals._scheduleContinuationForObligation([ownerA, ownerB], [messageA, messageB])).toBe(true);
+			admitTrackedContinuationAction(harness, messageB);
+			internals._schedulePostCompactionContinue();
+			const window = internals._continuationSettlementWindow!;
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "mixed tracked run failed" }),
+			]);
+
+			await vi.advanceTimersByTimeAsync(100);
+			expect(internals._continuationSettlementWindow).toBe(window);
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerA, ownerB],
+				obligationMessages: [messageA],
+				state: "scheduled",
+				pumpOwned: false,
+			});
+			expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual([0, 0]);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([messageA]);
+
+			internals._cancelPostCompactionContinue();
+			expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual([1, 1]);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
 			observer.restore();
 		});
 
@@ -4774,17 +5583,8 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			const ownerA = "owner-pump-unrelated-a";
 			const ownerB = "owner-pump-unrelated-b";
 			admitOwners(harness, ownerA, ownerB);
-			internals._continueAfterThresholdCompaction = true;
-			internals._lastRunPromptIds = [ownerA];
-			internals._postCompactionContinuationMessages = [
-				{ role: "user", content: [{ type: "text", text: "A obligation" }], timestamp: Date.now() } as AgentMessage,
-			];
-			await internals._runAutoCompaction("threshold", false);
-			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
-
-			// Unrelated B is admitted as a queued session action while A's window
-			// is scheduled; the pump runs B. A's window must stay intact and its
-			// leases must not be released or extended with B.
+			// Start unrelated B first. This is the genuine already-running handoff
+			// category; merely queued B is covered by the direct retry/throw proofs.
 			const bAccepted = harness.session as unknown as {
 				_createPreparedTurnAction(
 					schedule: string,
@@ -4819,6 +5619,13 @@ describe("AgentSession prompt settlement (group 2)", () => {
 				},
 			]);
 			await vi.waitFor(() => expect(bStarted).toBe(true));
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerA];
+			internals._postCompactionContinuationMessages = [
+				{ role: "user", content: [{ type: "text", text: "A obligation" }], timestamp: Date.now() } as AgentMessage,
+			];
+			await internals._runAutoCompaction("threshold", false);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
 
 			// A's scheduled continuation has its obligation message still owned
 			// and its must-run timer is pending while B runs: the pump handoff path

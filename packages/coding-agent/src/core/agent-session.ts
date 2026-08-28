@@ -1109,6 +1109,8 @@ interface ContinuationSettlementWindow {
 	state: "scheduled" | "running" | "parked";
 	pumpOwned: boolean;
 	protectQueuedWork: boolean;
+	/** True when this window owns the compact-and-retry recovery created by overflow. */
+	overflowRecovery: boolean;
 }
 
 interface ParkedContinuationSettlement {
@@ -1345,6 +1347,10 @@ export class AgentSession {
 	private _continuationSettlementAbortToken: symbol | undefined = undefined;
 	/** Object identity of the tracked session action that currently owns this continuation obligation. */
 	private _continuationPumpOwnerAction: QueuedSessionAction | undefined = undefined;
+	/** Exact tracked action terminal captured before the pump consumes the shared terminal slot. */
+	private _continuationPumpTerminal:
+		| { action: QueuedSessionAction; stopReason: AssistantMessage["stopReason"] | undefined }
+		| undefined = undefined;
 	/** The exact session action already active when the continuation timer hands off to an unrelated pump run. */
 	private _continuationUnrelatedPumpAction: QueuedSessionAction | undefined = undefined;
 	/**
@@ -2943,7 +2949,11 @@ export class AgentSession {
 	}
 
 	private _clearQueuedAutonomousContinuations(
-		options: { restoreAutonomousState?: boolean; messages?: AgentMessage[] } = {},
+		options: {
+			restoreAutonomousState?: boolean;
+			messages?: AgentMessage[];
+			cancelPostCompactionIfEmpty?: boolean;
+		} = {},
 	): void {
 		const requestedMessages = options.messages ?? [...this._postCompactionContinuationMessages];
 		const requestedMessageSet = new Set(requestedMessages);
@@ -2981,7 +2991,11 @@ export class AgentSession {
 		if (options.messages === undefined) {
 			this._continueAfterThresholdCompaction = false;
 		}
-		if (!this.agent.hasQueuedMessages() && this.unfinishedActionCount === 0) {
+		if (
+			options.cancelPostCompactionIfEmpty !== false &&
+			!this.agent.hasQueuedMessages() &&
+			this.unfinishedActionCount === 0
+		) {
 			this._cancelPostCompactionContinue();
 		}
 	}
@@ -3525,9 +3539,9 @@ export class AgentSession {
 			// Terminal run classification for prompt settlement: the assistant
 			// message that ends the run determines whether the run's owners are
 			// fenced as failed (provider error) or cancelled (aborted) before the
-			// run leases are consumed. Retry/compaction are not wired yet (group
-			// 3/4); if one ever ends a run with `error`/`aborted`, its own
-			// classification applies at that run's completion point.
+			// run leases are consumed. Retry and compaction continuation install
+			// their captured owners and apply the same terminal classification at
+			// their own completion boundary.
 			this._lastRunTerminalStopReason = event.message.stopReason;
 		}
 		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom")) {
@@ -3898,6 +3912,21 @@ export class AgentSession {
 	 * skipped: the continuation recovery is authoritative, so the provisional
 	 * error must not permanently fence the owner as failed.
 	 */
+	private _applyCapturedContinuationTerminalFence(
+		owners: string[],
+		stopReason: AssistantMessage["stopReason"] | undefined,
+	): void {
+		if (stopReason === "error") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.recordFailure(owner, "run_error");
+			}
+		} else if (stopReason === "aborted") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.requestCancel(owner);
+			}
+		}
+	}
+
 	private _applyRunTerminalSettlementFence(owners: string[]): void {
 		const stopReason = this._lastRunTerminalStopReason;
 		this._lastRunTerminalStopReason = undefined;
@@ -6055,6 +6084,12 @@ export class AgentSession {
 					const batchOwnersForSettlement = actions.flatMap((action) =>
 						action.payload.kind === "turn" ? (action.promptIds ?? []) : [],
 					);
+					if (this._continuationPumpOwnerAction && actions.includes(this._continuationPumpOwnerAction)) {
+						this._continuationPumpTerminal = {
+							action: this._continuationPumpOwnerAction,
+							stopReason: this._lastRunTerminalStopReason,
+						};
+					}
 					this._applyRunTerminalSettlementFence([...new Set(batchOwnersForSettlement)]);
 					for (const action of actions) {
 						if (action.lifecycle.state === "committing") {
@@ -7961,6 +7996,7 @@ export class AgentSession {
 		}
 		this._continuationSettlementAbortToken = undefined;
 		this._continuationPumpOwnerAction = undefined;
+		this._continuationPumpTerminal = undefined;
 		this._continuationUnrelatedPumpAction = undefined;
 		this._postCompactionContinuationScheduled = false;
 		this._postCompactionContinuationTimer = undefined;
@@ -8038,6 +8074,30 @@ export class AgentSession {
 		this._schedulePostCompactionContinue();
 	}
 
+	/** Remove only one failed producer's new obligation messages/actions, preserving prior window-owned work. */
+	private _dropFailedContinuationObligation(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		const oldMessages = new Set(this._continuationSettlementWindow?.obligationMessages ?? []);
+		const failedMessages = messages.filter((message) => !oldMessages.has(message));
+		if (failedMessages.length === 0) return;
+		this._clearQueuedAutonomousContinuations({
+			messages: failedMessages,
+			cancelPostCompactionIfEmpty: false,
+		});
+		const failed = new Set(failedMessages);
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(message) => !failed.has(message),
+		);
+		this._pendingThresholdCompactionAutonomousMessages = this._pendingThresholdCompactionAutonomousMessages.filter(
+			(message) => !failed.has(message),
+		);
+		const survivingTrackedAction = this._trackedSessionActionForScheduledContinuations([...oldMessages]);
+		this._continuationPumpOwnerAction = survivingTrackedAction;
+		if (this._continuationSettlementWindow) {
+			this._continuationSettlementWindow.pumpOwned = survivingTrackedAction !== undefined;
+		}
+	}
+
 	/**
 	 * All-or-nothing create/extend of the continuation settlement window for a
 	 * prompt-owned post-compaction obligation. Missing owners are acquired
@@ -8067,6 +8127,7 @@ export class AgentSession {
 				acquired.push(this._promptSettlementTracker.acquire(owner, "compaction_continuation"));
 			}
 		} catch {
+			this._dropFailedContinuationObligation(obligationMessages);
 			// Fence every affected owner BEFORE releasing any acquired sibling:
 			// releasing the last sibling can terminal synchronously and must derive
 			// failed/run_error rather than completed. Existing-window owners are not
@@ -8103,6 +8164,7 @@ export class AgentSession {
 				state: "scheduled",
 				pumpOwned: false,
 				protectQueuedWork: false,
+				overflowRecovery: false,
 			};
 		}
 
@@ -8392,6 +8454,9 @@ export class AgentSession {
 						for (const owner of windowAtEntry.owners) {
 							this._promptSettlementTracker.recordFailure(owner, "run_error");
 						}
+						if (windowAtEntry.overflowRecovery && this._continuationRetryWindowMatchesRetryOwners()) {
+							this._finishMatchingRetryAfterContinuationFailure(message);
+						}
 						closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
 					}
 					return;
@@ -8423,15 +8488,7 @@ export class AgentSession {
 			// aborted -> cancelled, normal -> completed.
 			this._lastRunTerminalStopReason = undefined;
 			this._provisionalOverflowContinuationOwners = [];
-			if (stopReason === "error") {
-				for (const owner of windowAtEntry?.owners ?? []) {
-					this._promptSettlementTracker.recordFailure(owner, "run_error");
-				}
-			} else if (stopReason === "aborted") {
-				for (const owner of windowAtEntry?.owners ?? []) {
-					this._promptSettlementTracker.requestCancel(owner);
-				}
-			}
+			this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], stopReason);
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 			if (windowAtEntry === undefined) {
 				closed = this._cancelPostCompactionContinue();
@@ -8473,8 +8530,10 @@ export class AgentSession {
 		// rearm case: it must run while its own retry window is active.
 		const matchingRetry = this.isRetrying && this._continuationRetryWindowMatchesRetryOwners();
 		if (
-			(this.isStreaming && this._currentRunOwners.length === 0) ||
-			(this.isStreaming && this._currentRunOwners.some((owner) => windowAtEntry?.owners.includes(owner))) ||
+			(!matchingRetry && this.isStreaming && this._currentRunOwners.length === 0) ||
+			(!matchingRetry &&
+				this.isStreaming &&
+				this._currentRunOwners.some((owner) => windowAtEntry?.owners.includes(owner))) ||
 			this.isCompacting ||
 			(this._queuedWorkPauses.size > 0 && this._continuationSchedulingPause === undefined) ||
 			(this.isRetrying && !matchingRetry)
@@ -8497,10 +8556,15 @@ export class AgentSession {
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
 		}
-		// A matching retry already owns the continuation run; wait it out before
-		// fencing (it runs while its own retry window is active, not rearm).
+		// A matching retry can mean either an already-streaming continue (wait
+		// only) or an idle overflow recovery that still needs one continue call.
 		if (matchingRetry) {
-			await this._runDirectContinuationUnderMatchingRetry(continuationMessages, windowAtEntry);
+			if (this.isStreaming) {
+				await this._runDirectContinuationUnderMatchingRetry(continuationMessages, windowAtEntry);
+			} else {
+				if (windowAtEntry?.overflowRecovery) this._prepareOverflowRecoveryContinuation();
+				await this._runDirectContinuation(continuationMessages, windowAtEntry);
+			}
 			return;
 		}
 		// Session-pump handoff: tracked continuation work is pump-owned. A legacy
@@ -8515,16 +8579,18 @@ export class AgentSession {
 			this._currentRunOwners.length > 0 &&
 			this._currentRunOwners.every((owner) => !windowAtEntry?.owners.includes(owner));
 		const unrelatedPumpAction =
-			!hasTrackedSessionAction && (!schedulingPauseAtEntry || windowAtEntry?.protectQueuedWork !== true)
+			!hasTrackedSessionAction && (hasUnrelatedRunningSessionAction || schedulingPauseAtEntry === undefined)
 				? this._actionStore
 						.ownedActions()
 						.find(
 							(action) =>
 								action.payload.kind === "turn" &&
-								(action.lifecycle.state === "queued" ||
-									action.lifecycle.state === "preparing" ||
-									action.lifecycle.state === "committing" ||
-									action.lifecycle.state === "running"),
+								(hasUnrelatedRunningSessionAction
+									? action.lifecycle.state === "committing" || action.lifecycle.state === "running"
+									: action.lifecycle.state === "queued" ||
+										action.lifecycle.state === "preparing" ||
+										action.lifecycle.state === "committing" ||
+										action.lifecycle.state === "running"),
 						)
 				: undefined;
 		if (unrelatedPumpAction) this._continuationUnrelatedPumpAction = unrelatedPumpAction;
@@ -8560,6 +8626,16 @@ export class AgentSession {
 				this._continuationUnrelatedPumpAction !== undefined &&
 				!this._actionStore.ownedActions().includes(this._continuationUnrelatedPumpAction);
 			if (hasTrackedSessionAction && trackedPumpOwnerConsumed) {
+				const trackedTerminal =
+					this._continuationPumpTerminal?.action === trackedPumpOwner
+						? this._continuationPumpTerminal.stopReason
+						: trackedPumpOwner.lifecycle.state === "failed"
+							? "error"
+							: trackedPumpOwner.lifecycle.state === "cancelled"
+								? "aborted"
+								: undefined;
+				this._continuationPumpTerminal = undefined;
+				this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], trackedTerminal);
 				// Consume only messages owned by tracked actions that actually reached
 				// terminal. The action's immutable records remain available after the
 				// store releases it, while the authoritative continuation list tells us
@@ -8590,7 +8666,7 @@ export class AgentSession {
 				this._schedulePostCompactionContinue();
 				return;
 			}
-			if (!hasTrackedSessionAction && unrelatedPumpActionConsumed) {
+			if (!hasTrackedSessionAction && (unrelatedPumpActionConsumed || hasUnrelatedRunningSessionAction)) {
 				this._continuationUnrelatedPumpAction = undefined;
 				if (windowAtEntry === undefined) {
 					this._postCompactionContinuationScheduled = false;
@@ -8643,6 +8719,29 @@ export class AgentSession {
 		await this._runDirectContinuation(continuationMessages, undefined);
 	}
 
+	/** Terminal-close a matching retry when its owned continuation cannot start. */
+	private _finishMatchingRetryAfterContinuationFailure(message: string): void {
+		if (this._retryAttempt > 0) {
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: message,
+			});
+			this._retryAttempt = 0;
+		}
+		this._retryAuthFailureSources = [];
+		this._resolveRetry();
+	}
+
+	/** Strip the rebuilt terminal overflow error so idle recovery can call `continue()`. */
+	private _prepareOverflowRecoveryContinuation(): void {
+		const lastMessage = this.agent.state.messages.at(-1);
+		if (lastMessage?.role === "assistant" && lastMessage.stopReason === "error") {
+			this.agent.state.messages = this.agent.state.messages.slice(0, -1);
+		}
+	}
+
 	/** Matching overflow-retry continuation: the retry machinery runs the continue; wait it out and fence/close. */
 	private async _runDirectContinuationUnderMatchingRetry(
 		continuationMessages: AgentMessage[],
@@ -8681,15 +8780,7 @@ export class AgentSession {
 			const stopReason = this._lastRunTerminalStopReason;
 			this._lastRunTerminalStopReason = undefined;
 			this._provisionalOverflowContinuationOwners = [];
-			if (stopReason === "error") {
-				for (const owner of windowAtEntry?.owners ?? []) {
-					this._promptSettlementTracker.recordFailure(owner, "run_error");
-				}
-			} else if (stopReason === "aborted") {
-				for (const owner of windowAtEntry?.owners ?? []) {
-					this._promptSettlementTracker.requestCancel(owner);
-				}
-			}
+			this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], stopReason);
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 			if (windowAtEntry === undefined) {
 				closed = this._cancelPostCompactionContinue();
@@ -9476,6 +9567,7 @@ export class AgentSession {
 				// Overflow recovery must run directly before unrelated queued work;
 				// the schedule pause is a real ownership fence, not a generic pump handoff.
 				this._continuationSettlementWindow.protectQueuedWork = true;
+				this._continuationSettlementWindow.overflowRecovery = true;
 			}
 			return scheduled;
 		};
@@ -9563,11 +9655,12 @@ export class AgentSession {
 				return true;
 			} else if (shouldContinueAfterCompaction) {
 				// The same run must resume (threshold/requested compaction stopped a
-				// tool loop with prompt-owned continuation work): prompt-owned
-				// create/extend, then arm the scheduler.
-				settleContinuationObligation();
-				this._schedulePostCompactionContinue();
-				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
+				// tool loop with prompt-owned continuation work). Arm only after the
+				// create/extend transaction owns the entire obligation.
+				if (settleContinuationObligation()) {
+					this._schedulePostCompactionContinue();
+					this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
+				}
 			} else if (hasQueuedMessages) {
 				// Only unrelated agent-level queued work / independent session
 				// actions: generic ownerless scheduler wake. It continues through
@@ -11651,13 +11744,25 @@ export class AgentSession {
 	}
 
 	private _abortRetry(preserveContinuationSettlement: boolean): void {
-		if (!preserveContinuationSettlement) {
-			// `abortRetry()` is NOT a prompt abort: for an overflow recovery
-			// continuation it records run_error on the captured window owners
-			// (failed, never cancelled/completed) and then closes both the retry
-			// and continuation resources. Idempotent: a repeated abort sees an
-			// already-detached window and does nothing.
+		const overflowContinuation = this._continuationSettlementWindow?.overflowRecovery === true;
+		const hasRetry =
+			this._retryPromise !== undefined || this._retryAttempt > 0 || this._retryAbortController !== undefined;
+		if (!preserveContinuationSettlement && overflowContinuation && hasRetry) {
+			// `abortRetry()` is NOT a prompt abort. It fail-closes only the
+			// classified overflow/matching-retry obligation; generic scheduler wakes
+			// and threshold/requested non-retry windows are unrelated and survive.
 			this._cancelPostCompactionContinue({ owners: "fail" });
+		} else if (
+			!preserveContinuationSettlement &&
+			this._continuationSettlementWindow === undefined &&
+			hasRetry &&
+			this._retryAttempt > 0 &&
+			this._autoCompactionAbortController !== undefined
+		) {
+			// Zero-owner overflow compatibility: an active overflow compaction plus
+			// retry tuple classifies its ownerless scheduler as retry recovery, not a
+			// generic wake. There are no owners to fence.
+			this._cancelPostCompactionContinue();
 		}
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
