@@ -1101,6 +1101,29 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 // AgentSession Class
 // ============================================================================
 
+interface ContinuationSettlementWindow {
+	owners: string[];
+	leases: PromptLease[];
+	obligationMessages: AgentMessage[];
+	revision: number;
+	state: "scheduled" | "running" | "parked";
+	pumpOwned: boolean;
+	/**
+	 * Exact owner snapshot whose overflow retry/recovery is currently active
+	 * (a strict subset of `owners` when an unrelated A shares the window).
+	 * Empty when this window is a plain threshold/requested continuation.
+	 * Retry matching, terminal fencing and `abortRetry()` are scoped to this
+	 * exact subset so a mixed A+B window never fails, fences or closes A.
+	 */
+	overflowRecoveryOwners: string[];
+}
+
+interface ParkedContinuationSettlement {
+	window: ContinuationSettlementWindow;
+	revision: number;
+	token: symbol;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1313,6 +1336,43 @@ export class AgentSession {
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
+	/**
+	 * Runtime-only post-compaction continuation settlement window (group 4):
+	 * parallel `owners[i] <-> leases[i]` captured at scheduling time, obligation
+	 * message snapshot, monotonic revision and scheduled/running/parked
+	 * lifecycle. Never re-reads the mutable `_lastRunPromptIds` (the captured
+	 * owners are the release/retry targets for the window's lifetime), never
+	 * serialized, and is orthogonal to the scheduler flag/timer/message snapshot
+	 * above (a legacy ownerless scheduler obligation carries zero leases).
+	 */
+	private _continuationSettlementWindow: ContinuationSettlementWindow | undefined = undefined;
+	/** The exact parked window/revision and private token owned by one manual compact operation. */
+	private _parkedContinuationSettlement: ParkedContinuationSettlement | undefined = undefined;
+	/** Token accepted only by the immediately adjacent internal manual-compact abort call. */
+	private _continuationSettlementAbortToken: symbol | undefined = undefined;
+	/** Object identity of the tracked session action that currently owns this continuation obligation. */
+	private _continuationPumpOwnerAction: QueuedSessionAction | undefined = undefined;
+	/** Exact tracked action terminal captured before the pump consumes the shared terminal slot. */
+	private _continuationPumpTerminal:
+		| { action: QueuedSessionAction; stopReason: AssistantMessage["stopReason"] | undefined }
+		| undefined = undefined;
+	/** The exact session action already active when the continuation timer hands off to an unrelated pump run. */
+	private _continuationUnrelatedPumpAction: QueuedSessionAction | undefined = undefined;
+	/**
+	 * Schedule-time queued-work pause for a prompt-owned continuation WITHOUT a
+	 * tracked session action: held from `_schedulePostCompactionContinue` until
+	 * the direct runner's own pause hand-off (never both at once), blocking a
+	 * freshly queued unrelated B from starting before A's terminal fence/close.
+	 * Tracked continuation actions (session-owned) never hold it.
+	 */
+	private _continuationSchedulingPause: { release(): void } | undefined = undefined;
+	/**
+	 * Owners whose terminal `error` fence is provisional: a successful overflow
+	 * compaction with willRetry established a continuation window for them, so
+	 * the main-run `run_error` fence must not fire (the recovery outcome is
+	 * authoritative). Consumed/cleared by the next run terminal fence.
+	 */
+	private _provisionalOverflowContinuationOwners: string[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
 	private _queuedAutonomousContinuationSnapshots = new WeakMap<AgentMessage, AutonomousRuntimeSnapshot>();
 	private _pendingThresholdCompactionAutonomousMessages: AgentMessage[] = [];
@@ -2894,7 +2954,11 @@ export class AgentSession {
 	}
 
 	private _clearQueuedAutonomousContinuations(
-		options: { restoreAutonomousState?: boolean; messages?: AgentMessage[] } = {},
+		options: {
+			restoreAutonomousState?: boolean;
+			messages?: AgentMessage[];
+			cancelPostCompactionIfEmpty?: boolean;
+		} = {},
 	): void {
 		const requestedMessages = options.messages ?? [...this._postCompactionContinuationMessages];
 		const requestedMessageSet = new Set(requestedMessages);
@@ -2932,7 +2996,11 @@ export class AgentSession {
 		if (options.messages === undefined) {
 			this._continueAfterThresholdCompaction = false;
 		}
-		if (!this.agent.hasQueuedMessages() && this.unfinishedActionCount === 0) {
+		if (
+			options.cancelPostCompactionIfEmpty !== false &&
+			!this.agent.hasQueuedMessages() &&
+			this.unfinishedActionCount === 0
+		) {
 			this._cancelPostCompactionContinue();
 		}
 	}
@@ -3476,9 +3544,9 @@ export class AgentSession {
 			// Terminal run classification for prompt settlement: the assistant
 			// message that ends the run determines whether the run's owners are
 			// fenced as failed (provider error) or cancelled (aborted) before the
-			// run leases are consumed. Retry/compaction are not wired yet (group
-			// 3/4); if one ever ends a run with `error`/`aborted`, its own
-			// classification applies at that run's completion point.
+			// run leases are consumed. Retry and compaction continuation install
+			// their captured owners and apply the same terminal classification at
+			// their own completion boundary.
 			this._lastRunTerminalStopReason = event.message.stopReason;
 		}
 		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom")) {
@@ -3843,10 +3911,16 @@ export class AgentSession {
 	 * a normal completion applies no fence. Reads the per-run stop reason
 	 * captured at assistant `message_end`, so a later unrelated run or stale
 	 * `agent.state` cannot misclassify this run.
+	 *
+	 * Owners whose terminal error fence is provisional (the run's error was a
+	 * context overflow that a successful overflow compaction will retry) are
+	 * skipped: the continuation recovery is authoritative, so the provisional
+	 * error must not permanently fence the owner as failed.
 	 */
-	private _applyRunTerminalSettlementFence(owners: string[]): void {
-		const stopReason = this._lastRunTerminalStopReason;
-		this._lastRunTerminalStopReason = undefined;
+	private _applyCapturedContinuationTerminalFence(
+		owners: string[],
+		stopReason: AssistantMessage["stopReason"] | undefined,
+	): void {
 		if (stopReason === "error") {
 			for (const owner of owners) {
 				this._promptSettlementTracker.recordFailure(owner, "run_error");
@@ -3855,6 +3929,26 @@ export class AgentSession {
 			for (const owner of owners) {
 				this._promptSettlementTracker.requestCancel(owner);
 			}
+		}
+	}
+
+	private _applyRunTerminalSettlementFence(owners: string[]): void {
+		const stopReason = this._lastRunTerminalStopReason;
+		this._lastRunTerminalStopReason = undefined;
+		if (stopReason === "error") {
+			const provisional = new Set(this._provisionalOverflowContinuationOwners);
+			this._provisionalOverflowContinuationOwners = [];
+			for (const owner of owners) {
+				if (provisional.has(owner)) continue;
+				this._promptSettlementTracker.recordFailure(owner, "run_error");
+			}
+		} else if (stopReason === "aborted") {
+			this._provisionalOverflowContinuationOwners = [];
+			for (const owner of owners) {
+				this._promptSettlementTracker.requestCancel(owner);
+			}
+		} else {
+			this._provisionalOverflowContinuationOwners = [];
 		}
 	}
 
@@ -4220,7 +4314,10 @@ export class AgentSession {
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
-			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+			// #29 transition: dispose cancels window owners then closes so waiters
+			// do not hang. Group 6 moves the session-wide atomic
+			// settleAll(...,{released:true}) before window/action lease close.
+			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true, cancelPostCompactionOwners: "cancel" });
 			this._autoRefineBranchVersion++;
 			this._cancelActiveRlmChildRuns("Parent session disposed");
 			for (const unsubscribe of this._rlmChildUnsubscribes.values()) {
@@ -5724,6 +5821,13 @@ export class AgentSession {
 			return { accepted: false, disposition: "queued" };
 		}
 		const isTurn = action.payload.kind === "turn";
+		if (
+			action.payload.kind === "turn" &&
+			action.payload.records.some((record) => this._postCompactionContinuationMessages.includes(record.message))
+		) {
+			this._continuationPumpOwnerAction = action;
+			if (this._continuationSettlementWindow) this._continuationSettlementWindow.pumpOwned = true;
+		}
 		// Group 2 background identity exclusion: injected heartbeat / RLM notices
 		// never admit a settlement identity. The turn runs without a tracker
 		// record, lease, candidate or `prompt_outcome`.
@@ -5985,6 +6089,12 @@ export class AgentSession {
 					const batchOwnersForSettlement = actions.flatMap((action) =>
 						action.payload.kind === "turn" ? (action.promptIds ?? []) : [],
 					);
+					if (this._continuationPumpOwnerAction && actions.includes(this._continuationPumpOwnerAction)) {
+						this._continuationPumpTerminal = {
+							action: this._continuationPumpOwnerAction,
+							stopReason: this._lastRunTerminalStopReason,
+						};
+					}
 					this._applyRunTerminalSettlementFence([...new Set(batchOwnersForSettlement)]);
 					for (const action of actions) {
 						if (action.lifecycle.state === "committing") {
@@ -7120,6 +7230,20 @@ export class AgentSession {
 	}
 
 	requestAbort(): void {
+		this._requestAbort();
+	}
+
+	private _requestAbort(continuationSettlementToken?: symbol): void {
+		const preserveContinuationSettlement =
+			continuationSettlementToken !== undefined &&
+			continuationSettlementToken === this._continuationSettlementAbortToken &&
+			this._parkedContinuationSettlement?.token === continuationSettlementToken &&
+			this._continuationSettlementWindow === this._parkedContinuationSettlement.window &&
+			this._continuationSettlementWindow.revision === this._parkedContinuationSettlement.revision &&
+			this._continuationSettlementWindow.state === "parked";
+		if (continuationSettlementToken !== undefined) {
+			this._continuationSettlementAbortToken = undefined;
+		}
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -7127,8 +7251,11 @@ export class AgentSession {
 			(action) => action.payload.kind === "turn" && !action.payload.queueVisible,
 			new Error("Prompt aborted before delivery."),
 		);
-		this._cancelPostCompactionContinue();
-		this.abortRetry();
+		if (!preserveContinuationSettlement) {
+			// Explicit abort: cancel fence on captured window owners, then exact-once close.
+			this._cancelPostCompactionContinue({ owners: "cancel" });
+		}
+		this._abortRetry(preserveContinuationSettlement);
 		this.abortCompaction();
 		this.abortBranchSummary();
 		this.abortBash();
@@ -7143,9 +7270,13 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		return this._abort();
+	}
+
+	private async _abort(continuationSettlementToken?: symbol): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
-		this.requestAbort();
+		this._requestAbort(continuationSettlementToken);
 		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
@@ -7166,7 +7297,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
-		this._cancelPostCompactionContinue();
+		this._cancelPostCompactionContinue({ owners: "cancel" });
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
@@ -7618,9 +7749,22 @@ export class AgentSession {
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
-		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
+		// Snapshot the actual window obligation, not only the scheduler flag: a
+		// direct/matching runner clears that flag while it owns a visibly running
+		// window, and an ordinary manual compact must still park/resume that tuple.
+		const hadPostCompactionContinue =
+			this._continuationSettlementWindow !== undefined || this._postCompactionContinuationScheduled;
+		const parkedContinuation = this._parkContinuationSettlementForManualCompact();
+		if (!parkedContinuation && hadPostCompactionContinue) {
+			this._cancelPostCompactionContinueSchedulerOnly();
+		}
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		if (!options.skipAbort) {
+			// The token is private and operation-local. Only this immediately adjacent
+			// internal abort can preserve the exact parked object/revision; every public
+			// or concurrent abort still cancels/closes it.
+			await this._abort(parkedContinuation?.token);
+		}
 		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
@@ -7685,8 +7829,12 @@ export class AgentSession {
 			resolveCompactionOperation();
 			this._scheduleSessionInputPump();
 			if (didCompact) {
-				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
-				if (hadPostCompactionContinue) {
+				// Ordinary manual success: resume only the exact object/revision this
+				// operation parked. A concurrent external abort/replacement wins.
+				this._discardPendingAutoRefine();
+				if (parkedContinuation) {
+					this._resumeContinuationSettlementAfterManualCompact(parkedContinuation);
+				} else if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue();
 				}
 				// Queued agent or session-owned inputs resume the loop; defer refine
@@ -7694,6 +7842,21 @@ export class AgentSession {
 				this._scheduleAutoRefineAfterCompaction(
 					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.unfinishedActionCount > 0,
 				);
+			} else if (options.skipAbort && hadPostCompactionContinue) {
+				// skipAbort failure/skipped: no abort was called. Resume the exact
+				// parked window, or restore the ownerless scheduler obligation.
+				this._discardPendingAutoRefine();
+				if (parkedContinuation) {
+					this._resumeContinuationSettlementAfterManualCompact(parkedContinuation);
+				} else {
+					this._schedulePostCompactionContinue();
+				}
+				this._scheduleAutoRefineAfterCompaction(true);
+			} else if (!options.skipAbort && parkedContinuation) {
+				// Ordinary manual failure/cancel closes only the exact parked window.
+				// A concurrent external abort/replacement has already won otherwise.
+				this._discardPendingAutoRefine();
+				this._cancelPostCompactionContinue({ owners: "cancel", expectedWindow: parkedContinuation.window });
 			}
 		}
 	}
@@ -7809,26 +7972,375 @@ export class AgentSession {
 		return this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
 	}
 
-	private _cancelPostCompactionContinue(): void {
-		if (this._postCompactionContinuationTimer) {
-			clearTimeout(this._postCompactionContinuationTimer);
-			this._postCompactionContinuationTimer = undefined;
+	/** Returns true when the requested exact window/scheduler tuple was detached (exact-once close). */
+	private _cancelPostCompactionContinue(
+		options: { owners?: "release" | "cancel" | "fail"; expectedWindow?: ContinuationSettlementWindow } = {},
+	): boolean {
+		const window = this._continuationSettlementWindow;
+		if (options.expectedWindow !== undefined && window !== options.expectedWindow) {
+			return false;
 		}
+		const hadScheduler =
+			this._postCompactionContinuationScheduled || this._postCompactionContinuationTimer !== undefined;
+		if (window === undefined && !hadScheduler) {
+			return false;
+		}
+
+		// Capture and detach the WHOLE old close tuple before the first lease can
+		// synchronously emit prompt_outcome and reenter scheduling. Fences are
+		// applied against captured owners while every old scheduler field is already
+		// invisible; then leases release, then the pause supplies the authoritative
+		// pump wake. A reentrant replacement can therefore survive untouched.
+		const timer = this._postCompactionContinuationTimer;
+		const leases = window?.leases ?? [];
+		const owners = window?.owners ?? [];
+		const pause = this._continuationSchedulingPause;
+		this._continuationSettlementWindow = undefined;
+		if (this._parkedContinuationSettlement?.window === window) {
+			this._parkedContinuationSettlement = undefined;
+		}
+		this._continuationSettlementAbortToken = undefined;
+		this._continuationPumpOwnerAction = undefined;
+		this._continuationPumpTerminal = undefined;
+		this._continuationUnrelatedPumpAction = undefined;
 		this._postCompactionContinuationScheduled = false;
+		this._postCompactionContinuationTimer = undefined;
 		this._scheduledPostCompactionContinuationMessages = [];
+		this._continuationSchedulingPause = undefined;
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+
+		if (options.owners === "cancel") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.requestCancel(owner);
+			}
+		} else if (options.owners === "fail") {
+			for (const owner of owners) {
+				this._promptSettlementTracker.recordFailure(owner, "run_error");
+			}
+		}
+		for (const lease of leases) {
+			lease.release();
+		}
+		pause?.release();
+		return true;
 	}
 
-	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
+	/** Release the schedule-time queued-work pause (idempotent). Its own `_scheduleSessionInputPump()` is the authoritative wake. */
+	private _releaseContinuationSchedulingPause(): void {
+		const pause = this._continuationSchedulingPause;
+		this._continuationSchedulingPause = undefined;
+		pause?.release();
+	}
+
+	/** Scheduler-only cancel: timer/flag/message snapshot; the settlement window is untouched. */
+	private _cancelPostCompactionContinueSchedulerOnly(): void {
+		const timer = this._postCompactionContinuationTimer;
+		this._postCompactionContinuationTimer = undefined;
+		this._postCompactionContinuationScheduled = false;
+		this._scheduledPostCompactionContinuationMessages = [];
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+	}
+
+	/** Park the exact active window for one manual compact operation without releasing its leases. */
+	private _parkContinuationSettlementForManualCompact(): ParkedContinuationSettlement | undefined {
+		const window = this._continuationSettlementWindow;
+		if (!window) {
+			return undefined;
+		}
+		const token = Symbol("manual-compact-continuation");
+		const parked = { window, revision: window.revision, token };
+		this._parkedContinuationSettlement = parked;
+		this._continuationSettlementAbortToken = token;
+		this._cancelPostCompactionContinueSchedulerOnly();
+		window.state = "parked";
+		// The compact's own abort path takes over scheduler isolation; drop the
+		// schedule pause so the manual operation cannot retain an obsolete pump wake.
+		this._releaseContinuationSchedulingPause();
+		return parked;
+	}
+
+	/** Resume only the exact object/revision parked by this manual compact; never re-acquire. */
+	private _resumeContinuationSettlementAfterManualCompact(parked: ParkedContinuationSettlement): void {
+		if (
+			this._continuationSettlementWindow !== parked.window ||
+			parked.window.revision !== parked.revision ||
+			parked.window.state !== "parked" ||
+			this._parkedContinuationSettlement !== parked
+		) {
+			return;
+		}
+		this._parkedContinuationSettlement = undefined;
+		this._continuationSettlementAbortToken = undefined;
+		parked.window.state = "scheduled";
+		this._schedulePostCompactionContinue();
+	}
+
+	/** Remove only one failed producer's new obligation messages/actions, preserving prior window-owned work. */
+	private _dropFailedContinuationObligation(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		const oldMessages = new Set(this._continuationSettlementWindow?.obligationMessages ?? []);
+		const failedMessages = messages.filter((message) => !oldMessages.has(message));
+		if (failedMessages.length === 0) return;
+		this._clearQueuedAutonomousContinuations({
+			messages: failedMessages,
+			cancelPostCompactionIfEmpty: false,
+		});
+		const failed = new Set(failedMessages);
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(message) => !failed.has(message),
+		);
+		this._pendingThresholdCompactionAutonomousMessages = this._pendingThresholdCompactionAutonomousMessages.filter(
+			(message) => !failed.has(message),
+		);
+		const survivingTrackedAction = this._trackedSessionActionForScheduledContinuations([...oldMessages]);
+		this._continuationPumpOwnerAction = survivingTrackedAction;
+		if (this._continuationSettlementWindow) {
+			this._continuationSettlementWindow.pumpOwned = survivingTrackedAction !== undefined;
+		}
+	}
+
+	/**
+	 * All-or-nothing create/extend of the continuation settlement window for a
+	 * prompt-owned post-compaction obligation. Missing owners are acquired
+	 * before any mutation of an existing window; on failure only the newly
+	 * acquired siblings are reverse-released, the existing window stays
+	 * untouched, and the affected owners fail closed with `run_error` (create
+	 * failure covers all captured owners; extend failure covers only owners not
+	 * already covered by the old window). Ownerless (zero captured owners)
+	 * obligations return true and stay a legacy scheduler obligation with zero
+	 * settlement leases. The revision changes only for a successful
+	 * new/extended obligation (new owners or new obligation messages); a
+	 * duplicate schedule of the same obligation changes nothing.
+	 */
+	private _scheduleContinuationForObligation(owners: string[], obligationMessages: AgentMessage[]): boolean {
+		const dedupedOwners = [...new Set(owners)];
+		if (dedupedOwners.length === 0) {
+			// Ownerless: legacy scheduler obligation, zero settlement leases.
+			return true;
+		}
+		const existing = this._continuationSettlementWindow;
+		const missingOwners = existing
+			? dedupedOwners.filter((owner) => !existing.owners.includes(owner))
+			: [...dedupedOwners];
+		const acquired: PromptLease[] = [];
+		try {
+			for (const owner of missingOwners) {
+				acquired.push(this._promptSettlementTracker.acquire(owner, "compaction_continuation"));
+			}
+		} catch {
+			this._dropFailedContinuationObligation(obligationMessages);
+			// Fence every affected owner BEFORE releasing any acquired sibling:
+			// releasing the last sibling can terminal synchronously and must derive
+			// failed/run_error rather than completed. Existing-window owners are not
+			// affected by a failed extension and remain untouched.
+			const affectedOwners = existing ? missingOwners : dedupedOwners;
+			for (const owner of affectedOwners) {
+				this._promptSettlementTracker.recordFailure(owner, "run_error");
+			}
+			for (let index = acquired.length - 1; index >= 0; index -= 1) {
+				acquired[index]!.release();
+			}
+			return false;
+		}
+		if (existing) {
+			// A successful NEW/EXTENDED prompt-owned obligation bumps the window
+			// revision so a late runner cannot close it; the same owner/obligation
+			// can never acquire twice (only missing owners are acquired). An
+			// identical obligation is a no-op: no revision, lease, timer or snapshot
+			// change.
+			const newMessages = obligationMessages.filter((message) => !existing.obligationMessages.includes(message));
+			if (missingOwners.length === 0 && newMessages.length === 0) {
+				return true;
+			}
+			existing.owners.push(...missingOwners);
+			existing.leases.push(...acquired);
+			existing.obligationMessages.push(...newMessages);
+			existing.revision += 1;
+		} else {
+			this._continuationSettlementWindow = {
+				owners: [...dedupedOwners],
+				leases: acquired,
+				obligationMessages: [...obligationMessages],
+				revision: 1,
+				state: "scheduled",
+				pumpOwned: false,
+				overflowRecoveryOwners: [],
+			};
+		}
+
+		// A real create/extension refreshes an armed scheduler snapshot and timer.
+		// This also promotes newly tracked session-action work to pump ownership by
+		// releasing the old direct-run schedule pause. An extension while a runner
+		// is active arms the required follow-up execution at the newer revision.
+		if (this._postCompactionContinuationScheduled) {
+			this._rearmPostCompactionContinue();
+		}
+		return true;
+	}
+
+	/**
+	 * Remove an exactly-classified overflow-recovery subset from its (possibly
+	 * shared) continuation window after the recovery terminal or abort. The
+	 * caller has already applied the terminal intent to the subset owners and
+	 * already consumed this operation's own messages; this helper drops the
+	 * subset from the shared owners/leases/subset arrays and either exact-closes
+	 * a fully consumed window or re-arms the remaining owners' obligation at a
+	 * newer revision. Wraps the shared exact partition-consumption primitive.
+	 */
+	private _removeOverflowRecoverySubset(
+		window: ContinuationSettlementWindow,
+		schedulingPause: { release(): void } | undefined,
+	): boolean {
+		// The surviving obligation snapshot is the authoritative global
+		// continuation message set (the pump's tracked consumption removes its
+		// own messages there), never a position-derived `owners - subset`
+		// inference. Overflow recovery itself has no independent message, so an
+		// empty remaining snapshot with remaining owners is a live recovery
+		// partition and is rearmed, not closed.
+		return this._consumeContinuationOwnerPartition(window, [...window.overflowRecoveryOwners], {
+			schedulingPause,
+			remainingOverflowOwners: [],
+			remainingObligationMessages: [...this._postCompactionContinuationMessages],
+		});
+	}
+
+	/**
+	 * Exact partition-consumption primitive (one continuation window, one
+	 * scheduler): consumes ONE owner partition — either the overflow-recovery
+	 * subset or its tracked non-overflow complement — from a shared window.
+	 * The caller has already applied the real terminal intent to the consumed
+	 * owners and already computed the surviving obligation message/action
+	 * state; this helper never guesses an owner↔message mapping from array
+	 * position or from `owners - subset`.
+	 *
+	 * Publication order follows the full detach-before-release discipline for
+	 * the REMAINING owners: the coherent remaining window and its scheduler
+	 * tuple (timer / message snapshot / pump-or-pause policy) are fully
+	 * published BEFORE the first consumed lease releases. A consumed lease
+	 * release can synchronously emit `prompt_outcome` and reenter session
+	 * APIs: a listener that closes/cancels or publishes a replacement must
+	 * observe the remaining partition already fully rearmed at the newer
+	 * revision, and the helper must not touch or resurrect any
+	 * scheduler/window state after that release returns. No release/reacquire
+	 * gap: untouched owners keep the same lease instances, and the caller's
+	 * queued-work pause transfers unchanged to the remaining partition's
+	 * scheduling fence. Returns true when the window closed entirely (full
+	 * detach-before-release close), false when the remaining partition was
+	 * re-armed.
+	 */
+	private _consumeContinuationOwnerPartition(
+		window: ContinuationSettlementWindow,
+		consumedOwners: string[],
+		options: {
+			/** The caller's queued-work pause, transferred to the remaining partition's fence (never released here). */
+			schedulingPause: { release(): void } | undefined;
+			/** Caller-authoritative post-consumption overflow subset identity (exact owners, not position-derived). */
+			remainingOverflowOwners: string[];
+			/** Caller-authoritative surviving obligation messages/snapshot state. */
+			remainingObligationMessages: AgentMessage[];
+		},
+	): boolean {
+		const consumedSet = new Set(consumedOwners);
+		const remainingOwners: string[] = [];
+		const remainingLeases: PromptLease[] = [];
+		const releasedLeases: PromptLease[] = [];
+		for (let index = 0; index < window.owners.length; index += 1) {
+			const owner = window.owners[index]!;
+			if (consumedSet.has(owner)) {
+				releasedLeases.push(window.leases[index]!);
+			} else {
+				remainingOwners.push(owner);
+				remainingLeases.push(window.leases[index]!);
+			}
+		}
+		if (remainingOwners.length === 0) {
+			// The consumed partition is the ENTIRE window: keep the existing full
+			// detach-before-release close shape (callers normally route
+			// whole-window closes directly, but a reentrantly-shrunk window can
+			// reach here). Do not mutate first: the full close helper captures
+			// and detaches the whole old tuple before any lease release.
+			return this._cancelPostCompactionContinue({ expectedWindow: window });
+		}
+		// Publish the coherent remaining window FIRST: detach the consumed
+		// owners/leases from the shared arrays, install the caller-authoritative
+		// surviving subset identity and obligation messages, bump the revision,
+		// restore the scheduled state and transfer the caller's pause. This is
+		// the state a synchronous consumed-owner outcome reentry must observe.
+		const remainingOwnerSet = new Set(remainingOwners);
+		window.owners = remainingOwners;
+		window.leases = remainingLeases;
+		window.overflowRecoveryOwners = [
+			...new Set(options.remainingOverflowOwners.filter((owner) => remainingOwnerSet.has(owner))),
+		];
+		window.obligationMessages = [...options.remainingObligationMessages];
+		window.revision += 1;
+		window.state = "scheduled";
+		// Re-install the caller's pause as the remaining partition's scheduling
+		// fence (the rearm helper keeps it; a pump-owned partition releases it).
+		this._continuationSchedulingPause = options.schedulingPause;
+		// Arm the remaining partition's scheduler tuple (timer + message
+		// snapshot + pause policy) at the newer revision BEFORE the first
+		// consumed lease can synchronously settle its owner and reenter. The
+		// rearm helper clears an already-pending timer so it can never
+		// double-fire; a reentrant close or replacement therefore survives
+		// untouched because no scheduler/window mutation happens after the
+		// releases below.
+		this._rearmPostCompactionContinue();
+		// Release the consumed leases exactly once. A reentrant synchronous
+		// listener now sees the remaining partition coherently rearmed (or its
+		// own replacement) and this helper does not touch global
+		// scheduler/window state afterward.
+		for (const lease of releasedLeases) {
+			lease.release();
+		}
+		return false;
+	}
+
+	/**
+	 * The active retry window belongs to THIS continuation window: an overflow
+	 * recovery matches its exact captured owner subset (which may be a strict
+	 * subset of a shared window), while a plain threshold/requested window
+	 * matches only a retry over its complete owner set. A matching
+	 * overflow-retry continuation must run it instead of rearming forever on
+	 * `isRetrying`; unrelated retry/busy still rearms.
+	 */
+	private _continuationRetryWindowMatchesRetryOwners(): boolean {
+		const window = this._continuationSettlementWindow;
+		if (!window) return false;
+		const retryWindow = this._retryWindow;
+		if (!retryWindow) return false;
+		const matchTarget = window.overflowRecoveryOwners.length > 0 ? window.overflowRecoveryOwners : window.owners;
+		const targetOwners = [...new Set(matchTarget)].sort();
+		const retryOwners = [...new Set(retryWindow.capturedPromptIds)].sort();
+		return (
+			targetOwners.length === retryOwners.length &&
+			targetOwners.every((owner, index) => owner === retryOwners[index])
+		);
+	}
+
+	private _discardPendingAutoRefine(
+		options: {
+			cancelPostCompactionContinue?: boolean;
+			cancelPostCompactionOwners?: "release" | "cancel" | "fail";
+		} = {},
+	): void {
 		this._compactAutoRefinePending = false;
 		this._turnIntervalAutoRefinePending = false;
 		this._pendingAutoRefineReview = undefined;
 		if (options.cancelPostCompactionContinue) {
-			this._cancelPostCompactionContinue();
+			this._cancelPostCompactionContinue(
+				options.cancelPostCompactionOwners ? { owners: options.cancelPostCompactionOwners } : {},
+			);
 		}
 	}
 
 	private async _invalidatePendingAutoRefineForBranchChange(): Promise<void> {
 		this._autoRefineReviewAbort?.abort();
+		// Branch invalidation is a non-abort cancellation: release-only close.
 		this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 		this._assistantTurnsSinceAutoRefine = 0;
 		// Increment branch version BEFORE aborting/awaiting the serialized plan.
@@ -7913,47 +8425,523 @@ export class AgentSession {
 		if (this._postCompactionContinuationScheduled) {
 			return;
 		}
+		this._armPostCompactionContinue();
+	}
+
+	/** Refresh one real scheduler obligation without touching settlement leases/revision. */
+	private _rearmPostCompactionContinue(): void {
+		const timer = this._postCompactionContinuationTimer;
+		this._postCompactionContinuationTimer = undefined;
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+		this._postCompactionContinuationScheduled = false;
+		this._armPostCompactionContinue(true);
+	}
+
+	private _armPostCompactionContinue(preserveRunningState = false): void {
 		this._postCompactionContinuationScheduled = true;
 		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
+		const trackedPumpOwner = this._trackedSessionActionForScheduledContinuations(
+			this._scheduledPostCompactionContinuationMessages,
+		);
+		// Pump ownership is derived from the current snapshot, never sticky across
+		// a tracked action's terminal. A mixed window can return to direct ownership
+		// after the pump consumes only its tracked subset.
+		this._continuationPumpOwnerAction = trackedPumpOwner;
+		if (this._continuationSettlementWindow) {
+			this._continuationSettlementWindow.pumpOwned = trackedPumpOwner !== undefined;
+		}
+		// A non-empty overflow-recovery subset is the authoritative next-dispatch
+		// owner: even when a tracked sibling action shares the window, the subset's
+		// direct recovery must run before the pump can dispatch the tracked sibling.
+		// `trackedPumpOwner` stays discoverable (pumpOwned stays true so a tracked
+		// action that ALREADY ran can be complement-consumed), but the queued-work
+		// pause policy must not release the pump fence while overflow recovery is
+		// pending, so a fresh queued sibling cannot be selected before the subset.
+		const overflowSubsetPending =
+			this._continuationSettlementWindow !== undefined &&
+			this._continuationSettlementWindow.overflowRecoveryOwners.length > 0;
+		const pumpOwnsObligation = trackedPumpOwner !== undefined && !overflowSubsetPending;
+		const activeRunner = preserveRunningState && this._continuationSettlementWindow?.state === "running";
+		// A prompt-owned continuation without a tracked session action (e.g. an
+		// overflow willRetry that must resume the SAME run) holds a queued-work
+		// pause from schedule time: a freshly queued unrelated B must not start
+		// before the direct runner fences/closes A. Tracked continuation actions are
+		// session-owned; pump ownership wins, so an obsolete direct pause is released.
+		if (pumpOwnsObligation) {
+			this._releaseContinuationSchedulingPause();
+		} else if (
+			this._continuationSettlementWindow !== undefined &&
+			this._continuationSettlementWindow.state !== "parked" &&
+			!activeRunner &&
+			this._continuationSchedulingPause === undefined
+		) {
+			this._continuationSchedulingPause = this.acquireQueuedWorkPause();
+		}
 		this._postCompactionContinuationTimer = setTimeout(() => {
 			this._postCompactionContinuationTimer = undefined;
 			void this._runScheduledPostCompactionContinue();
 		}, 100);
 	}
 
-	/** Whether any snapshot of scheduled continuation messages is still session-owned. */
+	/** Whether any snapshot message still belongs to the continuation obligation set. */
 	private _sessionOwnsScheduledContinuations(continuationMessages: AgentMessage[]): boolean {
 		return continuationMessages.some((message) => this._postCompactionContinuationMessages.includes(message));
+	}
+
+	/** Whether the session-action pump, rather than direct agent.continue(), owns any snapshot message. */
+	private _trackedSessionActionForScheduledContinuations(
+		continuationMessages: AgentMessage[],
+	): QueuedSessionAction | undefined {
+		return this._actionStore
+			.ownedActions()
+			.find(
+				(action) =>
+					action.payload.kind === "turn" &&
+					action.payload.records.some((record) => continuationMessages.includes(record.message)),
+			);
+	}
+
+	/**
+	 * Direct continuation runner: holds the queued-work pause for the whole
+	 * install -> continue -> retry chain -> event queue -> terminal fence ->
+	 * detach close/rearm span, so a retry close cannot wake the pump and start
+	 * another prompt in the middle; the pause release's own
+	 * `_scheduleSessionInputPump()` is the authoritative post-fence wake. A late
+	 * completion cannot close a later-revision/replacement window (the window
+	 * identity/revision is captured at entry and re-checked before close).
+	 */
+	private async _runDirectContinuation(
+		continuationMessages: AgentMessage[],
+		windowAtEntry: ContinuationSettlementWindow | undefined,
+	): Promise<void> {
+		const revisionAtEntry = windowAtEntry?.revision ?? 0;
+		// Hand off the schedule-time pause (if held): the same queued-work pause
+		// keeps B blocked across the whole install -> continue -> fence -> close
+		// span. When no schedule pause exists (ownerless generic wake), acquire
+		// one so the runner's own span is still isolated.
+		const queuedWorkPause = this._continuationSchedulingPause ?? this.acquireQueuedWorkPause();
+		this._continuationSchedulingPause = undefined;
+		let closed = false;
+		let pauseHandedOff = false;
+		try {
+			if (
+				windowAtEntry !== undefined &&
+				this._continuationSettlementWindow === windowAtEntry &&
+				windowAtEntry.revision === revisionAtEntry &&
+				windowAtEntry.state !== "parked"
+			) {
+				windowAtEntry.state = "running";
+			}
+			// The operation's OWN owner set: an overflow recovery running inside a
+			// mixed window operates strictly on its captured subset; a plain
+			// threshold/requested continuation owns the whole window.
+			const operationOwners =
+				windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0
+					? [...windowAtEntry.overflowRecoveryOwners]
+					: [...(windowAtEntry?.owners ?? [])];
+			// Install the operation owners into `_lastRunPromptIds` so a group-3
+			// retry window created by this continuation's agent_end inherits
+			// exactly those owners, never a sibling prompt's or a zero-owner
+			// snapshot; restore below.
+			const previousOwners = this._lastRunPromptIds;
+			this._lastRunPromptIds = operationOwners;
+			// Clear any stale terminal stop reason before the run: the continuation
+			// run's own message_end sets the authoritative reason, and a stale
+			// prior signal must never fence this run.
+			this._lastRunTerminalStopReason = undefined;
+			let stopReason: AssistantMessage["stopReason"] | undefined;
+			try {
+				await this.agent.continue();
+				// The retry chain (group 3) created at the continuation's agent_end
+				// runs its own recoveries; wait for it and the event queue while the
+				// pause is still held so no queued B can start in between.
+				await this.waitForRetry();
+				await this._agentEventQueue;
+				stopReason = this._lastRunTerminalStopReason;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("already processing")) {
+					// The matching overflow-retry continuation is already running
+					// under its own retry window: wait for it instead of rearming
+					// forever on `isRetrying`.
+					if (this.isRetrying && this._continuationRetryWindowMatchesRetryOwners()) {
+						await this.waitForRetry();
+						await this._agentEventQueue;
+						stopReason = this._lastRunTerminalStopReason;
+					} else {
+						// Unrelated retry/busy appeared: internal rearm, same tuple.
+						// The pause stays held across rearm boundaries: transfer it
+						// to the scheduling slot (the finally below must NOT
+						// release it), so no unrelated B can slip into the rearm gap.
+						this._continuationSchedulingPause = queuedWorkPause;
+						pauseHandedOff = true;
+						this._postCompactionContinuationScheduled = false;
+						this._schedulePostCompactionContinue();
+						return;
+					}
+				} else {
+					// A non-"already processing" continue throw is terminal only for the
+					// exact object/revision this runner owns. A parked or replaced window
+					// belongs to another operation and must survive untouched. The legacy
+					// ownerless scheduler still closes its own scheduler tuple.
+					if (windowAtEntry === undefined && this._continuationSettlementWindow === undefined) {
+						closed = this._cancelPostCompactionContinue();
+					} else if (
+						windowAtEntry !== undefined &&
+						this._continuationSettlementWindow === windowAtEntry &&
+						windowAtEntry.revision === revisionAtEntry &&
+						windowAtEntry.state !== "parked"
+					) {
+						for (const owner of operationOwners) {
+							this._promptSettlementTracker.recordFailure(owner, "run_error");
+						}
+						if (
+							windowAtEntry.overflowRecoveryOwners.length > 0 &&
+							this._continuationRetryWindowMatchesRetryOwners()
+						) {
+							this._finishMatchingRetryAfterContinuationFailure(message);
+						}
+						if (operationOwners.length === windowAtEntry.owners.length) {
+							closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+						} else {
+							// Mixed window: only the failed overflow subset is removed;
+							// the sibling A obligation survives; the direct-run pause
+							// transfers to A's rearmed scheduling fence (never released).
+							closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+							pauseHandedOff = true;
+						}
+					}
+					return;
+				}
+			} finally {
+				this._lastRunPromptIds = previousOwners;
+			}
+			// Close only if this window is still the SAME window at the SAME
+			// revision: a newer successful threshold/requested compaction during
+			// the continuation extended it (revision +1) and owns the new
+			// continuation; the old runner must neither fence nor close it (the
+			// recovery run is authoritative and the new runner fences later).
+			const windowNow = this._continuationSettlementWindow;
+			const sameWindow =
+				windowAtEntry === undefined
+					? windowNow === undefined
+					: windowNow === windowAtEntry && windowAtEntry.revision === revisionAtEntry;
+			if (windowAtEntry !== undefined && (!sameWindow || windowAtEntry.state === "parked")) {
+				// A newer obligation already armed its follow-up, a replacement owns
+				// this revision, or manual compact owns the parked tuple. The old
+				// runner relinquishes without fencing, forgetting, closing, or rearming.
+				return;
+			}
+			// Fence the operation owners with the final stop reason. The
+			// provisional-overflow suppression belongs ONLY to the original main
+			// run's terminal fence (consumed by `_applyRunTerminalSettlementFence`
+			// before any continuation starts); this continuation run's own
+			// terminal error is authoritative: error -> failed/run_error,
+			// aborted -> cancelled, normal -> completed.
+			this._lastRunTerminalStopReason = undefined;
+			this._provisionalOverflowContinuationOwners = [];
+			this._applyCapturedContinuationTerminalFence(operationOwners, stopReason);
+			if (windowAtEntry === undefined) {
+				this._forgetConsumedPostCompactionContinuations(continuationMessages);
+				closed = this._cancelPostCompactionContinue();
+			} else if (sameWindow) {
+				if (operationOwners.length === windowAtEntry.owners.length) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+					closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				} else {
+					// Mixed window: only the finished overflow subset is removed; the
+					// sibling A obligation and its messages survive untouched; the
+					// direct-run pause transfers to A's rearmed scheduling fence
+					// (never released here).
+					closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+					pauseHandedOff = true;
+				}
+			}
+		} finally {
+			// The pause release's own `_scheduleSessionInputPump()` is the
+			// authoritative post-fence wake. When the rearm path transferred the
+			// pause to the scheduling slot (pauseHandedOff), do NOT release it here.
+			if (!pauseHandedOff) {
+				queuedWorkPause.release();
+			}
+			if (closed) {
+				// Post-close auto-refine only after the authoritative wake boundary.
+				this._scheduleAutoRefineAfterAgentEnd();
+			}
+		}
 	}
 
 	private async _runScheduledPostCompactionContinue(): Promise<void> {
 		await this._waitForRefineIdle();
 		if (!this._postCompactionContinuationScheduled) {
+			this._releaseContinuationSchedulingPause();
 			return;
 		}
-		if (this.isStreaming || this.isCompacting || this.isRetrying || this._queuedWorkPauses.size > 0) {
+		const windowAtEntry = this._continuationSettlementWindow;
+		const revisionAtEntry = windowAtEntry?.revision ?? 0;
+		const continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
+		const schedulingPauseAtEntry = this._continuationSchedulingPause;
+		const isFreshWindow = () =>
+			windowAtEntry === undefined
+				? this._continuationSettlementWindow === undefined
+				: this._continuationSettlementWindow === windowAtEntry && windowAtEntry.revision === revisionAtEntry;
+
+		// Busy / external pause / unrelated retry: internal rearm of the same
+		// scheduler obligation (never re-reads `_lastRunPromptIds`, never
+		// acquires/releases). A matching overflow-retry continuation is NOT a
+		// rearm case: it must run while its own retry window is active. A
+		// non-empty overflow-recovery PARTITION is classification on its own:
+		// first-error overflow can carry no retry tuple at all, yet its exact
+		// owner subset still owns the next continuation dispatch.
+		const overflowRecoveryPending = windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0;
+		const matchingRetry =
+			(this.isRetrying && this._continuationRetryWindowMatchesRetryOwners()) || overflowRecoveryPending;
+		if (
+			(!matchingRetry && this.isStreaming && this._currentRunOwners.length === 0) ||
+			(!matchingRetry &&
+				this.isStreaming &&
+				this._currentRunOwners.some((owner) => windowAtEntry?.owners.includes(owner))) ||
+			this.isCompacting ||
+			(this._queuedWorkPauses.size > 0 && this._continuationSchedulingPause === undefined) ||
+			(this.isRetrying && !matchingRetry)
+		) {
+			// Internal rearm: only the exact captured object/revision may mutate the
+			// scheduler. A late old timer that observes a replacement returns without
+			// clearing or rearming replacement state.
+			if (!isFreshWindow()) return;
+			if (windowAtEntry?.state === "parked") return;
+			if (windowAtEntry) windowAtEntry.state = "scheduled";
 			this._postCompactionContinuationScheduled = false;
 			this._schedulePostCompactionContinue();
 			return;
 		}
 
-		const continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
 		if (continuationMessages.length > 0 && !this._sessionOwnsScheduledContinuations(continuationMessages)) {
+			// Tracked work removed / branch invalidation / confirmed no work:
+			// nonabort release-only close (the main run completed normally).
 			this._cancelPostCompactionContinue();
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
 		}
-		// An empty queue is not idle while the scheduler still owns active work.
+		// A matching retry can mean either an already-streaming continue (wait
+		// only) or an idle overflow recovery that still needs one continue call.
+		// A non-empty overflow subset with NO retry tuple (first-error overflow)
+		// must NOT run/fence while the agent is streaming: the stream is tracked
+		// sibling work (or an unrelated run) and the subset rearm-waits for idle.
+		if (matchingRetry) {
+			if (this.isStreaming) {
+				if (this.isRetrying && this._continuationRetryWindowMatchesRetryOwners()) {
+					// Matching retry tuple with a continue already in flight: wait
+					// only (no duplicate continue call).
+					await this._runDirectContinuationUnderMatchingRetry(continuationMessages, windowAtEntry);
+				} else {
+					// First-error overflow subset pending while a sibling streams:
+					// internal rearm of the same captured tuple, never a fence/run.
+					if (!isFreshWindow()) return;
+					if (windowAtEntry?.state === "parked") return;
+					if (windowAtEntry) windowAtEntry.state = "scheduled";
+					this._postCompactionContinuationScheduled = false;
+					this._schedulePostCompactionContinue();
+				}
+			} else {
+				if (windowAtEntry && windowAtEntry.overflowRecoveryOwners.length > 0) {
+					this._prepareOverflowRecoveryContinuation();
+				}
+				await this._runDirectContinuation(continuationMessages, windowAtEntry);
+			}
+			return;
+		}
+		// Session-pump handoff: tracked continuation work is pump-owned. A legacy
+		// direct obligation also hands off when unrelated work is already running
+		// (the scheduler pause cannot retroactively stop that run); queued-but-not-
+		// running unrelated work remains behind the direct runner's pause.
+		const trackedPumpOwner =
+			this._trackedSessionActionForScheduledContinuations(continuationMessages) ?? this._continuationPumpOwnerAction;
+		const hasTrackedSessionAction = windowAtEntry?.pumpOwned === true;
+		const hasUnrelatedRunningSessionAction =
+			this.isStreaming &&
+			this._currentRunOwners.length > 0 &&
+			this._currentRunOwners.every((owner) => !windowAtEntry?.owners.includes(owner));
+		const unrelatedPumpAction =
+			!hasTrackedSessionAction && (hasUnrelatedRunningSessionAction || schedulingPauseAtEntry === undefined)
+				? this._actionStore
+						.ownedActions()
+						.find(
+							(action) =>
+								action.payload.kind === "turn" &&
+								(hasUnrelatedRunningSessionAction
+									? action.lifecycle.state === "committing" || action.lifecycle.state === "running"
+									: action.lifecycle.state === "queued" ||
+										action.lifecycle.state === "preparing" ||
+										action.lifecycle.state === "committing" ||
+										action.lifecycle.state === "running"),
+						)
+				: undefined;
+		if (unrelatedPumpAction) this._continuationUnrelatedPumpAction = unrelatedPumpAction;
+		const pumpOwnsHandoff =
+			hasTrackedSessionAction || hasUnrelatedRunningSessionAction || unrelatedPumpAction !== undefined;
+		// Capture the tracked non-overflow complement AT HANDOFF ENTRY so a
+		// mid-flight window extension can never expand the consumed complement
+		// (only a real not-yet-terminal owner may remain in the window).
+		const trackedComplementAtEntry = windowAtEntry
+			? windowAtEntry.owners.filter((owner) => !windowAtEntry!.overflowRecoveryOwners.includes(owner))
+			: [];
+		if (pumpOwnsHandoff) {
+			if (windowAtEntry !== undefined && isFreshWindow() && windowAtEntry.state !== "parked") {
+				windowAtEntry.state = "running";
+			}
+			// A tracked session action cannot run while the schedule pause blocks
+			// the pump; release it (its `_scheduleSessionInputPump()` is the wake).
+			this._releaseContinuationSchedulingPause();
+			this._scheduleSessionInputPump();
+			await this._sessionInputPump;
+			await this._agentEventQueue;
+			// A revision bump from B's overflow extension mid-flight is NOT a
+			// replacement: the SAME window object extended its owner partition and
+			// must still be complement-consumed by this handoff. Only a genuine
+			// replacement (different window object) or a stale old head may return.
+			const sameWindowIdentity = windowAtEntry === undefined || this._continuationSettlementWindow === windowAtEntry;
+			if (windowAtEntry !== undefined && !sameWindowIdentity) {
+				// A different window object owns all current scheduler fields. A
+				// late old pump handoff must not close, clear, or rearm that
+				// replacement.
+				return;
+			}
+			if (windowAtEntry?.state === "parked") {
+				return;
+			}
+			const trackedPumpOwnerConsumed =
+				trackedPumpOwner !== undefined &&
+				!this._actionStore.ownedActions().includes(trackedPumpOwner) &&
+				(trackedPumpOwner.lifecycle.state === "completed" ||
+					trackedPumpOwner.lifecycle.state === "failed" ||
+					trackedPumpOwner.lifecycle.state === "cancelled");
+			const unrelatedPumpActionConsumed =
+				this._continuationUnrelatedPumpAction !== undefined &&
+				!this._actionStore.ownedActions().includes(this._continuationUnrelatedPumpAction);
+			if (hasTrackedSessionAction && trackedPumpOwnerConsumed) {
+				const trackedTerminal =
+					this._continuationPumpTerminal?.action === trackedPumpOwner
+						? this._continuationPumpTerminal.stopReason
+						: trackedPumpOwner.lifecycle.state === "failed"
+							? "error"
+							: trackedPumpOwner.lifecycle.state === "cancelled"
+								? "aborted"
+								: undefined;
+				this._continuationPumpTerminal = undefined;
+				// A tracked action belongs to the non-overflow complement captured
+				// at handoff entry: a mixed window's overflow-recovery subset
+				// (which may have been stamped mid-flight) must never receive the
+				// tracked terminal fence (B recovery is authoritative for B).
+				const trackedOwners = [...trackedComplementAtEntry];
+				this._applyCapturedContinuationTerminalFence(trackedOwners, trackedTerminal);
+				// Consume only messages owned by tracked actions that actually reached
+				// terminal. The action's immutable records remain available after the
+				// store releases it, while the authoritative continuation list tells us
+				// which other obligations still remain.
+				const consumedTrackedMessages = new Set<AgentMessage>(
+					trackedPumpOwner.payload.kind === "turn"
+						? trackedPumpOwner.payload.records.map((record) => record.message)
+						: [],
+				);
+				const remainingMessages = this._postCompactionContinuationMessages.filter(
+					(message) => !consumedTrackedMessages.has(message),
+				);
+				this._postCompactionContinuationMessages = remainingMessages;
+				if (windowAtEntry) windowAtEntry.obligationMessages = [...remainingMessages];
+				this._continuationPumpOwnerAction = undefined;
+				const overflowSubsetStillPending = (windowAtEntry?.overflowRecoveryOwners.length ?? 0) > 0;
+				const trackedOwnedWholeWindow =
+					windowAtEntry !== undefined && trackedOwners.length === windowAtEntry.owners.length;
+				// Overflow recovery has no independent message. Remaining
+				// non-overflow obligation messages (e.g. a mixed tracked A +
+				// direct D window) are the authority that A,D owners/leases must
+				// be preserved: consuming the whole non-overflow complement would
+				// release D and leave D's message under a B-only window.
+				if (
+					overflowSubsetStillPending &&
+					windowAtEntry !== undefined &&
+					!trackedOwnedWholeWindow &&
+					remainingMessages.length === 0
+				) {
+					// The tracked complement reached its real terminal while the
+					// overflow subset B is still pending AND no other non-overflow
+					// obligation remains: consume EXACTLY the fenced tracked
+					// owners/leases at A's real terminal and publish B's remaining
+					// partition (B owners/leases/subset + B's direct recovery
+					// scheduler/pause policy) BEFORE A's last lease releases. A is
+					// never retained / re-dispatched; B recovery is authoritative
+					// for B.
+					const didClose = this._consumeContinuationOwnerPartition(windowAtEntry, trackedOwners, {
+						schedulingPause: undefined,
+						remainingOverflowOwners: [...windowAtEntry.overflowRecoveryOwners],
+						remainingObligationMessages: remainingMessages,
+					});
+					if (didClose) this._scheduleAutoRefineAfterAgentEnd();
+					// The partition helper published/armed B and performed no
+					// scheduler/window mutation after A's release; this pump handoff
+					// must not touch global scheduler/window state.
+					return;
+				}
+				if (remainingMessages.length === 0 && !overflowSubsetStillPending) {
+					const didClose = windowAtEntry
+						? this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry })
+						: this._cancelPostCompactionContinue();
+					if (didClose) this._scheduleAutoRefineAfterAgentEnd();
+					return;
+				}
+				if (windowAtEntry) {
+					windowAtEntry.state = "scheduled";
+					windowAtEntry.pumpOwned = false;
+				}
+				this._postCompactionContinuationScheduled = false;
+				this._schedulePostCompactionContinue();
+				return;
+			}
+			if (!hasTrackedSessionAction && (unrelatedPumpActionConsumed || hasUnrelatedRunningSessionAction)) {
+				this._continuationUnrelatedPumpAction = undefined;
+				if (windowAtEntry === undefined) {
+					this._postCompactionContinuationScheduled = false;
+					this._scheduledPostCompactionContinuationMessages = [];
+					this._scheduleAutoRefineAfterAgentEnd();
+					return;
+				}
+			}
+			// The tracked action is still outstanding (or only unrelated B ran
+			// while A's obligation remains): coherently return the exact window to
+			// scheduled and rearm it without merging any other owner tuple.
+			if (windowAtEntry) windowAtEntry.state = "scheduled";
+			this._postCompactionContinuationScheduled = false;
+			this._schedulePostCompactionContinue();
+			return;
+		}
+		// A prompt-owned settlement window with must-resume work: the direct
+		// runner acquires the queued-work pause, so a queued unrelated B (or a B
+		// still preparing) cannot start before A's terminal fence/close — the
+		// pump sees the pause and defers B (DeferredSessionInputError rollback),
+		// and the pause release's own `_scheduleSessionInputPump()` is the
+		// authoritative post-fence wake. This takes priority over merely queued
+		// session work only when the continuation is genuinely prompt-owned
+		// (not a tracked session action, which goes through the pump above).
+		if (windowAtEntry !== undefined) {
+			await this._runDirectContinuation(continuationMessages, windowAtEntry);
+			return;
+		}
+		// Ownerless legacy scheduler obligation: agent-level queued messages or
+		// independent session actions. If the pump owns session work, hand off
+		// without a pause; otherwise direct `agent.continue()` (no settlement
+		// leases, zero window). Preserves the legacy reschedule policy: after the
+		// pump handled the queued work, reschedule only while session-owned work
+		// remains (no continuation window exists to keep alive).
 		if (this.unfinishedActionCount > 0 || this._sessionInputPumpRequested) {
 			this._scheduleSessionInputPump();
 			await this._sessionInputPump;
+			await this._agentEventQueue;
 			if (this._postCompactionContinuationScheduled) {
 				this._postCompactionContinuationScheduled = false;
-				const shouldReschedule =
-					continuationMessages.length === 0
-						? this.unfinishedActionCount > 0
-						: this._sessionOwnsScheduledContinuations(continuationMessages);
-				if (shouldReschedule) {
+				if (this.unfinishedActionCount > 0) {
 					this._schedulePostCompactionContinue();
 				} else {
 					this._scheduledPostCompactionContinuationMessages = [];
@@ -7962,15 +8950,99 @@ export class AgentSession {
 			}
 			return;
 		}
+		await this._runDirectContinuation(continuationMessages, undefined);
+	}
 
-		this._postCompactionContinuationScheduled = false;
+	/** Terminal-close a matching retry when its owned continuation cannot start. */
+	private _finishMatchingRetryAfterContinuationFailure(message: string): void {
+		if (this._retryAttempt > 0) {
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: message,
+			});
+			this._retryAttempt = 0;
+		}
+		this._retryAuthFailureSources = [];
+		this._resolveRetry();
+	}
+
+	/** Strip the rebuilt terminal overflow error so idle recovery can call `continue()`. */
+	private _prepareOverflowRecoveryContinuation(): void {
+		const lastMessage = this.agent.state.messages.at(-1);
+		if (lastMessage?.role === "assistant" && lastMessage.stopReason === "error") {
+			this.agent.state.messages = this.agent.state.messages.slice(0, -1);
+		}
+	}
+
+	/** Matching overflow-retry continuation: the retry machinery runs the continue; wait it out and fence/close. */
+	private async _runDirectContinuationUnderMatchingRetry(
+		continuationMessages: AgentMessage[],
+		windowAtEntry: ContinuationSettlementWindow | undefined,
+	): Promise<void> {
+		const revisionAtEntry = windowAtEntry?.revision ?? 0;
+		// The operation's OWN owner set: an overflow recovery inside a mixed
+		// window fences only its captured subset; a plain continuation owns the
+		// whole window.
+		const operationOwners =
+			windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0
+				? [...windowAtEntry.overflowRecoveryOwners]
+				: [...(windowAtEntry?.owners ?? [])];
+		// Hand off the schedule-time pause (held for prompt-owned continuations)
+		// so B stays blocked while the retry chain finishes; otherwise acquire.
+		const queuedWorkPause = this._continuationSchedulingPause ?? this.acquireQueuedWorkPause();
+		this._continuationSchedulingPause = undefined;
+		let closed = false;
 		try {
-			await this.agent.continue();
-			this._forgetConsumedPostCompactionContinuations(continuationMessages);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			if (message.includes("already processing")) {
-				this._schedulePostCompactionContinue();
+			if (
+				windowAtEntry !== undefined &&
+				this._continuationSettlementWindow === windowAtEntry &&
+				windowAtEntry.revision === revisionAtEntry &&
+				windowAtEntry.state !== "parked"
+			) {
+				windowAtEntry.state = "running";
+			}
+			const previousOwners = this._lastRunPromptIds;
+			try {
+				await this.waitForRetry();
+				await this._agentEventQueue;
+			} finally {
+				this._lastRunPromptIds = previousOwners;
+			}
+			const windowNow = this._continuationSettlementWindow;
+			const sameWindow =
+				windowAtEntry === undefined
+					? windowNow === undefined
+					: windowNow === windowAtEntry && windowAtEntry.revision === revisionAtEntry;
+			if (windowAtEntry !== undefined && (!sameWindow || windowAtEntry.state === "parked")) {
+				return;
+			}
+			const stopReason = this._lastRunTerminalStopReason;
+			this._lastRunTerminalStopReason = undefined;
+			this._provisionalOverflowContinuationOwners = [];
+			this._applyCapturedContinuationTerminalFence(operationOwners, stopReason);
+			if (windowAtEntry === undefined) {
+				this._forgetConsumedPostCompactionContinuations(continuationMessages);
+				closed = this._cancelPostCompactionContinue();
+			} else if (sameWindow) {
+				if (operationOwners.length === windowAtEntry.owners.length) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+					closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				} else {
+					// Mixed window: only the finished overflow subset is removed; the
+					// sibling A obligation and its messages survive untouched; the
+					// direct-run pause transfers to A's rearmed scheduling fence
+					// (never released here).
+					closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+				}
+			}
+		} finally {
+			if (this._continuationSchedulingPause !== queuedWorkPause) {
+				queuedWorkPause.release();
+			}
+			if (closed) {
+				this._scheduleAutoRefineAfterAgentEnd();
 			}
 		}
 	}
@@ -8704,6 +9776,10 @@ export class AgentSession {
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
 	): Promise<boolean> {
+		// Group 4 generation producer: capture the deduped run-owner snapshot
+		// BEFORE any await so a later run (auth/extension wait, provider call)
+		// can never re-read or overwrite the owners this compaction belongs to.
+		const compactionOwners = [...new Set(this._lastRunPromptIds)];
 		// Any compaction consumes a pending model request and honors its instructions
 		// (overflow recovery can fire first and take the request with it).
 		const pending = this._pendingRequestedCompaction;
@@ -8718,13 +9794,49 @@ export class AgentSession {
 		this._continueAfterThresholdCompaction = false;
 
 		// A requested compaction stopped the loop on purpose; don't stall if it fails.
+		// Prompt-owned resume only when the SAME run must continue; merely queued
+		// unrelated work stays a generic ownerless scheduler wake (no window).
 		const resumeAfterFailure = () => {
-			if (
-				reason === "requested" &&
-				(shouldContinueAfterCompaction || this.agent.hasQueuedMessages() || this.hasPendingSessionWork)
-			) {
+			if (reason !== "requested") return;
+			if (shouldContinueAfterCompaction) {
+				if (settleContinuationObligation()) this._schedulePostCompactionContinue();
+				return;
+			}
+			if (this.agent.hasQueuedMessages() || this.hasPendingSessionWork) {
 				this._schedulePostCompactionContinue();
 			}
+		};
+
+		const settleContinuationObligation = (): boolean => {
+			// Prompt-owned create/extend of the settlement window happens BEFORE
+			// any old run/retry ownership can release (the caller's lease release
+			// comes after this function returns). Ownerless obligations skip the
+			// window and remain the legacy scheduler-only path.
+			const scheduled = this._scheduleContinuationForObligation(compactionOwners, [
+				...this._postCompactionContinuationMessages,
+			]);
+			if (scheduled && reason === "overflow" && this._continuationSettlementWindow) {
+				// Overflow recovery must run directly before unrelated queued work:
+				// it owns the EXACT owner snapshot whose retry/recovery is active
+				// (a strict subset when an unrelated A already owned the window; a
+				// still-pending earlier overflow subset is preserved, never
+				// overwritten by a newer overflow extension).
+				const window = this._continuationSettlementWindow;
+				window.overflowRecoveryOwners = [...new Set([...window.overflowRecoveryOwners, ...compactionOwners])];
+				// Stamping the subset into an already-armed window changes the
+				// dispatch priority: the create/extend helper may have armed the
+				// scheduler as pump-owned (tracked sibling) BEFORE the subset was
+				// visible. Re-arm AFTER the subset is visible so the overflow
+				// subset owns the next continuation dispatch (and the queued-work
+				// scheduling fence is re-acquired/retained synchronously before
+				// `_runAutoCompaction` finally wakes the pump). An unarmed/parked
+				// window is left unarmed: the caller `_schedulePostCompactionContinue`
+				// arms after the subset is already visible.
+				if (this._postCompactionContinuationScheduled) {
+					this._rearmPostCompactionContinue();
+				}
+			}
+			return scheduled;
 		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
@@ -8764,6 +9876,16 @@ export class AgentSession {
 				willRetry,
 				customInstructions,
 			});
+			// Only successful threshold/requested compaction bumps generation for
+			// the captured active owners; overflow/manual never bump. This happens
+			// for every successful threshold/requested compaction regardless of
+			// whether a continuation obligation exists (bump and window are
+			// decoupled).
+			if (reason === "threshold" || reason === "requested") {
+				for (const owner of compactionOwners) {
+					this._promptSettlementTracker.bumpTraceGeneration(owner);
+				}
+			}
 			// Queued work lives in both the agent queues and the session-owned queues.
 			const hasQueuedMessages = this.agent.hasQueuedMessages() || this.hasPendingSessionWork;
 			const willContinueAfterCompaction = willRetry || shouldContinueAfterCompaction || hasQueuedMessages;
@@ -8775,12 +9897,42 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 
+				// Successful overflow compaction that will retry: the initial
+				// overflow assistant error is provisional — recovery is
+				// authoritative, so the terminal error fence must be suppressed
+				// for these owners once. The continuation obligation is created
+				// (or extended) BEFORE the old run ownership can release.
+				if (reason === "overflow") {
+					if (!settleContinuationObligation()) {
+						// Acquisition failed: fail closed and return non-retry. The
+						// terminal owner fence of the overflow run proceeds normally
+						// (no provisional suppression -> failed/run_error after the
+						// run lease release) and the old retry window is resolved so
+						// nothing retries this chain; separate legacy ownerless
+						// queued work keeps its own scheduling behavior.
+						this._resolveRetry();
+						return false;
+					}
+					this._provisionalOverflowContinuationOwners = [...compactionOwners];
+				} else if (reason === "threshold" || reason === "requested") {
+					settleContinuationObligation();
+				}
 				this._schedulePostCompactionContinue();
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 				return true;
-			} else if (shouldContinueAfterCompaction || hasQueuedMessages) {
-				// Compaction can intentionally stop a tool loop between turns.
-				// Queued follow-up/steering/custom messages can also be waiting.
+			} else if (shouldContinueAfterCompaction) {
+				// The same run must resume (threshold/requested compaction stopped a
+				// tool loop with prompt-owned continuation work). Arm only after the
+				// create/extend transaction owns the entire obligation.
+				if (settleContinuationObligation()) {
+					this._schedulePostCompactionContinue();
+					this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
+				}
+			} else if (hasQueuedMessages) {
+				// Only unrelated agent-level queued work / independent session
+				// actions: generic ownerless scheduler wake. It continues through
+				// `agent.continue()` or the session pump and NEVER reads
+				// `_lastRunPromptIds` or creates/extends a settlement window.
 				this._schedulePostCompactionContinue();
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 			} else {
@@ -10855,13 +12007,54 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
+		this._abortRetry(false);
+	}
+
+	private _abortRetry(preserveContinuationSettlement: boolean): void {
+		const window = this._continuationSettlementWindow;
+		const overflowOwners = window?.overflowRecoveryOwners ?? [];
+		const hasRetry =
+			this._retryPromise !== undefined || this._retryAttempt > 0 || this._retryAbortController !== undefined;
+		if (!preserveContinuationSettlement && window !== undefined && overflowOwners.length > 0) {
+			// `abortRetry()` is NOT a prompt abort. The non-empty overflow subset
+			// is the authoritative overflow-recovery classification: it fail-fences
+			// exactly those owners even when no provider retry tuple exists
+			// (first-error overflow creates no `_retryPromise`/`_retryAttempt`). An
+			// unrelated A sharing the window and generic/threshold work are
+			// unaffected. The exact overflow subset is removed/released or the
+			// whole window is closed when the subset was the entire window.
+			if (overflowOwners.length === window.owners.length) {
+				for (const owner of overflowOwners) {
+					this._promptSettlementTracker.recordFailure(owner, "run_error");
+				}
+				this._cancelPostCompactionContinue({ owners: "fail" });
+			} else {
+				for (const owner of overflowOwners) {
+					this._promptSettlementTracker.recordFailure(owner, "run_error");
+				}
+				// The schedule-time queued-work pause transfers to A's rearmed
+				// obligation: the same fence keeps unrelated queued work behind A
+				// until A's own terminal fence/close.
+				this._removeOverflowRecoverySubset(window, this._continuationSchedulingPause);
+			}
+		} else if (
+			!preserveContinuationSettlement &&
+			this._continuationSettlementWindow === undefined &&
+			hasRetry &&
+			this._retryAttempt > 0 &&
+			this._autoCompactionAbortController !== undefined
+		) {
+			// Zero-owner overflow compatibility: an active overflow compaction plus
+			// retry tuple classifies its ownerless scheduler as retry recovery, not a
+			// generic wake. There are no owners to fence.
+			this._cancelPostCompactionContinue();
+		}
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
 			return;
 		}
 		if (this._retryAttempt > 0) {
 			this._autoCompactionAbortController?.abort();
-			this._cancelPostCompactionContinue();
 			this._emit({
 				type: "auto_retry_end",
 				success: false,

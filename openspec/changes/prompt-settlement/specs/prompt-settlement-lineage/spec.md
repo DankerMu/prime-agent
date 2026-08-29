@@ -77,13 +77,83 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 
 #### Scenario: compaction continuation 不提前结算
 
-- WHEN run 结束时调度了 post-compaction continuation（timer 持有）
-- THEN 在 continuation 的 run 完成前不产生 outcome；continuation 完成后产生一个 `completed` outcome
+- WHEN run 成功完成 threshold/requested compaction并确认存在该prompt-owned post-compaction work，随后调度continuation（timer持有）
+- THEN session在旧run/retry ownership释放前捕获该run全部去重owners并各取得一份独立`compaction_continuation` lease；在continuation run（含其retry或再次compaction）完成前不产生outcome，最终每owner各产生一次`completed`
+
+#### Scenario: compaction generation 与 continuation obligation 解耦
+
+- WHEN prompt-owned run成功完成threshold/requested compaction但没有willRetry、tool/custom continuation或其他属于该prompt的post-compaction work
+- THEN 对captured owners的`traceGeneration`仍各+1，但不建立空的continuation lease/timer；owners可在现有owned work结束后正常settle
+
+#### Scenario: unrelated queued work 不扩展 continuation owner
+
+- WHEN A的compaction后只因session中存在独立prompt B的queued action而需要唤醒scheduler，且不存在A自己的post-compaction work
+- THEN scheduler可以运行B，但不得把A放入continuation window、不得让A等待B，也不得把B并入A的captured owner tuple
+
+#### Scenario: staged ownerless continuation 保持既有 timer 行为
+
+- WHEN #30接入autonomous lineage之前，settlement-excluded autonomous/background continuation或既有private scheduler seam没有active prompt owner但确有continuation work
+- THEN session保留100ms continuation/message处理与internal rearm行为，但不创建settlement lease；它与只唤醒queued prompt的generic wake仍为不同分类
+
+#### Scenario: continuation owner acquire 失败时 fail closed
+
+- WHEN为A/B真实obligation建立或扩展window时，B的`compaction_continuation` acquire失败
+- THEN本次已取得的new sibling leases逆序release，existing window保持原样；本次obligation不得在无完整ownership下执行，受影响的当前run owners最终为`failed/run_error`，不得取消或提前关闭旧window owners
+
+#### Scenario: continuation 重排与内部 reschedule 保持原 owner
+
+- WHEN prompt A 的continuation因B run、session pump、queued-work pause或`agent.continue()`报告already-processing而reschedule
+- THEN timer只rearm同一个captured owner/lease tuple，不回读B的`_lastRunPromptIds`、不重复acquire/release；A的continuation最终只释放A在调度时捕获的leases
+
+#### Scenario: overlapping compaction obligation 扩展 owner 而不重开 window
+
+- WHEN A continuation仍scheduled/parked/running时，prompt B的run成功完成另一次需要continuation的compaction
+- THEN existing window原子扩展B中尚未captured的owners与对应独立leases，并合并本次obligation snapshot；A/B均等待后续continuation，任一identity不被合并或提前终态
+
+#### Scenario: continuation 自身 retry 继承 captured owners
+
+- WHEN post-compaction `agent.continue()` 先以retryable provider error结束、随后retry成功
+- THEN group3 retry window对continuation captured owners逐id取得retry leases；continuation leases在retry chain结束前不释放，最终每owner只有一个completed outcome
+
+#### Scenario: continuation terminal fence 不被后续 run 覆盖
+
+- WHEN continuation retry结束会唤醒session pump，且另一prompt B仍在可执行队列
+- THEN session在continuation的captured owners、最终assistant stopReason与leases完成terminal fence/close前保持scheduler隔离；B不得先启动并覆盖continuation的owner或terminal signal。close后release scheduler pause必须重新唤醒pump，B随后按自己的identity实际启动并完成，不得因pause期间被拒绝的pump请求永久stall
+
+#### Scenario: overflow recovery 不继承 provisional failure且不丢后续 prompt wake
+
+- WHEN A run以context overflow error结束，successful overflow compaction调度willRetry continuation，独立prompt B已排队，且A continuation recovery分别成功或以terminal error结束
+- THEN原overflow assistant error不把A永久fence为failed；成功支A outcome为completed，terminal-error支A为failed/run_error，overflow均不bump generation。两支中A terminal fence与continuation close前B provider call均为0；scheduler pause release后B provider call恰为1并按B自己的promptId完成，不得因pause期间`_resolveRetry`的pump request被拒绝而stall
+
+#### Scenario: manual compaction 暂存并恢复既有 continuation ownership
+
+- WHEN scheduled continuation存在时执行普通manual compaction，manual path在通用abort取消timer前先park window，并在成功后恢复continuation
+- THEN原captured owners/lease instances在park/resume期间持续有效且不出现0-lease窗口或fresh owner回读；普通manual compaction失败/取消对window owners先置cancel fence再exact-once close（完整current/inherited abort清理由组6补齐）
+
+#### Scenario: skipAbort manual failure 保留既有 continuation
+
+- WHEN scheduled continuation存在时以`compact(...,{skipAbort:true})`执行manual compaction且compaction失败或skipped
+- THEN原timer/window/owners/leases保持scheduled并可继续执行，不因一次未abort的compaction失败而close、release或重复acquire
 
 #### Scenario: 非 abort 原因取消 continuation 推导为 completed
 
-- WHEN run 正常结束后调度了 post-compaction continuation，随后因排队 continuation 被清空（非 abort、非 dispose）而取消该 continuation
-- THEN lease 释放且无 cancel/failure fence，outcome 为 `completed`——主 run 已正常完成，continuation 不再需要；不产生第二个 outcome
+- WHEN run正常结束后调度了post-compaction continuation，随后因排队work清空、branch invalidation或确认无后续work（非prompt abort、非dispose）而取消该obligation
+- THEN对应continuation leases只release、不置cancel/failure fence，outcome为`completed`——主run已正常完成且continuation不再需要；不产生第二个outcome
+
+#### Scenario: explicit abort 关闭 continuation window 推导为 cancelled
+
+- WHEN scheduled/running continuation存在时调用`requestAbort()`或`abortForUpdateRestart()`
+- THEN captured window owners在lease release前先置cancel fence，window/timer detach-first且每个lease只release一次，不得错误`completed`或永久settling；完整current/inherited owner清理由组6共用同一cancel顺序
+
+#### Scenario: abortRetry 停止 overflow continuation 推导为 failed
+
+- WHEN successful overflow compaction已建立willRetry continuation window，调用方执行`abortRetry()`停止该retry continuation
+- THEN session对captured owners记录`run_error`后exact-once关闭retry与continuation leases，outcome为`failed`而非`cancelled`或`completed`；重复abort/close为no-op
+
+#### Scenario: dispose 先原子结算再关闭 continuation resources
+
+- WHEN session dispose时仍有scheduled/running continuation window
+- THEN session先按dispose requirement对全部active prompts执行atomic `cancelled + released` settlement，再detach window并对其lease做无副作用的exact-once close；不得先由最后一份continuation lease产生未released终态
 
 #### Scenario: lease 交接无空窗
 
@@ -165,17 +235,32 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 
 ### Requirement: traceGeneration 计数
 
-`traceGeneration` MUST 在 admission 时为 0，每当该 prompt 所属的 run（当前执行 run 的 owner；run 结束边界上为刚结束 run 的 prompt）完成一次 compaction（threshold 或 requested）时 +1，并在终态 outcome 中固定；本 change 不消费该值。
+`traceGeneration` MUST 在admission时为0；每当该prompt所属run成功完成一次threshold或requested compaction时，对该compaction开始时捕获的每个owner恰好+1，并在终态outcome中固定。失败/skipped/cancelled、manual与overflow compaction不得递增；是否需要post-compaction continuation不影响本次generation计数。本change不消费该值。
 
 #### Scenario: compaction 计数
 
-- WHEN prompt 的 run 触发一次 threshold compaction 并经 continuation 完成
-- THEN outcome 的 `traceGeneration === 1`；无 compaction 的 prompt 为 0
+- WHEN prompt 的run成功完成一次threshold/requested compaction并经需要的continuation完成
+- THEN outcome的`traceGeneration === 1`；无compaction为0
+
+#### Scenario: 无 continuation 的成功 compaction 仍计数
+
+- WHEN prompt的run成功完成threshold/requested compaction但没有该prompt-owned post-compaction work
+- THEN outcome可直接settle，且`traceGeneration === 1`，不因没有timer而漏计
+
+#### Scenario: multiple owner 与多代 continuation
+
+- WHEN `"all"`共享run的A/B成功完成一次compaction，随后continuation run再次成功完成一次threshold/requested compaction
+- THEN A/B各自generation从0→1→2；每次compaction对每owner只bump一次
+
+#### Scenario: 非计数 compaction 与失败不 bump
+
+- WHEN prompt经历manual或overflow compaction，或threshold/requested compaction失败、跳过或取消
+- THEN该事件不改变prompt的traceGeneration
 
 #### Scenario: 后台 compaction 不计入他人
 
-- WHEN prompt A 已终态后，session 因另一 prompt B 发生 compaction
-- THEN A 的 outcome `traceGeneration` 不变，B 的计数 +1
+- WHEN prompt A 已终态后，session 因另一prompt B发生成功threshold/requested compaction
+- THEN A的outcome `traceGeneration`不变，B的计数+1
 
 ### Requirement: session 结算 API 与事件
 

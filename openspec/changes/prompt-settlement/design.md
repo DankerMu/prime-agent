@@ -92,11 +92,11 @@ export class PromptSettlementTracker {
 | --- | --- | --- | --- |
 | 主 run（含排队期、同步 tool/子 Agent） | `_admitSessionInput` accepted分支在 enqueue前，以 action每个 promptIds owner取独立 `"run"` lease并存到 action；preparing不再 acquire。`"all"` 合并时共享 run owners为 action promptIds并集 | action completion/terminal error/实际取消时各自释放已存 leases；错误先逐 owner `recordFailure("run_error")`。排队期lease保证 accepted action无0-lease limbo | 同 owner可因父 action+inherit action并存多个 run lease。session command无 promptIds/lease；`:5608`不参与；`:6036`只释放实际 removed accepted turn的已有 lease |
 | provider retry 窗口 | 同步 `agent_end` pre-arm与`_handleRetryableError` defensive fallback共用一个idempotent helper：首次建立window时捕获当下 `_lastRunPromptIds` 去重快照，对每个owner all-or-nothing取一份 `"retry"` lease，全部成功后才发布Promise/resolve/lease state | 唯一 `_resolveRetry` 漏斗先detach Promise/resolve/captured leases，再逐实例release并resolve原waiters；成功、耗尽、禁用、sleep cancel、overflow/compaction结束与abort均复用 | retry属于该共享run的全部prompt owner；同一chain多个error `agent_end`不重复acquire；snapshot随后变化不串owner；background/no-owner window允许零lease；先全部acquire再允许旧run lease释放 |
-| post-compaction continuation | `_schedulePostCompactionContinue`（`:7377`）置 `Scheduled=true` 时，对 `_lastRunPromptIds` 中每个 owner 取 `"compaction_continuation"` lease | `_cancelPostCompactionContinue`（`:7277`）、继续路径 `agent.continue()` 返回/抛出后、以及各提前 return 分支逐个释放 | 重排（`:7400-7404` 的 reschedule）沿用同一组 lease，不重复 acquire。非 abort 的取消路径（`_clearQueuedAutonomousContinuations` `:2802`、auto-refine 分支失效）只 release、不 `requestCancel`：此时主 run 已正常结束、continuation 不再需要，推导为 `completed` 是**预期结果**，不是误判 |
+| post-compaction continuation | successful threshold/requested compaction或requested/overflow恢复路径确认需要后续run时，以当次run owner快照建立/扩展一个runtime continuation window：对missing owner all-or-nothing取独立`"compaction_continuation"` lease；同一真实obligation复用tuple，internal rearm不得读新owner | 单一close先detach timer/window/owner/lease state，再逐实例release；真实取消、确认无work、terminal结束/throw走close；busy/pump/already-processing与manual park/resume只rearm/转移同一tuple不release | schedule时旧run/retry ownership仍在，禁止0-lease空窗。runner在`agent.continue()`前临时安装captured owners到`_lastRunPromptIds`供group3 retry继承，等待continue+retry+event queue后按最终stopReason fence。overlapping真实compaction obligation原子扩展missing owners；非abort取消只release不`requestCancel` |
 | autonomous threshold continuation（session 内部入队） | `_queueAutonomousContinuationForThresholdCompaction` 创建 action 时标 `lineage: { inherit: promptIds }`，其中 promptIds 是触发它的共享 run owner 快照；后续按"主 run"行逐 owner 挂 lease | 同主 run | 一个 continuation action 可以继承多个 promptId，但只执行一次；不得为每个 owner 重复入队同一 continuation，也不得任意选择一个 owner |
 
 - **promptId admission**：turn action新增非空 `promptIds` 与同长度/owner对应的 `runLeases`。公共 action单 owner，内部 inherit可多 owner。`_createPreparedTurnAction` 只准备候选/lineage；`_admitSessionInput` 通过所有 pre-admission检查后、enqueue前：default先 admit再 acquire一个 run lease，inherit校验每个 owner仍 settling并逐 owner acquire（同 kind实例允许并存）；任一 owner已终态则放弃整个 inherit action且不入队。host internalPrompt总是新的单 owner；session command无这些字段。
-- **共享 run owners**：当前 pump 在 `steeringMode`/`followUpMode === "all"` 时会把多个 turn action 合并为一次 `agent.prompt(preparedMessages)`，因此 owner 不能用单数表示。session 在调用 `agent.prompt` 前把本次所有 turn action 的 promptIds 去重为 `_lastRunPromptIds: string[]`，同时设置 `_currentRunOwners`；retry 对 `_lastRunPromptIds`、compaction continuation 对调度时捕获的 owner 快照逐 id 调用现有 tracker API。tracker 仍按单个 promptId 记账，不新增集合类型、不合并 promptId，也不改变 `"all"` batching userspace。消息归属使用 `_currentRunOwners`（D5）；A 的 continuation 被 B 重排时使用 A 在调度时捕获的 owner/lease 组，不读取已被 B 覆盖的 `_lastRunPromptIds`。
+- **共享 run owners**：当前 pump 在 `steeringMode`/`followUpMode === "all"` 时会把多个 turn action 合并为一次 `agent.prompt(preparedMessages)`，因此 owner 不能用单数表示。session 在调用 `agent.prompt` 前把本次所有 turn action 的 promptIds 去重为 `_lastRunPromptIds: string[]`，同时设置 `_currentRunOwners`；retry 对 `_lastRunPromptIds`、compaction continuation 对调度时捕获的 owner 快照逐 id 调用现有 tracker API。tracker 仍按单个 promptId 记账，不新增集合类型、不合并 promptId，也不改变 `"all"` batching userspace。A 的 continuation 被 B 重排时继续使用 A 的captured owner/lease tuple；runner调用`agent.continue()`前临时把A owners安装到`_lastRunPromptIds`，使continuation内group3 retry继承A而不是B或zero-owner，结束后恢复此前snapshot。消息归属仍由组7使用 `_currentRunOwners`（D5）。
 - **steer/followUp**：`steer()`（`:4850`）、`followUp()`（`:4883`）与 `/goal` 斜杠命令的 goal context 入队（`_runOrQueueGoalContext` `:2063`，由用户命令触发）都经 `_createPreparedTurnAction` 缺省 lineage → 新 promptId；它们不会并入正在结算的 prompt，即使随后因 `"all"` batching 与其他 action 共享一次 run——共享 run 只使各自 outcome 等待同一份 run-owned work，不合并 lineage identity。
 - **abort 与清队边界**：挂点是 `requestAbort()`。普通 abort保留真正的可见用户队列，但必须先识别并移除当前 owners的内部 inherited autonomous actions（即使其 `queueVisible` 默认 true，它们也不是用户队列）：对其 owners置 cancel fence并释放action已存 leases；同时取消/释放 compaction continuation leases，再对当前 run owners requestCancel，当前 action completion最终释放自己的 run leases。`clearQueue`/mutate delete/abortAndClearQueue取消实际移除的用户 action：default先cancel再release，inherit非-abort只release。任何取消路径禁止临时 acquire或让终态 inherit action恢复后执行。
 - **dispose**：`dispose()`（`:3976`）在拒绝 `_agentMessageOutcomes`（`:4009-4013`）的同一处调用 `tracker.settleAll("cancelled", "session_disposed", { released: true })`。终态、released fence、persist、emit 与 waiter resolve 在一次同步操作内完成，不再随后逐项 `release()`；每个 prompt 因而仍只有 admission 与终态/released 两条 ledger 记录。
@@ -111,7 +111,7 @@ export class PromptSettlementTracker {
 ### D5 `finalMessageIds` 与 `traceGeneration`
 
 - `finalMessageIds`：组2先建立 `_currentRunOwners` owner snapshot但不记录消息（因此组2 outcome保持空数组）；组7再在主 agent `message_end` 事件写入 JSONL 的 **assistant** message entry `id`，归属于 **`_currentRunOwners`**——session 在每个主 agent run 开始时设置、结束时清空的 promptId 去重数组：普通 dispatch 取本次所有 turn action 的 `promptIds`；`_runScheduledPostCompactionContinue` 调用 `agent.continue()` 前取该 continuation 调度时捕获的 owner 快照、返回/抛出后清空；retry 的续跑发生在同一次 action dispatch 内（`:5784` `waitForRetry` 先于 completion settle），owners 不清空。每条 assistant entry 对 owners 逐 id 调 `recordFinalMessage`，所以共享 run 的各 prompt 都记录同一真实输出。这样即使 prompt B 在 A 的 continuation 待执行期间先行运行（`:7398-7404` 的重排路径），B 的消息归 B、A 的 continuation 消息归 A。不以"是否持有 lease"或当前 `_lastRunPromptIds` 推断迟到 continuation 归属；run 之外（`_currentRunOwners` 为空）追加的 assistant 消息不记录。`completed` 时为完整列表；`cancelled/failed` 时为已追加的部分。
-- `traceGeneration`：该 prompt 持有 lease 期间每次 compaction（threshold 或 requested）完成后 +1，admission 时为 0；`bumpTraceGeneration` 在 compaction 完成回调处对当前 `_currentRunOwners` 调用，若回调位于 run 结束边界则使用为该 compaction 捕获的 owner 快照，逐 id 递增（主题 4 的 review coverage 将对比它）；本 change 只计数不消费。
+- `traceGeneration`：该 prompt 持有 lease 期间每次successful threshold/requested compaction完成后 +1，admission时为0；manual与overflow compaction不计入该prompt trace generation。组4在compaction成功边界使用为该compaction捕获的owner snapshot逐id `bumpTraceGeneration`（不能读取已被后续run覆盖的 `_currentRunOwners`/`_lastRunPromptIds`）；continuation run再次成功threshold/requested compaction则同一owners再+1。组7复用同一snapshot记录message ids；本change只计数不消费。
 - `sessionEpoch`：取 `_sessionInputArrivalEpoch`（`:1112`）在 admission 时刻的值。
 
 ### D6 持久化与恢复（压测分支 3）
@@ -404,3 +404,94 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不实现compaction/autonomous leases、traceGeneration、active abort/dispose fence、finalMessageIds、ledger/recovery或任何mode/wire变化。
 - 不改变哪些provider错误可retry、maxRetries算法、backoff、event payload/order或error-message清理；发现这些问题只报告不顺手修。
+
+## Issue #29 implementation fixture
+
+Fixture level: expanded（上游建议compact；本切片引入100ms timer-owned work、取消/rearm、multi-owner扩展与retry/compaction handoff，命中mandatory expanded triggers）
+Repair intensity: high（continuation跨越action、timer与多个Agent run；owner或lease任何空窗/串线都会不可逆提前settle或永久settling）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts` 的successful compaction owner capture/generation、`_schedulePostCompactionContinue`、`_cancelPostCompactionContinue`、`_runScheduledPostCompactionContinue`、manual compact park/resume与现有retry/terminal fence组合；focused settlement/compaction/queue tests。tracker API不变。
+- Must preserve: 100ms timer、auto-refine pending语义、agent/session-owned queue draining、`already processing`重试、manual compact成功/失败/skipAbort行为、overflow recovery、retry事件/attempt/backoff、public prompt/AgentMessageOutcome timing、action recovery/wire，以及`_postCompactionContinuationMessages` autonomous bookkeeping。
+- Must add: generation对successful threshold/requested compaction的exact owner计数；只为真实prompt-owned post-compaction obligation持continuation leases；captured owner tuple跨rearm/reorder/manual park稳定；continuation内retry/compaction正确handoff；单一terminal close。
+- Staged boundary: autonomous action inherit producer（#30）仍暂用background exclusion；#29只清理自己新增的continuation-window资源。显式`requestAbort`/update-restart、普通manual-abort失败与dispose过渡路径对window owners先置cancel fence；`abortRetry()`只停止retry，不是prompt abort，因此对overflow continuation owners记录`run_error`后close。这样本切片单独合并后不会错误`completed`或永久settling。#31再补current owners、internal inherited actions、可见队列边界，并把dispose的session-wide `settleAll(...,{released:true})`移到window close之前；`_currentRunOwners`/finalMessageIds（#32）、ledger/restart与mode/wire（#33+）不实现。
+- Seam under test: in-process AgentSession + faux provider + fake timers；直接spy tracker `acquire("compaction_continuation")`、returned lease object release与`bumpTraceGeneration`。只观察scheduled boolean或最终outcome不足以证明owner/lease/generation。
+
+### Continuation-window ownership contract
+
+- **Generation producer**：`_runAutoCompaction`进入任何`await`前固定该次去重run-owner snapshot，避免auth/extension/provider等待期间另一run覆盖；仅successful threshold/requested在成功边界逐active owner `bumpTraceGeneration`一次。pump在调用pre-turn compaction前已安装即将执行batch的owners，且其admission run leases覆盖准备阶段，所以owned pre-turn success计入该batch；真正无identity owner的background/private pre-turn不bump。failed/skipped/cancelled、manual与overflow不bump；无continuation work仍bump，不创建window。unknown/terminal mutation自然no-op，不改其他prompt或cached outcome。
+- **Schedule caller classification**：scheduler flag/timer与settlement window是正交状态。实现必须给每个调用点选择且仅选择一类：(1) successful `willRetry`、`shouldContinueAfterCompaction`，或requested失败后`shouldContinueAfterCompaction`为prompt-owned window create/extend + scheduler arm；(2) #30前settlement-excluded autonomous/background continuation与既有no-owner private seam为legacy ownerless scheduler obligation（100ms timer、零settlement lease）；(3) 仅agent-level queued message或independent session action为ownerless generic scheduler wake，前者继续走`agent.continue()`，后者走session pump；(4) busy/pump/`already processing`为原scheduler obligation internal rearm；(5) manual compact为window/scheduler park/resume；(6) `requestAbort`、update-restart、dispose、branch/no-work invalidation与`abortRetry` failure-close为close policy。tracked `_postCompactionContinuationMessages`只是obligation/message证据，不能把独立queued B并入captured owners。
+- **Create/extend事务**：新window捕获去重active owners、obligation messages，对全部owners all-or-nothing acquire；partial失败逆序release本次siblings且不发布tuple。已有window收到新的真实obligation时，先求missing owners/messages，all-or-nothing acquire missing owners后再原子扩展并递增revision；相同owner重复obligation不重复lease。若create失败，本次全部owners记录`run_error`；若extend失败，只对未被旧window覆盖的本次owners记录`run_error`，旧owners/window不变。本次prompt-owned obligation/message/action不得作为这些失败owners的owned work继续或混入旧window；overflow `willRetry`须返回non-retry/resolve旧retry window，其他legacy ownerless queued work仍可按自身既有调度运行。不得cancel失败owners或破坏旧window。
+- **Internal rearm / generic wake**：busy（streaming/compacting/retrying/pause）、pump ownership、`already processing`与100ms timer重试只改变scheduler state，复用同一obligation snapshot且不读取`_lastRunPromptIds`、不扩owner、不release。#30前legacy ownerless continuation保留相同timer/message行为但无settlement window。generic wake可保持现有timer：agent-level queue最终`agent.continue()`，session action先pump；若pump消费tracked continuation message，window须等该action及event queue结束后close；若只消费unrelated B，则A window rearm不close。两者都不得伪造或扩展window。manual compact在调用会触发`abort()`前先park window和scheduler timer：clear timer但保留tuple/leases，并以operation-local one-shot preserve token只让这次紧邻internal `abort()`跳过window close；任何外部/concurrent abort仍cancel+close。成功rearm原状态；普通manual失败/取消cancel+close；`skipAbort:true`不调用abort且无论成功或failed/skipped都resume。
+- **Runner isolation/handoff**：direct `agent.continue()`路径先取得queued-work pause，并在install captured owners→clear terminal signal→continue→wait group3 retry chain→wait `_agentEventQueue`→capture/fence final stopReason期间持有，防retry close唤醒pump启动B；临时`_lastRunPromptIds=capturedOwners`使group3继承正确owners。该run的terminal signal在fence后被消费，finally只恢复此前owner snapshot，不把stale prior terminal signal写回。terminal fence与detach-first close/rearm在pause内完成；随后必须release pause，并以该release现有的`_scheduleSessionInputPump()`作为权威post-fence wake（或release后显式再schedule），最后才触发可与B并行的post-close auto-refine observer。pause期间`_resolveRetry`/close发出的pump请求允许被门闩拒绝，但不得成为唯一唤醒。matching overflow-retry continuation可在`isRetrying`时执行并结束其retry window，其他unrelated retry/busy才rearm，避免`isRetrying`自锁。session-action pump路径不能持pause：先捕获window identity/revision/message snapshot，schedule并await当次`_sessionInputPump`及`_agentEventQueue`；tracked continuation message被该action消费时才可在action terminal后close，若pump仅运行unrelated B则rearm原window。两条路径结束都比较window identity/revision，不得让late completion close后来扩展/rearmed的obligation。组7再在direct范围设置`_currentRunOwners`；tracked action沿普通batch owners记录，本组不做。
+- **Terminal/rearm**：若continuation run触发新的successful threshold/requested compaction并使same window revision变化，则旧runner保留/rearmwindow；否则最终`error`对captured owners `recordFailure("run_error")`、`aborted` requestCancel，然后single close。successful overflow compaction前的overflow assistant error为provisional：willRetry window建立成功后不得由主run terminal fence永久recordFailure；recovery成功completed，只有recovery terminal error failed。
+- **Close**：单一helper先detach timer/window/owners/messages/leases，再逐lease exact-once release，最后触发auto-refine/pump等observer动作；reentry/重复cancel/late timer no-op。branch invalidation、tracked work清空、确认无post-work等nonabort close只release。`abortRetry()`对overflow continuation owners先`recordFailure("run_error")`再close；`requestAbort`、update-restart、普通manual-abort失败及#29过渡期dispose先对window owners `requestCancel`再close。这只覆盖#29新增资源；#31仍负责完整abort/dispose，并须在dispose中先`settleAll(...,{released:true})`再允许任何window/action lease release。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: not selected - 无签名/CLI/AgentConnection/wire变化。
+- Config / project setup: not selected - compaction/retry配置shape与默认值不变。
+- File IO / path safety / overwrite: not selected - 不新增文件/JSONL操作；compaction persistence逻辑不改。
+- Schema / columns / units / field names: not selected - outcome/action recovery/wire shape不变；仅private runtime tuple。
+- Auth / permissions / secrets: not selected - 不改auth；既有compaction/retry auth失败回归需保留。
+- Concurrency / shared state / ordering: selected - timer、pump、manual park、overlapping obligations、retry与terminal signal交接是核心。
+- Resource limits / large input / discovery: selected - timer/rearm必须有单window、不积累timer/lease/owner数组；owner/message集合按当前obligation去重有界。
+- Legacy compatibility / examples: selected - queue/auto-refine/manual/overflow/timer/public prompt行为必须不变。
+- Error handling / rollback / partial outputs: selected - partial owner extension、continue throw、compaction failure/skipped、late timer、duplicate close与provisional overflow error必须稳定。
+- Release / packaging / dependency compatibility: not selected - 无export/dependency/build shape变化。
+- Documentation / migration notes: not selected - shared状态文档由#42更新；fixture记录staged边界。
+- TUI focus/render lifecycle: not selected - 不触碰TUI。
+- Session/extension teardown lifecycle: selected - branch invalidation/requestAbort/update-restart/dispose/manual compaction会取消或park timer；cancel fences本组与#31边界必须明确。
+
+### Required evidence
+
+- single threshold/requested：run owner在compaction成功时generation 0→1并在旧ownership释放前取得一份continuation lease；timer pending/continuation run/retry期间无outcome，最终第二个agent_end后release一次completed。成功但无post-work：generation=1、零continuation acquire/timer。
+- generation negatives/prepare boundary：无compaction为0；failed/skipped/cancelled/manual/overflow与真正ownerless pre-turn均不bump；owned pre-turn success只bump已安装的next batch owners；A终态后B successful threshold/requested只bump B；same owners的continuation再compaction到2且每代只bump一次。
+- `"all"` A/B：两owners各exact acquire/release、generation +1、一个outcome；create/extend第二owner acquire失败逆序回滚本次siblings、旧window不变，当前obligation不continue且该次run owners最终`failed/run_error`。
+- reorder/overlap：A timer pending时B普通run先执行，A tuple不变且B不并入；B自己的真实compaction obligation原子扩展B。unrelated queued action/generic 100ms wake不扩A。mutable `_lastRunPromptIds` clobber不改变release/retry targets。
+- internal rearm：busy/retrying/external pause/pump/`already processing`只rearm同一timer/window，acquire/release各不重复；late timer与重复cancel no-op。100ms时序与existing queue/auto-refine tests保持。
+- manual transfer：普通manual compact成功park/resume exact same lease；普通失败/取消对window owners cancel后close once；`skipAbort:true`成功或failed/skipped均resume scheduled window与leases。
+- direct continuation retry：first continuation agent_end retryable时group3对captured owners各取retry lease；queued B的provider call在direct fence/close前为0；window close/rearm decision完成并release pause后，B的provider call恰发生一次并按B identity完成，证明wake未丢。A最终completed once；continuation再次compaction时same window revision变化并保留，generation再+1。非`already processing` continue throw最终`failed/run_error`并close，仍须唤醒B。
+- pump handoff：tracked continuation action被pump执行时window等到action + event queue terminal再close；只运行unrelated B时A window/revision保持并rearm；不得用queued-work pause等待pump造成死锁。
+- overflow recovery + post-fence wake：initial overflow error→successful overflow compaction→willRetry continuation success = A completed/no failure；recovery terminal error=A failed/run_error；overflow不bump generation。两支都预先排队独立prompt B，并直接断言A terminal fence/continuation close前B provider calls=0，pause release后B provider calls恰为1且B按自身promptId完成，证明`_resolveRetry`在pause内被拒绝的schedule不是唯一wake。
+- close policies：branch invalidation、tracked messages移除或确认无work为release-only completed；`abortRetry()`为window-owner failure+release；`requestAbort`、update-restart与#29 dispose过渡路径为window-owner cancel+release once。#31测试并实现完整current/inherited/queue取消，以及dispose先session-wide released settle、后window close。
+- focused commands: settlement groups 2-4 + compaction/queue/retry-events/auth/action-race/autonomous/serialized-refine siblings；root check/build；strict OpenSpec；diff/stash/debug scan。
+
+### Invariant Matrix
+
+- Governing invariant: 每个真实post-compaction obligation从successful scheduling边界到其最终continue/retry/recompaction结束始终由create-time/extended owner tuple的独立continuation leases覆盖；internal rearm不改变ownership，close exact-once且generation只归successful threshold/requested compaction owners。
+- Source-of-truth identity/contract: private settlement-window tuple `{owners[i] ↔ leases[i], obligationMessages, revision, scheduled|running|parked}`与正交scheduler `{scheduled,timer,messageSnapshot}`；generation snapshot在`_runAutoCompaction`异步边界前固定。
+- Producers: `_runAutoCompaction` successful threshold/requested/overflow-willRetry与requested-failure owned-resume；manual只park/resume，queued-only caller只generic wake；每个schedule/close caller必须分类。
+- Validators/preflight: active owner/message dedup、prompt-owned vs legacy-ownerless vs generic-wake classification、existing-window missing-owner extension、tracker acquire、all-or-nothing rollback与fail-closed。
+- Storage/cache/query: runtime-only settlement window/revision + legacy-compatible scheduler timer/message snapshot；tracker Map与outcome query；recovery/wire/persist不变。
+- Public routes/entrypoints: prompt/compact skill/manual compact/queue/abort/dispose只间接触发；无新public API。
+- Frontend/downstream consumers: agent queue, session action pump, retry window, auto-refine, compaction events/outcomes, autonomous message bookkeeping, future group6/7。
+- Failure paths/rollback/stale state: partial create/extend fail-closed、busy/pump/already-processing、manual success/fail/skipAbort、branch/no-work close、requestAbort/abortRetry/update-restart/dispose、continue throw/aborted、continuation retry/recompaction、overflow provisional failure、late runner/reentry/duplicate close、B run overwrite。
+- Evidence/audit/readiness: direct acquire/release/bump spies + faux-provider/fake-timer public paths + unchanged queue/compaction/retry/auto-refine suites。
+- Regression rows:
+  - successful compaction with/without post-work -> correct generation; lease only when obligation exists。
+  - single/all owners continuation/retry/recompaction -> no early outcome, correct owner leases/generation, exact terminal。
+  - A delayed behind B / overlapping A+B obligations -> captured/extended owners exact, generic wake does not merge identities。
+  - pump consumes tracked continuation vs unrelated B -> close A only after tracked action/event completion; unrelated B only rearm A。
+  - ownerless agent queue/background/private seam -> preserve timer/continue/message behavior with zero settlement leases。
+  - create/extend failure -> rollback only new siblings, no unowned continuation, affected current owners failed while old window remains valid。
+  - manual transfer or internal rearm -> no half-open window, no 0-lease handoff, legacy behavior stable。
+  - nonabort close vs explicit abort/dispose transition -> release-only completed vs cancel+release; no duplicate outcome。
+  - overflow recovery success/failure -> provisional error suppressed, final recovery status authoritative。
+  - unchanged queue/auto-refine/manual/auth/action recovery consumers -> existing timing/events/serialization remain stable。
+
+### Boundary-surface checklist
+
+- Shared helper roots: one continuation create/extend/rearm/park/close state machine; no per-caller lease arrays。
+- Public entrypoints: unchanged; compact/prompt APIs only gain internal ownership accounting。
+- Staging/rollback: all-or-nothing owner extension before publish；failed extension禁止unowned continue；manual park retains tuple；detach-first close。
+- Producer/consumer evidence: every schedule/close caller categorized; direct lease/generation spies, not scheduled-flag-only。
+- Stale/idempotency: captured owners immutable except explicit atomic extension；revision protects newer obligation；late timer/rearm/duplicate cancel do not duplicate leases or terminal。
+- Unchanged downstream consumers: retry/auth/queue/auto-refine/autonomous/manual compaction/recovery/wire。
+
+### Non-goals for #29
+
+- 不实现autonomous action `lineage:{inherit}` producer、完整current/inherited abort清理或dispose `settleAll(...,{released:true})`最终接线、finalMessageIds、ledger/restart或mode/wire变化；本组仅给自己新增的continuation window做cancel/close过渡闭环。
+- 不改变compaction eligibility/summary/persistence、retry eligibility/backoff/events、queue visibility或auto-refine policy；发现范围外问题只报告。
