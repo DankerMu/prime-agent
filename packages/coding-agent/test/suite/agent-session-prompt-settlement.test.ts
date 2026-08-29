@@ -1,5 +1,5 @@
 /**
- * OpenSpec prompt-settlement, groups 2-4, shared session-level suite.
+ * OpenSpec prompt-settlement, groups 2-5, shared session-level suite.
  *
  * Group 2 (issue #27): action promptId + main run lease + promptAndSettle
  * API. These tests use the retry-disabled faux provider so each error is
@@ -11,17 +11,29 @@
  * see group-3 leases because the group-2 run lease already spans the retry
  * chain.
  *
+ * Group 5 (issue #30): autonomous threshold continuation inherit lineage.
+ * Production threshold/autonomous staging plus the producer seam. Tests
+ * observe exact inherited `promptIds`/`runLeases`, provider continuation
+ * count, and delayed outcomes — not timer flags or text labels.
+ *
  * Seam 2: in-process AgentSession + faux provider. Tests observe behavior
  * through the public callback / query / event APIs and read-only action-store
  * inspection. The tracker's private persist count is never observed;
  * `finalMessageIds` stays empty (group 7 records them).
  */
 
+import { existsSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentEvent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionActionRecoveryAction, SessionActionRecoveryPayload } from "../../src/core/agent-session.js";
+import type {
+	AgentSession,
+	SessionActionRecoveryAction,
+	SessionActionRecoveryPayload,
+} from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { createHeartbeatPromptMessage, createRlmChildFailureMessage } from "../../src/core/messages.js";
 import type { PromptLease, PromptLeaseKind } from "../../src/core/prompt-settlement.js";
@@ -270,6 +282,162 @@ interface ContinuationInternals {
 
 function continuationInternals(harness: Harness): ContinuationInternals {
 	return harness.session as unknown as ContinuationInternals;
+}
+
+interface InheritedRunLeaseRecord {
+	promptId: string;
+	kind: "run";
+	releaseCalls: number;
+}
+
+interface AutonomousProducerInternals {
+	_lastRunPromptIds: string[];
+	_currentRunOwners: string[];
+	_postCompactionContinuationMessages: AgentMessage[];
+	_queuedAutonomousThresholdContinuations: {
+		get(message: AssistantMessage): AgentMessage | undefined;
+	};
+	_queuedAutonomousContinuationSnapshots: {
+		get(message: AgentMessage): unknown;
+	};
+	_pendingThresholdCompactionAutonomousMessages: AgentMessage[];
+	_continuationPumpOwnerAction: unknown | undefined;
+	_continuationSettlementWindow:
+		| {
+				owners: string[];
+				leases: unknown[];
+				obligationMessages: AgentMessage[];
+				revision: number;
+				state: "scheduled" | "running" | "parked";
+				pumpOwned: boolean;
+				overflowRecoveryOwners: string[];
+		  }
+		| undefined;
+	_createPreparedTurnAction(
+		schedule: "followUp",
+		text: string,
+		images: undefined,
+		options: {
+			message?: AgentMessage;
+			resumeIfIdle?: boolean;
+			noSettlementIdentity?: boolean;
+			lineage?: { inherit: string[] };
+		},
+	): SessionAction;
+	_admitSessionInput(action: SessionAction, options?: { wake?: boolean }): { accepted: boolean };
+	_queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): Promise<AgentMessage | undefined>;
+	_clearQueuedAutonomousContinuations(options?: {
+		restoreAutonomousState?: boolean;
+		messages?: AgentMessage[];
+		cancelPostCompactionIfEmpty?: boolean;
+	}): void;
+	_runOrQueueGoalContext(kind: "continuation" | "objective_updated"): void;
+	_promptSettlementTracker: {
+		acquire(promptId: string, kind: PromptLeaseKind): PromptLease;
+		requestCancel(promptId: string): void;
+		isSettling(promptId: string): boolean;
+	};
+}
+
+function autonomousProducerInternals(harness: Harness): AutonomousProducerInternals {
+	return harness.session as unknown as AutonomousProducerInternals;
+}
+
+/**
+ * Group 5 instrumentation: wrap every `run` and `compaction_continuation`
+ * lease so inherited action ownership is observed by object identity.
+ */
+function installAutonomousInheritObserver(harness: Harness): {
+	acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }>;
+	runLeases: InheritedRunLeaseRecord[];
+	continuationLeases: ContinuationLeaseRecord[];
+	timeline: string[];
+	acquiresOfKind: (kind: PromptLeaseKind) => Array<{ promptId: string; kind: PromptLeaseKind }>;
+	restore: () => void;
+} {
+	const tracker = autonomousProducerInternals(harness)._promptSettlementTracker;
+	const originalAcquire = tracker.acquire.bind(tracker);
+	const acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }> = [];
+	const runLeases: InheritedRunLeaseRecord[] = [];
+	const continuationLeases: ContinuationLeaseRecord[] = [];
+	const timeline: string[] = [];
+	const acquireSpy = vi.spyOn(tracker, "acquire").mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+		acquireLog.push({ promptId, kind });
+		if (kind === "run") timeline.push(`run_acquire:${promptId}`);
+		if (kind === "compaction_continuation") timeline.push("continuation_acquire");
+		const lease = originalAcquire(promptId, kind);
+		if (kind === "run") {
+			const record: InheritedRunLeaseRecord = { promptId, kind: "run", releaseCalls: 0 };
+			const baseRelease = lease.release.bind(lease);
+			const wrapped = lease as PromptLease & { release: () => void };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				timeline.push(`run_release:${promptId}`);
+				baseRelease();
+			};
+			runLeases.push(record);
+		} else if (kind === "compaction_continuation") {
+			const record: ContinuationLeaseRecord = { promptId, kind: "compaction_continuation", releaseCalls: 0 };
+			const baseRelease = lease.release.bind(lease);
+			const wrapped = lease as PromptLease & { release: () => void };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				baseRelease();
+			};
+			continuationLeases.push(record);
+		}
+		return lease;
+	});
+	return {
+		acquireLog,
+		runLeases,
+		continuationLeases,
+		timeline,
+		acquiresOfKind: (kind) => acquireLog.filter((entry) => entry.kind === kind),
+		restore: () => {
+			acquireSpy.mockRestore();
+		},
+	};
+}
+
+function failingGateCommand(): string {
+	return `${process.execPath} -e "console.error('gate failed'); process.exit(1)"`;
+}
+
+function gatedAutonomousCommand(startedPath: string, gatePath: string): string {
+	return `${process.execPath} -e ${JSON.stringify(
+		`const fs=require('fs');fs.writeFileSync(${JSON.stringify(startedPath)},'started');const p=${JSON.stringify(gatePath)};while(!fs.existsSync(p)){Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25)} process.exit(1);`,
+	)}`;
+}
+
+function inheritedAutonomousActions(harness: Harness, owners: string[]): TurnAction[] {
+	return turnActions(harness).filter((action) => {
+		if (action.lineage?.inherit === undefined) return false;
+		if ((action.promptIds?.length ?? 0) !== owners.length) return false;
+		return owners.every((owner) => action.promptIds?.includes(owner));
+	});
+}
+
+function createFauxIpythonTool(sessionRef: { current?: AgentSession }): AgentTool {
+	return {
+		name: "ipython",
+		label: "ipython",
+		description: "Execute Python code in the agent kernel.",
+		parameters: Type.Object({ code: Type.String() }),
+		execute: async (_toolCallId, params) => {
+			const session = sessionRef.current;
+			if (!session) throw new Error("test session is not initialized");
+			const code = (params as { code: string }).code.trim();
+			let text = "";
+			if (code.startsWith("goal.")) {
+				const spaceIndex = code.indexOf(" ");
+				const type = spaceIndex < 0 ? code : code.slice(0, spaceIndex);
+				const payload = spaceIndex < 0 ? {} : JSON.parse(code.slice(spaceIndex + 1));
+				text = JSON.stringify(session.handleGoalHostRequest(type, payload));
+			}
+			return { content: [{ type: "text", text }], details: {} };
+		},
+	};
 }
 
 /** Extension factory that supplies a compaction summary so `_performCompaction` succeeds without a model summarizer call. */
@@ -3007,7 +3175,8 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(agentEndObservations[0]!.outcome).toBeUndefined();
 			expect(observer.timeline).toEqual(["agent_end", "continuation_acquire", "agent_end"]);
 			expect(observer.acquireContexts).toEqual([
-				{ promptId: ownerIds[0], runLeasesHeld: 1, outcomeAtAcquire: undefined },
+				// Parent run lease + inherited autonomous run lease overlap here.
+				{ promptId: ownerIds[0], runLeasesHeld: 2, outcomeAtAcquire: undefined },
 			]);
 			expect(observer.acquiresOfContinuation()).toEqual([
 				{ promptId: ownerIds[0], kind: "compaction_continuation" },
@@ -7310,6 +7479,783 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._continuationSchedulingPause).toBeUndefined();
 			unsubscribe();
 			continueSpy.mockRestore();
+			observer.restore();
+		});
+	});
+
+	describe("autonomous threshold continuation inherit lineage (group 5)", () => {
+		const group5Harnesses: Harness[] = [];
+
+		afterEach(() => {
+			vi.useRealTimers();
+			while (group5Harnesses.length > 0) group5Harnesses.pop()?.cleanup();
+		});
+
+		it("production single-owner threshold queues one inherited action with [A] and delays A's completed until continuation terminal", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				tools: [largeContextThresholdTool()],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 1,
+					maxTurns: 100,
+					gates: { commands: [], maxRetries: 1 },
+				},
+				settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 } },
+				models: [{ id: "faux-1", contextWindow: 200_000 }],
+				extensionFactories: [compactSummaryExtension("group-5 single-owner summary")],
+			});
+			group5Harnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("post-compaction continuation completed"),
+			]);
+			const ownerIds: string[] = [];
+			const inheritSnapshots: Array<{
+				promptIds: string[];
+				inherit: string[];
+				runLeases: number;
+				noSettlementIdentity: boolean | undefined;
+				candidatePromptId: string | undefined;
+				continuationLeaseCount: number;
+			}> = [];
+			const agentEndObservations: Array<{
+				outcome: unknown;
+				inheritedActions: number;
+				inheritedPromptIds: string[][];
+				inheritedRunLeases: number[];
+				continuationLeaseCount: number;
+				continuationReleases: number[];
+				providerCalls: number;
+			}> = [];
+			harness.session.subscribe((event) => {
+				for (const action of turnActions(harness).filter((candidate) => candidate.lineage?.inherit !== undefined)) {
+					inheritSnapshots.push({
+						promptIds: [...(action.promptIds ?? [])],
+						inherit: [...action.lineage!.inherit],
+						runLeases: action.runLeases?.length ?? 0,
+						noSettlementIdentity: action.noSettlementIdentity,
+						candidatePromptId: action.candidatePromptId,
+						continuationLeaseCount: observer.continuationLeases.length,
+					});
+				}
+				if (event.type !== "agent_end") return;
+				const owner = ownerIds[0];
+				const inherited = owner ? inheritedAutonomousActions(harness, [owner]) : [];
+				agentEndObservations.push({
+					outcome: owner ? harness.session.getPromptOutcome(owner) : undefined,
+					inheritedActions: inherited.length,
+					inheritedPromptIds: inherited.map((action) => [...(action.promptIds ?? [])]),
+					inheritedRunLeases: inherited.map((action) => action.runLeases?.length ?? 0),
+					continuationLeaseCount: observer.continuationLeases.length,
+					continuationReleases: observer.continuationLeases.map((lease) => lease.releaseCalls),
+					providerCalls: harness.faux.state.callCount,
+				});
+			});
+
+			const settled = harness.session.promptAndSettle("cross the production threshold", {
+				settlementAdmission: (info) => ownerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1));
+			await vi.waitFor(() => expect(harness.eventsOfType("compaction_end")).toHaveLength(1));
+			await vi.advanceTimersByTimeAsync(100);
+			const outcome = await settled;
+			await vi.waitFor(() => expect(ownerIds).toHaveLength(1));
+			const ownerA = ownerIds[0]!;
+			expect(inheritSnapshots.length).toBeGreaterThan(0);
+			expect(inheritSnapshots[0]).toMatchObject({
+				promptIds: [ownerA],
+				inherit: [ownerA],
+				runLeases: 1,
+				noSettlementIdentity: undefined,
+				candidatePromptId: undefined,
+			});
+			expect(observer.acquiresOfKind("run").filter((entry) => entry.promptId === ownerA)).toHaveLength(2);
+			expect(agentEndObservations).toHaveLength(2);
+			expect(agentEndObservations[0]!.outcome).toBeUndefined();
+			expect(agentEndObservations[0]!.inheritedActions).toBe(1);
+			expect(agentEndObservations[0]!.inheritedPromptIds).toEqual([[ownerA]]);
+			expect(agentEndObservations[0]!.inheritedRunLeases).toEqual([1]);
+			expect(agentEndObservations[0]!.providerCalls).toBe(1);
+			expect(
+				inheritSnapshots.some(
+					(snapshot) =>
+						snapshot.promptIds[0] === ownerA && snapshot.runLeases === 1 && snapshot.continuationLeaseCount === 1,
+				),
+			).toBe(true);
+			expect(agentEndObservations[1]!.providerCalls).toBe(2);
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(outcome).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(outcome?.failure).toBeUndefined();
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerA),
+			).toHaveLength(1);
+			expect(observer.continuationLeases).toHaveLength(1);
+			expect(observer.continuationLeases[0]!.promptId).toBe(ownerA);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			const inheritedRunLeases = observer.runLeases.filter((lease) => lease.promptId === ownerA);
+			expect(inheritedRunLeases).toHaveLength(2);
+			expect(inheritedRunLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+			observer.restore();
+		});
+
+		it('production "all" A/B shared run creates one inherited action with [A,B] and one continuation execution', async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				tools: [largeContextThresholdTool()],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 1,
+					maxTurns: 100,
+					gates: { commands: [], maxRetries: 1 },
+				},
+				settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 } },
+				models: [{ id: "faux-1", contextWindow: 200_000 }],
+				extensionFactories: [compactSummaryExtension("group-5 all-batch summary")],
+			});
+			group5Harnesses.push(harness);
+			seedSessionForCompaction(harness);
+			harness.session.setFollowUpMode("all");
+			const observer = installAutonomousInheritObserver(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("shared continuation completed"),
+			]);
+			const pause = harness.session.acquireQueuedWorkPause();
+			await harness.session.followUp("batch A", undefined, { resumeIfIdle: true });
+			await harness.session.followUp("batch B", undefined, { resumeIfIdle: true });
+			const ids = [actionByText(harness, "batch A").promptIds![0], actionByText(harness, "batch B").promptIds![0]];
+			expect(new Set(ids).size).toBe(2);
+			expect(observer.acquiresOfKind("run")).toHaveLength(2);
+
+			const inheritSnapshots: Array<{
+				promptIds: string[];
+				inherit: string[];
+				runLeases: number;
+				noSettlementIdentity: boolean | undefined;
+			}> = [];
+			const firstTerminalFacts: Array<{
+				outcomes: unknown[];
+				inheritedActions: number;
+				inheritedPromptIds: string[] | undefined;
+				inheritedRunLeases: number | undefined;
+				continuationLeaseCount: number;
+				continuationReleases: number[];
+				providerCalls: number;
+			}> = [];
+			harness.session.subscribe((event) => {
+				for (const action of turnActions(harness).filter((candidate) => candidate.lineage?.inherit !== undefined)) {
+					inheritSnapshots.push({
+						promptIds: [...(action.promptIds ?? [])],
+						inherit: [...action.lineage!.inherit],
+						runLeases: action.runLeases?.length ?? 0,
+						noSettlementIdentity: action.noSettlementIdentity,
+					});
+				}
+				if (event.type !== "agent_end") return;
+				const inherited = turnActions(harness).filter((action) => action.lineage?.inherit !== undefined);
+				firstTerminalFacts.push({
+					outcomes: ids.map((id) => harness.session.getPromptOutcome(id)),
+					inheritedActions: inherited.length,
+					inheritedPromptIds: inherited[0]?.promptIds ? [...inherited[0].promptIds] : undefined,
+					inheritedRunLeases: inherited[0]?.runLeases?.length,
+					continuationLeaseCount: observer.continuationLeases.length,
+					continuationReleases: observer.continuationLeases.map((lease) => lease.releaseCalls),
+					providerCalls: harness.faux.state.callCount,
+				});
+			});
+
+			pause.release();
+			await vi.waitFor(() => expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1));
+			await vi.waitFor(() => expect(harness.eventsOfType("compaction_end")).toHaveLength(1));
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(harness.session.getPromptOutcome(ids[0])).toBeDefined());
+			await vi.waitFor(() => expect(harness.session.getPromptOutcome(ids[1])).toBeDefined());
+			expect(inheritSnapshots.length).toBeGreaterThan(0);
+			expect([...inheritSnapshots[0]!.promptIds].sort()).toEqual([...ids].sort());
+			expect([...inheritSnapshots[0]!.inherit].sort()).toEqual([...ids].sort());
+			expect(inheritSnapshots[0]!.runLeases).toBe(2);
+			expect(inheritSnapshots[0]!.noSettlementIdentity).toBeUndefined();
+			expect(observer.acquiresOfKind("run")).toHaveLength(4);
+			expect(firstTerminalFacts[0]!.outcomes).toEqual([undefined, undefined]);
+			expect(firstTerminalFacts[0]!.inheritedActions).toBe(1);
+			expect([...firstTerminalFacts[0]!.inheritedPromptIds!].sort()).toEqual([...ids].sort());
+			expect(firstTerminalFacts[0]!.inheritedRunLeases).toBe(2);
+			expect(firstTerminalFacts[0]!.providerCalls).toBe(1);
+			expect(harness.faux.state.callCount).toBe(2);
+			for (const id of ids) {
+				expect(harness.session.getPromptOutcome(id)).toMatchObject({ promptId: id, status: "completed" });
+				expect(
+					harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === id),
+				).toHaveLength(1);
+			}
+			expect(observer.continuationLeases).toHaveLength(2);
+			expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual([1, 1]);
+			observer.restore();
+		});
+
+		it("captures owners before the autonomous decision await so a later _lastRunPromptIds clobber cannot change lineage", async () => {
+			const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			const startedPath = join(tmpdir(), `prime-agent-group5-gate-started-${stamp}`);
+			const gatePath = join(tmpdir(), `prime-agent-group5-gate-release-${stamp}`);
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: {
+						commands: [gatedAutonomousCommand(startedPath, gatePath)],
+						maxRetries: 5,
+						timeoutMs: 10_000,
+					},
+				},
+			});
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			admitOwners(harness, "captured-a", "captured-b");
+			const parentLeases = ["captured-a", "captured-b"].map((owner) =>
+				internals._promptSettlementTracker.acquire(owner, "run"),
+			);
+			internals._lastRunPromptIds = ["captured-a", "captured-b"];
+			const assistant = {
+				...fauxAssistantMessage("needs continuation"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queuedPromise = internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
+			expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+			internals._lastRunPromptIds = ["clobbered-owner"];
+			writeFileSync(gatePath, "release");
+			const queued = await queuedPromise;
+			expect(queued).toBeDefined();
+			expect(internals._lastRunPromptIds).toEqual(["clobbered-owner"]);
+			const inherited = turnActions(harness).filter((action) => action.lineage?.inherit !== undefined);
+			expect(inherited).toHaveLength(1);
+			expect(inherited[0]!.promptIds).toEqual(["captured-a", "captured-b"]);
+			expect(inherited[0]!.lineage).toEqual({ inherit: ["captured-a", "captured-b"] });
+			expect(inherited[0]!.runLeases).toHaveLength(2);
+			expect(inherited[0]!.noSettlementIdentity).toBeUndefined();
+			expect(observer.acquiresOfKind("run").map((entry) => entry.promptId)).toEqual([
+				"captured-a",
+				"captured-b",
+				"captured-a",
+				"captured-b",
+			]);
+			for (const lease of parentLeases) lease.release();
+			expect(harness.session.getPromptOutcome("captured-a")).toBeUndefined();
+			expect(harness.session.getPromptOutcome("captured-b")).toBeUndefined();
+			observer.restore();
+		});
+
+		it("does not create a second action or extra run lease when the same assistant message is queued twice", async () => {
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: { commands: [failingGateCommand()], maxRetries: 5 },
+				},
+			});
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			admitOwners(harness, "dup-owner");
+			const parentLease = internals._promptSettlementTracker.acquire("dup-owner", "run");
+			internals._lastRunPromptIds = ["dup-owner"];
+			const assistant = {
+				...fauxAssistantMessage("same assistant"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+
+			const first = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			const runAcquiresAfterFirst = observer.acquiresOfKind("run").length;
+			const second = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			expect(first).toBeDefined();
+			expect(second).toBe(first);
+			expect(turnActions(harness).filter((action) => action.lineage?.inherit !== undefined)).toHaveLength(1);
+			expect(observer.acquiresOfKind("run")).toHaveLength(runAcquiresAfterFirst);
+			expect(harness.session.getFollowUpMessages()).toHaveLength(1);
+			parentLease.release();
+			observer.restore();
+		});
+
+		it("clears a queued inherited action before delivery with exact lease release and zero requestCancel", async () => {
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: { commands: [failingGateCommand()], maxRetries: 5 },
+				},
+			});
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			admitOwners(harness, "clear-a", "clear-b");
+			const parentLeases = ["clear-a", "clear-b"].map((owner) =>
+				internals._promptSettlementTracker.acquire(owner, "run"),
+			);
+			internals._lastRunPromptIds = ["clear-a", "clear-b"];
+			const assistant = {
+				...fauxAssistantMessage("clear before delivery"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queued = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			expect(queued).toBeDefined();
+			const inherited = turnActions(harness).filter((action) => action.lineage?.inherit !== undefined);
+			expect(inherited).toHaveLength(1);
+			expect(inherited[0]!.runLeases).toHaveLength(2);
+			const inheritedRunLeases = observer.runLeases.slice(-2);
+			expect(inheritedRunLeases.map((lease) => lease.promptId)).toEqual(["clear-a", "clear-b"]);
+			expect(inheritedRunLeases.map((lease) => lease.releaseCalls)).toEqual([0, 0]);
+
+			const requestCancelSpy = vi.spyOn(internals._promptSettlementTracker, "requestCancel");
+			internals._clearQueuedAutonomousContinuations();
+			expect(inheritedRunLeases.map((lease) => lease.releaseCalls)).toEqual([1, 1]);
+			expect(requestCancelSpy).not.toHaveBeenCalled();
+			expect(turnActions(harness).filter((action) => action.lineage?.inherit !== undefined)).toHaveLength(0);
+			expect(harness.session.getPromptOutcome("clear-a")).toBeUndefined();
+			expect(harness.session.getPromptOutcome("clear-b")).toBeUndefined();
+			expect(internals._promptSettlementTracker.isSettling("clear-a")).toBe(true);
+			expect(internals._promptSettlementTracker.isSettling("clear-b")).toBe(true);
+
+			internals._clearQueuedAutonomousContinuations();
+			expect(inheritedRunLeases.map((lease) => lease.releaseCalls)).toEqual([1, 1]);
+			expect(requestCancelSpy).not.toHaveBeenCalled();
+			expect(outcomeCount(harness)).toBe(0);
+
+			for (const lease of parentLeases) lease.release();
+			expect(harness.session.getPromptOutcome("clear-a")).toMatchObject({ status: "completed" });
+			expect(harness.session.getPromptOutcome("clear-b")).toMatchObject({ status: "completed" });
+			expect(outcomeCount(harness)).toBe(2);
+			requestCancelSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("keeps a zero-owner producer settlement-excluded with no promptIds, run lease, or outcome", async () => {
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: { commands: [failingGateCommand()], maxRetries: 5 },
+				},
+			});
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			expect(internals._lastRunPromptIds).toEqual([]);
+			const assistant = {
+				...fauxAssistantMessage("ownerless background"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queued = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			expect(queued).toBeDefined();
+			const admitted = turnActions(harness).filter((action) =>
+				action.payload.text.includes("Autonomous quality gate"),
+			);
+			expect(admitted).toHaveLength(1);
+			expect(admitted[0]!.noSettlementIdentity).toBe(true);
+			expect(admitted[0]!.promptIds).toBeUndefined();
+			expect(admitted[0]!.runLeases).toBeUndefined();
+			expect(admitted[0]!.lineage).toBeUndefined();
+			expect(admitted[0]!.candidatePromptId).toBeUndefined();
+			expect(observer.acquiresOfKind("run")).toEqual([]);
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.session.getFollowUpMessages()).toHaveLength(1);
+			observer.restore();
+		});
+
+		it("gives /goal-created goal context a fresh default promptId and lets a threshold child inherit that owner", async () => {
+			const sessionRef: { current?: AgentSession } = {};
+			const harness = await createHarness({
+				tools: [createFauxIpythonTool(sessionRef)],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: { commands: [failingGateCommand()], maxRetries: 5 },
+				},
+			});
+			sessionRef.current = harness.session;
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			expect(
+				harness.session.handleGoalHostRequest("goal.create", { objective: "finish the threshold task" }),
+			).toMatchObject({ goal: expect.objectContaining({ objective: "finish the threshold task" }) });
+			internals._runOrQueueGoalContext("continuation");
+			const goalAction = turnActions(harness).find((action) => action.payload.text.includes("<goal_context>"));
+			expect(goalAction).toBeDefined();
+			expect(goalAction!.lineage).toBeUndefined();
+			expect(goalAction!.noSettlementIdentity).toBeUndefined();
+			expect(goalAction!.candidatePromptId).toBeUndefined();
+			expect(goalAction!.promptIds).toHaveLength(1);
+			expect(goalAction!.runLeases).toHaveLength(1);
+			const goalOwner = goalAction!.promptIds![0]!;
+			expect(goalOwner).toBeTruthy();
+			expect(observer.acquiresOfKind("run")).toEqual([{ promptId: goalOwner, kind: "run" }]);
+
+			internals._lastRunPromptIds = [goalOwner];
+			const assistant = {
+				...fauxAssistantMessage("goal threshold child"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queued = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			expect(queued).toBeDefined();
+			const inherited = inheritedAutonomousActions(harness, [goalOwner]);
+			expect(inherited).toHaveLength(1);
+			expect(inherited[0]!.promptIds).toEqual([goalOwner]);
+			expect(inherited[0]!.lineage).toEqual({ inherit: [goalOwner] });
+			expect(inherited[0]!.runLeases).toHaveLength(1);
+			expect(inherited[0]!.id).not.toBe(goalAction!.id);
+			expect(harness.session.getPromptOutcome(goalOwner)).toBeUndefined();
+			observer.restore();
+		});
+
+		it("production /goal threshold inherit queues one child under the goal-context owner G and completes G only after the child terminal", async () => {
+			vi.useFakeTimers();
+			const sessionRef: { current?: AgentSession } = {};
+			const harness = await createHarness({
+				tools: [createFauxIpythonTool(sessionRef), largeContextThresholdTool()],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 1,
+					maxTurns: 100,
+					gates: { commands: [], maxRetries: 1 },
+				},
+				settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 } },
+				models: [{ id: "faux-1", contextWindow: 200_000 }],
+				extensionFactories: [compactSummaryExtension("group-5 production goal summary")],
+			});
+			sessionRef.current = harness.session;
+			group5Harnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage(fauxToolCall("ipython", { code: "goal.complete" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("goal complete after inherited continuation"),
+			]);
+
+			const parentSnapshots: Array<{
+				id: string;
+				promptIds: string[];
+				inherit: string[] | undefined;
+				runLeases: number;
+				noSettlementIdentity: boolean | undefined;
+				candidatePromptId: string | undefined;
+			}> = [];
+			const inheritSnapshots: Array<{
+				id: string;
+				promptIds: string[];
+				inherit: string[];
+				runLeases: number;
+				noSettlementIdentity: boolean | undefined;
+				candidatePromptId: string | undefined;
+			}> = [];
+			const agentEndObservations: Array<{
+				outcome: unknown;
+				parentActions: number;
+				parentPromptIds: string[][];
+				inheritedActions: number;
+				inheritedPromptIds: string[][];
+				inheritedRunLeases: number[];
+				continuationLeaseCount: number;
+				continuationReleases: number[];
+				providerCalls: number;
+			}> = [];
+			harness.session.subscribe((event) => {
+				for (const action of turnActions(harness)) {
+					if (action.payload.text.includes("<goal_context>") && action.lineage?.inherit === undefined) {
+						parentSnapshots.push({
+							id: action.id,
+							promptIds: [...(action.promptIds ?? [])],
+							inherit: action.lineage?.inherit,
+							runLeases: action.runLeases?.length ?? 0,
+							noSettlementIdentity: action.noSettlementIdentity,
+							candidatePromptId: action.candidatePromptId,
+						});
+					}
+					if (action.lineage?.inherit !== undefined) {
+						inheritSnapshots.push({
+							id: action.id,
+							promptIds: [...(action.promptIds ?? [])],
+							inherit: [...action.lineage.inherit],
+							runLeases: action.runLeases?.length ?? 0,
+							noSettlementIdentity: action.noSettlementIdentity,
+							candidatePromptId: action.candidatePromptId,
+						});
+					}
+				}
+				if (event.type !== "agent_end") return;
+				const owner = parentSnapshots[0]?.promptIds[0];
+				const inherited = inheritSnapshots.filter((snapshot) => snapshot.promptIds[0] === owner);
+				const uniqueInheritedIds = [...new Set(inherited.map((snapshot) => snapshot.id))];
+				const uniqueParentIds = [...new Set(parentSnapshots.map((snapshot) => snapshot.id))];
+				const outcome = owner ? harness.session.getPromptOutcome(owner) : undefined;
+				agentEndObservations.push({
+					outcome,
+					parentActions: uniqueParentIds.length,
+					parentPromptIds: parentSnapshots.slice(0, 1).map((snapshot) => [...snapshot.promptIds]),
+					inheritedActions: uniqueInheritedIds.length,
+					inheritedPromptIds: inherited.slice(0, 1).map((snapshot) => [...snapshot.promptIds]),
+					inheritedRunLeases: inherited.slice(0, 1).map((snapshot) => snapshot.runLeases),
+					continuationLeaseCount: observer.continuationLeases.length,
+					continuationReleases: observer.continuationLeases.map((lease) => lease.releaseCalls),
+					providerCalls: harness.faux.state.callCount,
+				});
+			});
+
+			const prompted = harness.session.prompt("/goal finish the production threshold task");
+			await vi.waitFor(() => expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1));
+			await vi.waitFor(() => expect(harness.eventsOfType("compaction_end")).toHaveLength(1));
+			expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
+				reason: "threshold",
+				aborted: false,
+				result: expect.objectContaining({ summary: "group-5 production goal summary" }),
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			await prompted;
+
+			expect(parentSnapshots.length).toBeGreaterThan(0);
+			const parent = parentSnapshots[0]!;
+			expect(parent.inherit).toBeUndefined();
+			expect(parent.noSettlementIdentity).toBeUndefined();
+			expect(parent.candidatePromptId).toBeUndefined();
+			expect(parent.promptIds).toHaveLength(1);
+			expect(parent.runLeases).toBe(1);
+			const ownerG = parent.promptIds[0]!;
+			expect(ownerG).toBeTruthy();
+			expect(new Set(parentSnapshots.map((snapshot) => snapshot.id)).size).toBe(1);
+			expect(parentSnapshots.every((snapshot) => snapshot.promptIds[0] === ownerG)).toBe(true);
+
+			expect(inheritSnapshots.length).toBeGreaterThan(0);
+			expect(inheritSnapshots[0]).toMatchObject({
+				promptIds: [ownerG],
+				inherit: [ownerG],
+				runLeases: 1,
+				noSettlementIdentity: undefined,
+				candidatePromptId: undefined,
+			});
+			expect(new Set(inheritSnapshots.map((snapshot) => snapshot.id)).size).toBe(1);
+			expect(inheritSnapshots[0]!.id).not.toBe(parent.id);
+			expect(agentEndObservations.length).toBeGreaterThanOrEqual(2);
+			expect(agentEndObservations[0]!.outcome).toBeUndefined();
+			expect(agentEndObservations[0]!.parentActions).toBe(1);
+			expect(agentEndObservations[0]!.parentPromptIds).toEqual([[ownerG]]);
+			expect(agentEndObservations[0]!.inheritedActions).toBe(1);
+			expect(agentEndObservations[0]!.inheritedPromptIds).toEqual([[ownerG]]);
+			expect(agentEndObservations[0]!.inheritedRunLeases).toEqual([1]);
+			expect(agentEndObservations[0]!.providerCalls).toBe(1);
+
+			const outcome = await harness.session.waitForPromptOutcome(ownerG);
+			expect(outcome).toMatchObject({ promptId: ownerG, status: "completed", traceGeneration: 1 });
+			expect(outcome.failure).toBeUndefined();
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerG),
+			).toHaveLength(1);
+			expect(outcomeCount(harness)).toBe(1);
+			expect(observer.continuationLeases).toHaveLength(1);
+			expect(observer.continuationLeases[0]!.promptId).toBe(ownerG);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			const inheritedRunLeases = observer.runLeases.filter((lease) => lease.promptId === ownerG);
+			expect(inheritedRunLeases.length).toBeGreaterThanOrEqual(2);
+			expect(inheritedRunLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+			expect(harness.session.goalState).toMatchObject({ active: false, status: "complete" });
+			observer.restore();
+		});
+
+		it("rolls back a rejected inherit when the second owner run acquire fails, without queuing an obligation", async () => {
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: { commands: [failingGateCommand()], maxRetries: 5 },
+				},
+			});
+			group5Harnesses.push(harness);
+			const internals = autonomousProducerInternals(harness);
+			const tracker = internals._promptSettlementTracker;
+			const originalAcquire = tracker.acquire.bind(tracker);
+			const runLeases: InheritedRunLeaseRecord[] = [];
+			let failSecondInheritRun = false;
+			let inheritRunAcquires = 0;
+			const acquireSpy = vi
+				.spyOn(tracker, "acquire")
+				.mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+					if (failSecondInheritRun && kind === "run") {
+						inheritRunAcquires += 1;
+						if (inheritRunAcquires === 2) {
+							throw new Error("simulated sibling acquire failure");
+						}
+					}
+					const lease = originalAcquire(promptId, kind);
+					if (kind === "run") {
+						const record: InheritedRunLeaseRecord = { promptId, kind: "run", releaseCalls: 0 };
+						const baseRelease = lease.release.bind(lease);
+						const wrapped = lease as PromptLease & { release: () => void };
+						wrapped.release = () => {
+							record.releaseCalls += 1;
+							baseRelease();
+						};
+						runLeases.push(record);
+					}
+					return lease;
+				});
+			const requestCancelSpy = vi.spyOn(tracker, "requestCancel");
+
+			admitOwners(harness, "reject-a", "reject-b");
+			const parentLeases = ["reject-a", "reject-b"].map((owner) => tracker.acquire(owner, "run"));
+			expect(runLeases.map((lease) => lease.promptId)).toEqual(["reject-a", "reject-b"]);
+			internals._lastRunPromptIds = ["reject-a", "reject-b"];
+
+			const priorMessage = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "prior-window-obligation" }],
+				timestamp: Date.now(),
+			};
+			internals._postCompactionContinuationMessages.push(priorMessage);
+			internals._pendingThresholdCompactionAutonomousMessages.push(priorMessage);
+			internals._continuationSettlementWindow = {
+				owners: ["reject-a"],
+				leases: [],
+				obligationMessages: [priorMessage],
+				revision: 1,
+				state: "scheduled",
+				pumpOwned: false,
+				overflowRecoveryOwners: [],
+			};
+			internals._continuationPumpOwnerAction = undefined;
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+
+			failSecondInheritRun = true;
+			const assistant = {
+				...fauxAssistantMessage("rejected inherit acquire"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queued = await internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+
+			expect(queued).toBeUndefined();
+			expect(inheritRunAcquires).toBe(2);
+			expect(turnActions(harness).filter((action) => action.lineage?.inherit !== undefined)).toHaveLength(0);
+			expect(runLeases.map((lease) => ({ promptId: lease.promptId, releaseCalls: lease.releaseCalls }))).toEqual([
+				{ promptId: "reject-a", releaseCalls: 0 },
+				{ promptId: "reject-b", releaseCalls: 0 },
+				{ promptId: "reject-a", releaseCalls: 1 },
+			]);
+			expect(tracker.isSettling("reject-a")).toBe(true);
+			expect(tracker.isSettling("reject-b")).toBe(true);
+			expect(requestCancelSpy).not.toHaveBeenCalled();
+			expect(outcomeCount(harness)).toBe(0);
+			expect(harness.session.getPromptOutcome("reject-a")).toBeUndefined();
+			expect(harness.session.getPromptOutcome("reject-b")).toBeUndefined();
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+			expect(internals._postCompactionContinuationMessages).toEqual([priorMessage]);
+			expect(internals._pendingThresholdCompactionAutonomousMessages).toEqual([priorMessage]);
+			expect(internals._queuedAutonomousThresholdContinuations.get(assistant)).toBeUndefined();
+			expect(internals._continuationPumpOwnerAction).toBeUndefined();
+			expect(internals._continuationSettlementWindow?.pumpOwned).toBe(false);
+
+			for (const lease of parentLeases) lease.release();
+			expect(harness.session.getPromptOutcome("reject-a")).toMatchObject({ status: "completed" });
+			expect(harness.session.getPromptOutcome("reject-b")).toMatchObject({ status: "completed" });
+			expect(outcomeCount(harness)).toBe(2);
+			requestCancelSpy.mockRestore();
+			acquireSpy.mockRestore();
+		});
+
+		it("rolls back a rejected inherit when an owner becomes terminal during the autonomous decision", async () => {
+			const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			const startedPath = join(tmpdir(), `prime-agent-group5-reject-started-${stamp}`);
+			const gatePath = join(tmpdir(), `prime-agent-group5-reject-release-${stamp}`);
+			const harness = await createHarness({
+				autonomous: {
+					enabled: true,
+					maxContinuations: 2,
+					maxTurns: 100,
+					gates: {
+						commands: [gatedAutonomousCommand(startedPath, gatePath)],
+						maxRetries: 5,
+						timeoutMs: 10_000,
+					},
+				},
+			});
+			group5Harnesses.push(harness);
+			const observer = installAutonomousInheritObserver(harness);
+			const internals = autonomousProducerInternals(harness);
+			const requestCancelSpy = vi.spyOn(internals._promptSettlementTracker, "requestCancel");
+			admitOwners(harness, "terminal-a", "terminal-b");
+			const parentLeases = ["terminal-a", "terminal-b"].map((owner) =>
+				internals._promptSettlementTracker.acquire(owner, "run"),
+			);
+			internals._lastRunPromptIds = ["terminal-a", "terminal-b"];
+
+			const priorMessage = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "prior-window-during-decision" }],
+				timestamp: Date.now(),
+			};
+			internals._postCompactionContinuationMessages.push(priorMessage);
+			internals._pendingThresholdCompactionAutonomousMessages.push(priorMessage);
+			internals._continuationSettlementWindow = {
+				owners: ["terminal-a"],
+				leases: [],
+				obligationMessages: [priorMessage],
+				revision: 1,
+				state: "scheduled",
+				pumpOwned: false,
+				overflowRecoveryOwners: [],
+			};
+			internals._continuationPumpOwnerAction = undefined;
+
+			const assistant = {
+				...fauxAssistantMessage("owner terminal during decision"),
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			const queuedPromise = internals._queueAutonomousContinuationForThresholdCompaction(assistant);
+			await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true));
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+			expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+			parentLeases[1]!.release();
+			expect(harness.session.getPromptOutcome("terminal-b")).toMatchObject({ status: "completed" });
+			expect(outcomeCount(harness)).toBe(1);
+			writeFileSync(gatePath, "release");
+			const queued = await queuedPromise;
+
+			expect(queued).toBeUndefined();
+			expect(turnActions(harness).filter((action) => action.lineage?.inherit !== undefined)).toHaveLength(0);
+			expect(observer.acquiresOfKind("run").map((entry) => entry.promptId)).toEqual(["terminal-a", "terminal-b"]);
+			expect(observer.runLeases.map((lease) => lease.releaseCalls)).toEqual([0, 1]);
+			expect(requestCancelSpy).not.toHaveBeenCalled();
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+			expect(internals._postCompactionContinuationMessages).toEqual([priorMessage]);
+			expect(internals._pendingThresholdCompactionAutonomousMessages).toEqual([priorMessage]);
+			expect(internals._queuedAutonomousThresholdContinuations.get(assistant)).toBeUndefined();
+			expect(internals._continuationPumpOwnerAction).toBeUndefined();
+			expect(internals._continuationSettlementWindow?.pumpOwned).toBe(false);
+			expect(internals._promptSettlementTracker.isSettling("terminal-a")).toBe(true);
+			expect(harness.session.getPromptOutcome("terminal-a")).toBeUndefined();
+			expect(harness.session.getPromptOutcome("terminal-b")).toMatchObject({ status: "completed" });
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === "terminal-b"),
+			).toHaveLength(1);
+
+			parentLeases[0]!.release();
+			expect(harness.session.getPromptOutcome("terminal-a")).toMatchObject({ status: "completed" });
+			expect(outcomeCount(harness)).toBe(2);
+			requestCancelSpy.mockRestore();
 			observer.restore();
 		});
 	});

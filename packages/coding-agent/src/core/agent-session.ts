@@ -2919,6 +2919,10 @@ export class AgentSession {
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return queuedMessage;
 		}
+		// Capture the triggering run's deduped owners BEFORE the autonomous
+		// decision await. This immutable snapshot is the only lineage source;
+		// later `_lastRunPromptIds` mutations must not change this action.
+		const ownerSnapshot = [...new Set(this._lastRunPromptIds)];
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
@@ -2940,17 +2944,55 @@ export class AgentSession {
 			typeof autonomousMessage.content === "string"
 				? autonomousMessage.content
 				: autonomousMessage.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
-		this._admitSessionInput(
-			this._createPreparedTurnAction("followUp", text, undefined, {
-				message: autonomousMessage,
-				// Group 2 background identity exclusion: the session-internal
-				// autonomous continuation is background owned work, not a user
-				// prompt. It must not create a default settlement identity; group
-				// 5 wires the inherit lineage producer instead.
-				noSettlementIdentity: true,
-			}),
-		);
+		try {
+			const result = this._admitSessionInput(
+				this._createPreparedTurnAction(
+					"followUp",
+					text,
+					undefined,
+					ownerSnapshot.length > 0
+						? {
+								message: autonomousMessage,
+								// Nonempty captured owners: one action inherits every
+								// owner. Group 2 admission is the sole all-or-nothing
+								// run-lease producer; never pass noSettlementIdentity
+								// here and never enqueue one action per owner.
+								lineage: { inherit: ownerSnapshot },
+							}
+						: {
+								message: autonomousMessage,
+								// Zero-owner background/private work stays settlement-
+								// excluded. Empty inherit is rejected by admission.
+								noSettlementIdentity: true,
+							},
+				),
+			);
+			if (!result.accepted) {
+				this._dropUnadmittedAutonomousContinuation(message, autonomousMessage, snapshot);
+				return undefined;
+			}
+		} catch (error) {
+			this._dropUnadmittedAutonomousContinuation(message, autonomousMessage, snapshot);
+			throw error;
+		}
 		return autonomousMessage;
+	}
+
+	/** Roll back only this attempt's producer bookkeeping after rejected/thrown admission. */
+	private _dropUnadmittedAutonomousContinuation(
+		trigger: AssistantMessage,
+		autonomousMessage: AgentMessage,
+		snapshot: AutonomousRuntimeSnapshot,
+	): void {
+		this._restoreAutonomousRuntimeSnapshot(snapshot);
+		this._queuedAutonomousThresholdContinuations.delete(trigger);
+		this._queuedAutonomousContinuationSnapshots.delete(autonomousMessage);
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(queued) => queued !== autonomousMessage,
+		);
+		this._pendingThresholdCompactionAutonomousMessages = this._pendingThresholdCompactionAutonomousMessages.filter(
+			(queued) => queued !== autonomousMessage,
+		);
 	}
 
 	private _clearQueuedAutonomousContinuations(
@@ -5821,13 +5863,6 @@ export class AgentSession {
 			return { accepted: false, disposition: "queued" };
 		}
 		const isTurn = action.payload.kind === "turn";
-		if (
-			action.payload.kind === "turn" &&
-			action.payload.records.some((record) => this._postCompactionContinuationMessages.includes(record.message))
-		) {
-			this._continuationPumpOwnerAction = action;
-			if (this._continuationSettlementWindow) this._continuationSettlementWindow.pumpOwned = true;
-		}
 		// Group 2 background identity exclusion: injected heartbeat / RLM notices
 		// never admit a settlement identity. The turn runs without a tracker
 		// record, lease, candidate or `prompt_outcome`.
@@ -5893,6 +5928,16 @@ export class AgentSession {
 		}
 		if (options.front) this._actionStore.enqueueFront(action);
 		else this._actionStore.enqueue(action);
+		// Tracked continuation pump ownership is published only after the action
+		// is admitted and enqueued. A rejected inherit must not leak a stale
+		// `_continuationPumpOwnerAction` or mark an existing window pump-owned.
+		if (
+			action.payload.kind === "turn" &&
+			action.payload.records.some((record) => this._postCompactionContinuationMessages.includes(record.message))
+		) {
+			this._continuationPumpOwnerAction = action;
+			if (this._continuationSettlementWindow) this._continuationSettlementWindow.pumpOwned = true;
+		}
 		let disposition: "starts_when_admitted" | "queued" = "queued";
 		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
 		const controller = this._actionStore.ticketFor(action);

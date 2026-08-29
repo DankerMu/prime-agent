@@ -495,3 +495,86 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不实现autonomous action `lineage:{inherit}` producer、完整current/inherited abort清理或dispose `settleAll(...,{released:true})`最终接线、finalMessageIds、ledger/restart或mode/wire变化；本组仅给自己新增的continuation window做cancel/close过渡闭环。
 - 不改变compaction eligibility/summary/persistence、retry eligibility/backoff/events、queue visibility或auto-refine policy；发现范围外问题只报告。
+
+## Issue #30 implementation fixture
+
+Fixture level: expanded（上游建议none；本切片虽只接一个options producer，但会把session-internal autonomous action从zero-identity切换为counted multi-owner run leases，涉及共享状态、异步owner捕获与取消顺序，命中mandatory expanded trigger）
+Repair intensity: high（漏owner、重复action/lease、可变snapshot串线或clear误cancel会造成提前终态、永久settling或错误cancelled）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts` 的 `_queueAutonomousContinuationForThresholdCompaction` action options；focused settlement/compaction/autonomous/goal harness tests。组2 admission/cancel helper、组4 continuation window与tracker API不改。
+- Must preserve: autonomous decision/limits/gates、arrival-epoch rollback、同assistant message去重、100ms scheduler与compaction window、ownerless background/private continuation、`/goal` goal-context default lineage、public prompt/AgentMessageOutcome timing、action recovery/wire。
+- Must add: threshold producer在进入`nextAutonomousContinuation`异步边界前复制触发run全部去重owners；非空snapshot通过`lineage:{inherit: owners}`让单一action逐owner取得独立run lease；零owner继续显式settlement-excluded。
+- Staged boundary: #31才处理active abort摘除inherited actions与dispose released fence；#32记录message ids；#33+ ledger/wire/modes。不在本切片修改主动abort/dispose、recovery schema或public API。
+- Seam under test: in-process AgentSession + faux provider的production threshold路径；必要的private只读action-store/clear seam仅用于在delivery前观察exact action owners/leases和已有group2 release-only分支。
+
+### Autonomous inherit producer contract
+
+- `_queueAutonomousContinuationForThresholdCompaction`先处理同message已有queued obligation的idempotent return；fresh producer随后立即复制`[...new Set(_lastRunPromptIds)]`，再进入gate/decision await。后续任何mutable owner snapshot变化不得改变本action lineage。
+- decision返回message且arrival epoch仍匹配时，只创建一个queued message/action。owner snapshot非空则options只传`lineage:{inherit: snapshot}`；不得同时传`noSettlementIdentity`或生成fresh candidate。snapshot为空则保持`noSettlementIdentity:true`，不构造空inherit（空inherit会按组2拒绝）。
+- 组2 `_admitSessionInput`是唯一lease producer：它对snapshot owners all-or-nothing acquire独立`run` leases并把exact dedup owners写入action；本方法不得自己逐owner入队或acquire。tracked continuation pump owner只在settlement admission与ActionStore enqueue均成功后发布。若owner在decision期间终态或partial acquire失败，producer恢复autonomous snapshot并只删除本轮weak-map/message/pending bookkeeping，返回无obligation；prior window/messages、parent leases/cancel state与pump owner不变，preflight throw清理后仍原样抛出。组4仍对同owners持独立`compaction_continuation` leases，两种kind/实例并存直到各自owned work终止。
+- shared `"all"` run只调用本producer一次，因此只有一个autonomous message/action和一次后续provider run；action可有多个promptIds，但不得按owner复制action。
+- `_clearQueuedAutonomousContinuations`继续通过`_cancelSessionActions`移除action。因为action带`lineage`，组2 non-abort inherit分支只消费本action run leases，不requestCancel owners；其余parent/window ownership决定自然终态。#31 active abort会另加cancel policy，不在此混入。
+- `/goal`由`_runOrQueueGoalContext`创建的goal-context action不使用本producer，继续缺省lineage并取得fresh promptId；active goal run若自身触发threshold，则只对该run随后生成的autonomous threshold action继承该run owners。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: not selected - 无签名或入口变化；`/goal`仅做不变回归。
+- Config / project setup: not selected - autonomous/compaction/goal配置不变。
+- File IO / path safety / overwrite: not selected - 无文件读写。
+- Schema / columns / units / field names: not selected - 复用runtime-only action lineage字段，不改recovery/wire schema。
+- Auth / permissions / secrets: not selected - 无权限或secret边界。
+- Concurrency / shared state / ordering: selected - async前owner capture、multi-owner action lease与parent/window lease并存、terminal release顺序。
+- Resource limits / large input / discovery: not selected - owner集合按当前run去重有界；同message idempotency禁止重复action/lease。
+- Legacy compatibility / examples: selected - ownerless scheduler、autonomous gate/limit、goal context identity与public timing必须不变。
+- Error handling / rollback / partial outputs: selected - arrival epoch/abort使decision失效时不入队；inherit admission失败沿组2 all-or-nothing drop；clear只release不cancel。
+- Release / packaging / dependency compatibility: not selected - 无dependency/export/build变化。
+- Documentation / migration notes: not selected - shared状态文档由#42统一更新。
+- TUI focus/render lifecycle: not selected - 不触碰TUI。
+- Session/extension teardown lifecycle: selected - queued inherited action的non-abort clear与#31 active abort必须严格分界。
+
+### Required evidence
+
+- production single owner threshold：decision await前captured owner为A；queued action `promptIds=[A]`且一份inherited run lease，与组4 continuation lease并存；first run terminal后无outcome，后续action/continuation terminal后A仅一个completed。
+- production `"all"` A/B threshold：一个共享run只产生一个autonomous action，exact dedup `promptIds=[A,B]`、每owner一份run lease，后续provider continuation只调用一次；A/B各一个completed且都不早于continuation terminal。
+- duplicate/async stability：同assistant message重复queue不新增action/acquire；decision await期间mutable `_lastRunPromptIds`被其他值覆盖也不改变captured lineage（可用deterministic gate seam，不能只检查最终outcome）。
+- clear/skipped：delivery前清理inherited action时每份action lease释放一次、`requestCancel`对owners零调用，parent/window ownership保留并自然completed；重复clear零副作用。
+- rejected admission：第二owner inherited `run` acquire失败与decision期间owner终态两支均不入队/不返回obligation；child siblings reverse-release once、autonomous usage恢复、只移除本轮maps/messages/pending，zero cancel/outcome/pump-owner；prior window/messages与parent leases保持exact。
+- zero-owner：background/private调用仍创建legacy settlement-excluded work或按原decision no-op，零candidate/promptIds/run lease/outcome，100ms行为不变。
+- goal boundary：`/goal`产生的goal-context action仍为default fresh identity；若该run触发threshold，其autonomous threshold child继承该fresh owner而非slash-command或先前prompt identity。
+- focused settlement/compaction/autonomous/goal suites、root`npm run check`、workspace build、strict OpenSpec均exit 0。
+
+### Invariant Matrix
+
+- Governing invariant: 每个threshold autonomous obligation恰有一个action，且该action从admission到terminal始终以异步decision前捕获的全部run owners各一份独立run lease覆盖；非abort清理只释放该子action ownership。
+- Source-of-truth identity/contract: fresh producer的immutable dedup `ownerSnapshot`，随后映射为`action.promptIds[i] ↔ action.runLeases[i]`；mutable `_lastRunPromptIds`与continuation-window owners不是admission后的重读来源。
+- Producers: `_queueAutonomousContinuationForThresholdCompaction`唯一lineage producer；`_admitSessionInput`唯一run-lease acquire/publish helper。
+- Validators/preflight: duplicate message map、arrival epoch、nonempty-vs-zero owner classification、组2全部owner settling检查与all-or-nothing acquire。
+- Storage/cache/query: runtime maps/message arrays、ActionStore与tracker内存；recovery/persist/wire不变。
+- Public routes/entrypoints: threshold compaction间接触发；`/goal`、public prompt与manual/requested/overflow不改producer语义。
+- Frontend/downstream consumers: session pump、group4 continuation scheduler/window、autonomous limits/gates、goal context与future #31 abort cleanup。
+- Failure paths/rollback/stale state: decision abort/arrival epoch变化、terminal owner/drop、partial acquire rollback、duplicate queue/clear、zero-owner background与mutable snapshot clobber。
+- Evidence/audit/readiness: production faux-provider single/all tests、direct action/lease observations、clear/ownerless/goal compatibility tests、focused sibling suites与OpenSpec validation。
+- Regression rows:
+  - single/all active owners + successful threshold -> one action, exact captured owners/leases, no early or duplicate outcome。
+  - decision await后owner snapshot clobber或duplicate call -> original owner tuple不变且无额外action/lease。
+  - skipped/nonabort clear -> child leases exact release、zero cancel fence、parent/window自然terminal。
+  - zero-owner producer -> legacy no-identity behavior；空inherit不得入队。
+  - `/goal` goal context -> fresh default promptId；其threshold child只继承该run snapshot。
+  - unchanged compaction/autonomous/action recovery consumers -> existing timer, gate, limits, queue与serialization behavior稳定。
+
+### Boundary-surface checklist
+
+- Shared helper roots: producer只选择lineage classification；所有acquire/release继续复用组2 helper，不复制状态机。
+- Public entrypoints: 无变更；goal/public prompt仅回归。
+- Staging/rollback: owner capture在await前；arrival epoch rollback和inherit all-or-nothing admission保持原子。
+- Producer/consumer evidence: tests直接观察action promptIds/runLeases、provider call count与outcome timing，不以文本标签或timer flag代替ownership证明。
+- Stale/idempotency: same-message map与immutable snapshot防duplicate/stale owner；clear与terminal helper exact-once。
+- Unchanged downstream consumers: ownerless background、goal context、group4 scheduler/window、autonomous gates/limits、recovery/wire。
+
+### Non-goals for #30
+
+- 不实现#31主动abort/dispose ownership清理，不记录finalMessageIds，不接ledger/recovery/wire/modes，不改变compaction或autonomous决策策略。
+- 不把`/goal` goal context改为inherit；它仍是独立default prompt identity。发现其他producer/abort问题只报告，不顺手修。

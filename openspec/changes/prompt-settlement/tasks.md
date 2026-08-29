@@ -38,11 +38,37 @@ Minimal mergeable slice: atomic - 一个continuation-window状态机、generatio
 
 ## 5. autonomous threshold continuation 继承 lineage
 
-- [ ] 5.1 `_queueAutonomousContinuationForThresholdCompaction` 创建 action 时传 `lineage: { inherit: ownerSnapshot }`，其中 ownerSnapshot 是触发 continuation 的共享 run 全部去重 promptIds；同一 continuation action 只入队/执行一次。`_clearQueuedAutonomousContinuations` 取消该 action 时对全部 inherited owners 走组 2.2 的 inherit 分支（只 release、不 `requestCancel`）
-- [ ] 5.2 行为测试：goal 模式下 threshold compaction 排队 autonomous continuation，单 owner 时 action.promptIds 等于原 prompt；`"all"` 共享 run 时 action 继承全部 owners 但只执行一次；每个 outcome 均单次且在 continuation 完成后产生
+- [x] 5.1 `_queueAutonomousContinuationForThresholdCompaction` 在进入 autonomous decision 的异步边界前捕获触发共享 run 的全部去重 prompt owners；非空时创建 action传`lineage: { inherit: ownerSnapshot }`且不再标`noSettlementIdentity`，同一 message 仍只入队/执行一个 action。真正零 owner 的 background/private调用保持既有 settlement exclusion。`_clearQueuedAutonomousContinuations` 取消 inherited action 时复用组2.2分支，对全部owners只release、不`requestCancel`。inherit admission拒绝/partial acquire失败时只回滚本次producer bookkeeping并恢复autonomous snapshot；tracked pump ownership只在action成功enqueue后发布
+- [x] 5.2 行为测试：production threshold路径单owner action.promptIds等于原id且持独立run lease；`"all"`共享run继承全部ids但只创建/执行一次；每个outcome均单次且在inherited action与compaction continuation完成后产生；skipped/clear只释放inherited leases且owner自然completed；零owner路径仍无identity/outcome；用户`/goal`产生的goal context仍走default lineage获得新promptId；第二owner acquire失败与decision期间owner终态均零孤儿obligation/pump-owner/cancel fence
 
-Suggested fixture level: none - 一行 options 透传 + 组 2.2 取消路径复用
-Minimal mergeable slice: atomic - 单调用点，依赖组 2/4，独立合并保绿
+Suggested fixture level: expanded - 上游建议none；该options接线把background action切换为counted multi-owner lease producer，涉及shared-state ordering与cancellation，命中mandatory expanded trigger
+Repair intensity: high - owner漏取/串取、重复action或clear误cancel会造成提前终态、永久settling或错误cancelled
+Minimal mergeable slice: atomic - 单producer接线与行为oracle，依赖组2/4，独立合并保绿
+
+Required evidence:
+- single production threshold -> queued autonomous action exact `[A]` + one inherited run lease；first terminal后无outcome，continuation terminal后A恰一个completed
+- `"all"` production threshold -> exactly one autonomous action with dedup `[A,B]`、每owner一份inherited run lease、provider continuation一次、A/B各一个completed
+- same assistant重复queue / internal rearm -> 不新增action或lease，不重复执行
+- skipped/clear before delivery -> inherited leases exact release、`requestCancel`零调用、remaining parent/window work自然settle
+- second-owner acquire失败或decision期间owner终态 -> producer返回无obligation，child siblings rollback once、autonomous usage/maps/message/pending/pump-owner全回滚，prior window/messages与parent leases不变
+- ownerless background/private threshold -> legacy action/timer行为保留，零prompt identity/lease/outcome
+- `/goal` goal-context producer -> default lineage的新promptId，不继承触发它的旧owner
+- focused settlement/compaction/autonomous/goal suites、root check/build、strict OpenSpec均exit 0
+
+Risk packs:
+- Public API / CLI / script entry: not selected - 无签名或公共入口变化；`/goal`仅做不变回归
+- Config / project setup: not selected - autonomous/compaction/goal配置不变
+- File IO / path safety / overwrite: not selected - 无文件读写
+- Schema / columns / units / field names: not selected - runtime-only action字段已由组2定义，不改recovery/wire shape
+- Auth / permissions / secrets: not selected - 无权限或secret边界
+- Concurrency / shared state / ordering: selected - async前owner snapshot、multi-owner lease acquire、parent/window/action release顺序
+- Resource limits / large input / discovery: not selected - owner集合按当前run去重有界；重复message不得新增action
+- Legacy compatibility / examples: selected - ownerless scheduler、autonomous limits/gates、goal context新identity与100ms行为不变
+- Error handling / rollback / partial outputs: selected - inherit admission失败/terminal owner由组2 all-or-nothing处理；clear只释放不cancel
+- Release / packaging / dependency compatibility: not selected - 无dependency/export/build shape变化
+- Documentation / migration notes: not selected - shared运行时状态文档由组17更新
+- TUI focus/render lifecycle: not selected - 不触碰TUI
+- Session/extension teardown lifecycle: selected - queued inherited action清理必须与#31主动abort边界分离
 
 ## 6. cancel 路径：abort、admission 后未执行、dispose
 
