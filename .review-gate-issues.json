@@ -157,7 +157,13 @@
     "29": {
       "ceilingPrs": [],
       "gateEntries": 1,
-      "closed": []
+      "closed": [
+        {
+          "pr": 56,
+          "outcome": "merged",
+          "rounds": 3
+        }
+      ]
     }
   }
 }
