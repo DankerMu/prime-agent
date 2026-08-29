@@ -1108,9 +1108,14 @@ interface ContinuationSettlementWindow {
 	revision: number;
 	state: "scheduled" | "running" | "parked";
 	pumpOwned: boolean;
-	protectQueuedWork: boolean;
-	/** True when this window owns the compact-and-retry recovery created by overflow. */
-	overflowRecovery: boolean;
+	/**
+	 * Exact owner snapshot whose overflow retry/recovery is currently active
+	 * (a strict subset of `owners` when an unrelated A shares the window).
+	 * Empty when this window is a plain threshold/requested continuation.
+	 * Retry matching, terminal fencing and `abortRetry()` are scoped to this
+	 * exact subset so a mixed A+B window never fails, fences or closes A.
+	 */
+	overflowRecoveryOwners: string[];
 }
 
 interface ParkedContinuationSettlement {
@@ -8163,8 +8168,7 @@ export class AgentSession {
 				revision: 1,
 				state: "scheduled",
 				pumpOwned: false,
-				protectQueuedWork: false,
-				overflowRecovery: false,
+				overflowRecoveryOwners: [],
 			};
 		}
 
@@ -8179,21 +8183,102 @@ export class AgentSession {
 	}
 
 	/**
-	 * The active retry window covers exactly the same owners as the
-	 * continuation window: this is the continuation's OWN retry chain (a
-	 * matching overflow-retry continuation must run it instead of rearming
-	 * forever on `isRetrying`; unrelated retry/busy still rearms).
+	 * Remove an exactly-classified overflow-recovery subset from its (possibly
+	 * shared) continuation window after the recovery terminal or abort. The
+	 * caller has already applied the terminal intent to the subset owners and
+	 * already consumed this operation's own messages; this helper drops the
+	 * subset from the shared owners/leases/subset arrays and either exact-closes
+	 * a fully consumed window or re-arms the remaining owners' obligation at a
+	 * newer revision.
+	 *
+	 * Publication order follows the full detach-before-release discipline for
+	 * the REMAINING owners: the coherent A window and its scheduler tuple
+	 * (timer / message snapshot / pause fence) are fully published BEFORE the
+	 * first subset lease releases. A subset lease release can synchronously
+	 * emit `prompt_outcome` (the subset's retry ownership was already detached
+	 * and released by retry resolution, so the continuation lease can be its
+	 * last) and reenter session APIs: a listener that closes/cancels A or
+	 * publishes a replacement must observe A already fully rearmed at the newer
+	 * revision, and the helper must not touch or resurrect any scheduler/window
+	 * state after that release returns. No release/reacquire gap: untouched
+	 * owners keep the same lease instances, and the caller's queued-work pause
+	 * transfers unchanged to A's rearmed scheduling fence. Returns true when
+	 * the window closed entirely, false when the remaining obligation was
+	 * re-armed.
+	 */
+	private _removeOverflowRecoverySubset(
+		window: ContinuationSettlementWindow,
+		schedulingPause: { release(): void } | undefined,
+	): boolean {
+		const subsetSet = new Set(window.overflowRecoveryOwners);
+		const remainingOwners: string[] = [];
+		const remainingLeases: PromptLease[] = [];
+		const releasedLeases: PromptLease[] = [];
+		for (let index = 0; index < window.owners.length; index += 1) {
+			const owner = window.owners[index]!;
+			if (subsetSet.has(owner)) {
+				releasedLeases.push(window.leases[index]!);
+			} else {
+				remainingOwners.push(owner);
+				remainingLeases.push(window.leases[index]!);
+			}
+		}
+		if (remainingOwners.length === 0) {
+			// The overflow subset is the ENTIRE window: keep the existing full
+			// detach-before-release close shape (callers normally route
+			// whole-window closes directly, but a reentrantly-shrunk window can
+			// reach here). Do not mutate first: the full close helper captures
+			// and detaches the whole old tuple before any lease release.
+			return this._cancelPostCompactionContinue({ expectedWindow: window });
+		}
+		// Publish the coherent remaining A window FIRST: detach B from the
+		// shared owners/leases/subset arrays, bump the revision, restore the
+		// scheduled state and transfer the caller's pause. This is the state a
+		// synchronous B outcome reentry must observe.
+		window.owners = remainingOwners;
+		window.leases = remainingLeases;
+		window.overflowRecoveryOwners = [];
+		window.revision += 1;
+		window.state = "scheduled";
+		// Re-install the caller's pause as A's scheduling fence (the rearm
+		// helper keeps it; the pump-owned path releases it).
+		this._continuationSchedulingPause = schedulingPause;
+		// Arm A's scheduler tuple (timer + message snapshot + pause policy) at
+		// the newer revision BEFORE the first subset lease can synchronously
+		// settle B and reenter. The rearm helper clears an already-pending
+		// timer so it can never double-fire; a reentrant close or replacement
+		// therefore survives untouched because no scheduler/window mutation
+		// happens after the releases below.
+		this._rearmPostCompactionContinue();
+		// Release the subset leases exactly once. A reentrant synchronous
+		// listener (B prompt_outcome) now sees A coherently rearmed (or its own
+		// replacement) and this helper does not touch global scheduler/window
+		// state afterward.
+		for (const lease of releasedLeases) {
+			lease.release();
+		}
+		return false;
+	}
+
+	/**
+	 * The active retry window belongs to THIS continuation window: an overflow
+	 * recovery matches its exact captured owner subset (which may be a strict
+	 * subset of a shared window), while a plain threshold/requested window
+	 * matches only a retry over its complete owner set. A matching
+	 * overflow-retry continuation must run it instead of rearming forever on
+	 * `isRetrying`; unrelated retry/busy still rearms.
 	 */
 	private _continuationRetryWindowMatchesRetryOwners(): boolean {
 		const window = this._continuationSettlementWindow;
 		if (!window) return false;
 		const retryWindow = this._retryWindow;
 		if (!retryWindow) return false;
-		const windowOwners = [...new Set(window.owners)].sort();
+		const matchTarget = window.overflowRecoveryOwners.length > 0 ? window.overflowRecoveryOwners : window.owners;
+		const targetOwners = [...new Set(matchTarget)].sort();
 		const retryOwners = [...new Set(retryWindow.capturedPromptIds)].sort();
 		return (
-			windowOwners.length === retryOwners.length &&
-			windowOwners.every((owner, index) => owner === retryOwners[index])
+			targetOwners.length === retryOwners.length &&
+			targetOwners.every((owner, index) => owner === retryOwners[index])
 		);
 	}
 
@@ -8399,11 +8484,19 @@ export class AgentSession {
 			) {
 				windowAtEntry.state = "running";
 			}
-			// Install the captured owners into `_lastRunPromptIds` so a group-3
-			// retry window created by this continuation's agent_end inherits A's
-			// owners, never B's or a zero-owner snapshot; restore below.
+			// The operation's OWN owner set: an overflow recovery running inside a
+			// mixed window operates strictly on its captured subset; a plain
+			// threshold/requested continuation owns the whole window.
+			const operationOwners =
+				windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0
+					? [...windowAtEntry.overflowRecoveryOwners]
+					: [...(windowAtEntry?.owners ?? [])];
+			// Install the operation owners into `_lastRunPromptIds` so a group-3
+			// retry window created by this continuation's agent_end inherits
+			// exactly those owners, never a sibling prompt's or a zero-owner
+			// snapshot; restore below.
 			const previousOwners = this._lastRunPromptIds;
-			this._lastRunPromptIds = [...(windowAtEntry?.owners ?? [])];
+			this._lastRunPromptIds = operationOwners;
 			// Clear any stale terminal stop reason before the run: the continuation
 			// run's own message_end sets the authoritative reason, and a stale
 			// prior signal must never fence this run.
@@ -8451,13 +8544,24 @@ export class AgentSession {
 						windowAtEntry.revision === revisionAtEntry &&
 						windowAtEntry.state !== "parked"
 					) {
-						for (const owner of windowAtEntry.owners) {
+						for (const owner of operationOwners) {
 							this._promptSettlementTracker.recordFailure(owner, "run_error");
 						}
-						if (windowAtEntry.overflowRecovery && this._continuationRetryWindowMatchesRetryOwners()) {
+						if (
+							windowAtEntry.overflowRecoveryOwners.length > 0 &&
+							this._continuationRetryWindowMatchesRetryOwners()
+						) {
 							this._finishMatchingRetryAfterContinuationFailure(message);
 						}
-						closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+						if (operationOwners.length === windowAtEntry.owners.length) {
+							closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+						} else {
+							// Mixed window: only the failed overflow subset is removed;
+							// the sibling A obligation survives; the direct-run pause
+							// transfers to A's rearmed scheduling fence (never released).
+							closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+							pauseHandedOff = true;
+						}
 					}
 					return;
 				}
@@ -8480,7 +8584,7 @@ export class AgentSession {
 				// runner relinquishes without fencing, forgetting, closing, or rearming.
 				return;
 			}
-			// Fence the captured owners with the final stop reason. The
+			// Fence the operation owners with the final stop reason. The
 			// provisional-overflow suppression belongs ONLY to the original main
 			// run's terminal fence (consumed by `_applyRunTerminalSettlementFence`
 			// before any continuation starts); this continuation run's own
@@ -8488,12 +8592,22 @@ export class AgentSession {
 			// aborted -> cancelled, normal -> completed.
 			this._lastRunTerminalStopReason = undefined;
 			this._provisionalOverflowContinuationOwners = [];
-			this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], stopReason);
-			this._forgetConsumedPostCompactionContinuations(continuationMessages);
+			this._applyCapturedContinuationTerminalFence(operationOwners, stopReason);
 			if (windowAtEntry === undefined) {
+				this._forgetConsumedPostCompactionContinuations(continuationMessages);
 				closed = this._cancelPostCompactionContinue();
 			} else if (sameWindow) {
-				closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				if (operationOwners.length === windowAtEntry.owners.length) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+					closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				} else {
+					// Mixed window: only the finished overflow subset is removed; the
+					// sibling A obligation and its messages survive untouched; the
+					// direct-run pause transfers to A's rearmed scheduling fence
+					// (never released here).
+					closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+					pauseHandedOff = true;
+				}
 			}
 		} finally {
 			// The pause release's own `_scheduleSessionInputPump()` is the
@@ -8562,7 +8676,9 @@ export class AgentSession {
 			if (this.isStreaming) {
 				await this._runDirectContinuationUnderMatchingRetry(continuationMessages, windowAtEntry);
 			} else {
-				if (windowAtEntry?.overflowRecovery) this._prepareOverflowRecoveryContinuation();
+				if (windowAtEntry && windowAtEntry.overflowRecoveryOwners.length > 0) {
+					this._prepareOverflowRecoveryContinuation();
+				}
 				await this._runDirectContinuation(continuationMessages, windowAtEntry);
 			}
 			return;
@@ -8635,7 +8751,13 @@ export class AgentSession {
 								? "aborted"
 								: undefined;
 				this._continuationPumpTerminal = undefined;
-				this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], trackedTerminal);
+				// A tracked action belongs to the non-overflow obligation set: a
+				// mixed window's overflow-recovery subset must never receive the
+				// tracked terminal fence (B recovery is authoritative for B).
+				const trackedOwners = windowAtEntry
+					? windowAtEntry.owners.filter((owner) => !windowAtEntry!.overflowRecoveryOwners.includes(owner))
+					: [];
+				this._applyCapturedContinuationTerminalFence(trackedOwners, trackedTerminal);
 				// Consume only messages owned by tracked actions that actually reached
 				// terminal. The action's immutable records remain available after the
 				// store releases it, while the authoritative continuation list tells us
@@ -8651,7 +8773,8 @@ export class AgentSession {
 				this._postCompactionContinuationMessages = remainingMessages;
 				if (windowAtEntry) windowAtEntry.obligationMessages = [...remainingMessages];
 				this._continuationPumpOwnerAction = undefined;
-				if (remainingMessages.length === 0) {
+				const overflowSubsetStillPending = (windowAtEntry?.overflowRecoveryOwners.length ?? 0) > 0;
+				if (remainingMessages.length === 0 && !overflowSubsetStillPending) {
 					const didClose = windowAtEntry
 						? this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry })
 						: this._cancelPostCompactionContinue();
@@ -8748,6 +8871,13 @@ export class AgentSession {
 		windowAtEntry: ContinuationSettlementWindow | undefined,
 	): Promise<void> {
 		const revisionAtEntry = windowAtEntry?.revision ?? 0;
+		// The operation's OWN owner set: an overflow recovery inside a mixed
+		// window fences only its captured subset; a plain continuation owns the
+		// whole window.
+		const operationOwners =
+			windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0
+				? [...windowAtEntry.overflowRecoveryOwners]
+				: [...(windowAtEntry?.owners ?? [])];
 		// Hand off the schedule-time pause (held for prompt-owned continuations)
 		// so B stays blocked while the retry chain finishes; otherwise acquire.
 		const queuedWorkPause = this._continuationSchedulingPause ?? this.acquireQueuedWorkPause();
@@ -8780,15 +8910,26 @@ export class AgentSession {
 			const stopReason = this._lastRunTerminalStopReason;
 			this._lastRunTerminalStopReason = undefined;
 			this._provisionalOverflowContinuationOwners = [];
-			this._applyCapturedContinuationTerminalFence(windowAtEntry?.owners ?? [], stopReason);
-			this._forgetConsumedPostCompactionContinuations(continuationMessages);
+			this._applyCapturedContinuationTerminalFence(operationOwners, stopReason);
 			if (windowAtEntry === undefined) {
+				this._forgetConsumedPostCompactionContinuations(continuationMessages);
 				closed = this._cancelPostCompactionContinue();
 			} else if (sameWindow) {
-				closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				if (operationOwners.length === windowAtEntry.owners.length) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+					closed = this._cancelPostCompactionContinue({ expectedWindow: windowAtEntry });
+				} else {
+					// Mixed window: only the finished overflow subset is removed; the
+					// sibling A obligation and its messages survive untouched; the
+					// direct-run pause transfers to A's rearmed scheduling fence
+					// (never released here).
+					closed = this._removeOverflowRecoverySubset(windowAtEntry, queuedWorkPause);
+				}
 			}
 		} finally {
-			queuedWorkPause.release();
+			if (this._continuationSchedulingPause !== queuedWorkPause) {
+				queuedWorkPause.release();
+			}
 			if (closed) {
 				this._scheduleAutoRefineAfterAgentEnd();
 			}
@@ -9564,10 +9705,13 @@ export class AgentSession {
 				...this._postCompactionContinuationMessages,
 			]);
 			if (scheduled && reason === "overflow" && this._continuationSettlementWindow) {
-				// Overflow recovery must run directly before unrelated queued work;
-				// the schedule pause is a real ownership fence, not a generic pump handoff.
-				this._continuationSettlementWindow.protectQueuedWork = true;
-				this._continuationSettlementWindow.overflowRecovery = true;
+				// Overflow recovery must run directly before unrelated queued work:
+				// it owns the EXACT owner snapshot whose retry/recovery is active
+				// (a strict subset when an unrelated A already owned the window; a
+				// still-pending earlier overflow subset is preserved, never
+				// overwritten by a newer overflow extension).
+				const window = this._continuationSettlementWindow;
+				window.overflowRecoveryOwners = [...new Set([...window.overflowRecoveryOwners, ...compactionOwners])];
 			}
 			return scheduled;
 		};
@@ -11744,14 +11888,30 @@ export class AgentSession {
 	}
 
 	private _abortRetry(preserveContinuationSettlement: boolean): void {
-		const overflowContinuation = this._continuationSettlementWindow?.overflowRecovery === true;
+		const window = this._continuationSettlementWindow;
+		const overflowOwners = window?.overflowRecoveryOwners ?? [];
 		const hasRetry =
 			this._retryPromise !== undefined || this._retryAttempt > 0 || this._retryAbortController !== undefined;
-		if (!preserveContinuationSettlement && overflowContinuation && hasRetry) {
-			// `abortRetry()` is NOT a prompt abort. It fail-closes only the
-			// classified overflow/matching-retry obligation; generic scheduler wakes
-			// and threshold/requested non-retry windows are unrelated and survive.
-			this._cancelPostCompactionContinue({ owners: "fail" });
+		if (!preserveContinuationSettlement && window !== undefined && overflowOwners.length > 0 && hasRetry) {
+			// `abortRetry()` is NOT a prompt abort. It fail-fences only the exact
+			// classified overflow/retry owner subset; an unrelated A sharing the
+			// window and generic/threshold work are unaffected. The exact
+			// overflow subset is removed/released or the whole window is closed
+			// when the subset was the entire window.
+			if (overflowOwners.length === window.owners.length) {
+				for (const owner of overflowOwners) {
+					this._promptSettlementTracker.recordFailure(owner, "run_error");
+				}
+				this._cancelPostCompactionContinue({ owners: "fail" });
+			} else {
+				for (const owner of overflowOwners) {
+					this._promptSettlementTracker.recordFailure(owner, "run_error");
+				}
+				// The schedule-time queued-work pause transfers to A's rearmed
+				// obligation: the same fence keeps unrelated queued work behind A
+				// until A's own terminal fence/close.
+				this._removeOverflowRecoverySubset(window, this._continuationSchedulingPause);
+			}
 		} else if (
 			!preserveContinuationSettlement &&
 			this._continuationSettlementWindow === undefined &&

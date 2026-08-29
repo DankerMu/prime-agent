@@ -235,8 +235,7 @@ interface ContinuationInternals {
 				revision: number;
 				state: "scheduled" | "running" | "parked";
 				pumpOwned: boolean;
-				protectQueuedWork?: boolean;
-				overflowRecovery?: boolean;
+				overflowRecoveryOwners?: string[];
 		  }
 		| undefined;
 	_runAutoCompaction(reason: "overflow" | "threshold" | "requested", willRetry: boolean): Promise<boolean>;
@@ -257,6 +256,7 @@ interface ContinuationInternals {
 		windowAtEntry: { owners: string[]; revision: number } | undefined,
 	): Promise<void>;
 	_provisionalOverflowContinuationOwners: string[];
+	_retryWindow: RetryWindowTuple | undefined;
 	_retryPromise: Promise<void> | undefined;
 	_retryResolve: (() => void) | undefined;
 	_retryAttempt: number;
@@ -3485,7 +3485,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			const message = continuationMessage("matching retry already streaming");
 			internals._postCompactionContinuationMessages = [message];
 			expect(internals._scheduleContinuationForObligation([ownerId], [message])).toBe(true);
-			internals._continuationSettlementWindow!.overflowRecovery = true;
+			internals._continuationSettlementWindow!.overflowRecoveryOwners = [ownerId];
 			internals._schedulePostCompactionContinue();
 			internals._lastRunPromptIds = [ownerId];
 			const retryInternals = internals as unknown as RetryInternals;
@@ -5158,8 +5158,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 				timestamp: Date.now(),
 			} as AgentMessage;
 			expect(internals._scheduleContinuationForObligation([ownerId], [obligationMessage])).toBe(true);
-			internals._continuationSettlementWindow!.protectQueuedWork = true;
-			internals._continuationSettlementWindow!.overflowRecovery = true;
+			internals._continuationSettlementWindow!.overflowRecoveryOwners = [ownerId];
 			internals._schedulePostCompactionContinue();
 			internals._retryAttempt = 1;
 			internals._retryPromise = new Promise<void>((resolve) => {
@@ -5648,6 +5647,745 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			await vi.advanceTimersByTimeAsync(50);
 			const bOutcome = harness.session.getPromptOutcome(bId);
 			expect(bOutcome).toMatchObject({ promptId: bId, status: "completed" });
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] idle mixed A+B overflow recovery runs B once under B's owners and preserves A", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("mixed overflow summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			// A's already-scheduled threshold continuation owns a live window.
+			const ownerA = "mixed-owner-a";
+			admitOwners(harness, ownerA);
+			const messageA = continuationMessage("mixed A obligation");
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			internals._schedulePostCompactionContinue();
+
+			// Independent B runs first, sees a retryable error, then overflows.
+			// Successful overflow compaction extends the SAME live window to
+			// [A,B] and stamps B's exact overflow subset. Production overflow
+			// introduces no obligation message of its own: B's recovery is the
+			// same-run resume, so the shared obligation snapshot stays A's.
+			const ownerB = "mixed-owner-b";
+			admitOwners(harness, ownerB);
+			internals._lastRunPromptIds = [ownerB];
+			internals._postCompactionContinuationMessages = [messageA];
+			await internals._runAutoCompaction("overflow", true);
+			internals._schedulePostCompactionContinue();
+
+			// The retry chain belongs to B only: the scheduler must NOT rearm
+			// forever (a window-wide classification would never match [B]); it
+			// must run the idle recovery under B's owners exactly once.
+			internals._retryPromise = new Promise<void>((resolve) => {
+				internals._retryResolve = resolve;
+			});
+			internals._retryWindow = { capturedPromptIds: [ownerB], leases: [] };
+			internals._lastRunTerminalStopReason = undefined;
+			// Queued independent C: admitted while A's scheduling pause holds, so
+			// it must NOT start until A's obligation closes (then exactly once).
+			const promptSpy = vi.spyOn(harness.session.agent, "prompt").mockImplementation(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			await harness.session.followUp("queued C after mixed recovery", undefined, { resumeIfIdle: true });
+			const ownersAtContinue: string[][] = [];
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				// The recovery run ends with a successful stop: its agent_end
+				// resolves the still-active retry chain (B's own).
+				ownersAtContinue.push([...internals._lastRunPromptIds]);
+				internals._lastRunTerminalStopReason = "stop";
+				(internals as unknown as RetryInternals)._resolveRetry();
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			// Behavioral RED assertion (pre-fix: window-wide classification
+			// [A,B] !== [B] rearms forever and never calls continue).
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(promptSpy).not.toHaveBeenCalled();
+			// Recovery started exactly once under B's captured owners (the retry
+			// window subset), never under the mixed [A,B] window.
+			expect(ownersAtContinue).toEqual([[ownerB]]);
+			// B's recovery settled exactly B completed; A is NOT terminal/fenced
+			// by B and remains owned by its own obligation.
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "completed",
+			});
+			expect(harness.session.getPromptOutcome(ownerB)?.failure).toBeUndefined();
+			// B's exact continuation lease released once; A's remains live in the
+			// rearmed window with no scheduler/window residue.
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerA],
+				overflowRecoveryOwners: [],
+			});
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			expect(internals._retryPromise).toBeUndefined();
+
+			// A executes exactly once under A's own owners and settles normally.
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(ownersAtContinue).toEqual([[ownerB], [ownerA]]);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(harness.session.getPromptOutcome(ownerA)?.failure).toBeUndefined();
+			// Queued C stayed at zero agent runs through BOTH authoritative
+			// boundaries (B recovery terminal, A obligation close) and woke
+			// exactly once afterward.
+			expect(promptSpy).toHaveBeenCalledTimes(1);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(3);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			promptSpy.mockRestore();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] mixed A+B overflow recovery terminal error fails only B and preserves A", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("mixed overflow terminal summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "mixed-terminal-a";
+			const ownerB = "mixed-terminal-b";
+			admitOwners(harness, ownerA, ownerB);
+			const messageA = continuationMessage("mixed terminal A obligation");
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			// B's overflow extends the live window; B's recovery terminal errors.
+			// No synthetic B obligation message: overflow recovery is a same-run
+			// resume and owns no separate message.
+			internals._lastRunPromptIds = [ownerB];
+			internals._postCompactionContinuationMessages = [messageA];
+			await internals._runAutoCompaction("overflow", true);
+			internals._schedulePostCompactionContinue();
+			internals._retryPromise = new Promise<void>((resolve) => {
+				internals._retryResolve = resolve;
+			});
+			internals._retryWindow = { capturedPromptIds: [ownerB], leases: [] };
+			internals._lastRunTerminalStopReason = undefined;
+			let continueCalls = 0;
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				continueCalls += 1;
+				internals._lastRunTerminalStopReason = continueCalls === 1 ? "error" : "stop";
+				(internals as unknown as RetryInternals)._resolveRetry();
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(continueSpy).toHaveBeenCalledTimes(1));
+			// Only B is fenced failed; A stays settling with its obligation live.
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([]);
+			// A then executes and completes normally, not failed by B's terminal.
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(harness.session.getPromptOutcome(ownerA)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] public abortRetry in mixed A+B fails only B, preserves and rearms A", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			continuationHarnesses.push(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "mixed-abort-a";
+			const ownerB = "mixed-abort-b";
+			admitOwners(harness, ownerA, ownerB);
+			const messageA = continuationMessage("mixed abort A obligation");
+			// Production overflow owns no separate obligation message (same-run
+			// resume); the shared window obligation snapshot is A's work only.
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA, ownerB], [messageA])).toBe(true);
+			internals._continuationSettlementWindow!.overflowRecoveryOwners = [ownerB];
+			internals._schedulePostCompactionContinue();
+			internals._retryAttempt = 1;
+			internals._retryPromise = new Promise<void>((resolve) => {
+				internals._retryResolve = resolve;
+			});
+			internals._retryWindow = { capturedPromptIds: [ownerB], leases: [] };
+
+			harness.session.abortRetry();
+			// B failed/run_error, A untouched and still settling.
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(0);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([]);
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			// A's continuation then executes/settles normally.
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(harness.session.getPromptOutcome(ownerA)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] partial subset removal publishes coherent A rearm before B lease release; synchronous B outcome reentry cannot resurrect A", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("mixed reentry close summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "mixed-reentry-close-a";
+			const ownerB = "mixed-reentry-close-b";
+			admitOwners(harness, ownerA, ownerB);
+			const messageA = continuationMessage("mixed reentry close A obligation");
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			const mixedWindow = internals._continuationSettlementWindow!;
+			const aPause = internals._continuationSchedulingPause;
+			const aLease = mixedWindow.leases[0]!;
+			// B's overflow extends the SAME live window. Production overflow adds
+			// no obligation message of its own: no synthetic B message is used.
+			internals._lastRunPromptIds = [ownerB];
+			await internals._runAutoCompaction("overflow", true);
+			expect(internals._continuationSettlementWindow).toBe(mixedWindow);
+			expect(mixedWindow.owners).toEqual([ownerA, ownerB]);
+			expect(mixedWindow.overflowRecoveryOwners).toEqual([ownerB]);
+			internals._retryPromise = new Promise<void>((resolve) => {
+				internals._retryResolve = resolve;
+			});
+			internals._retryWindow = { capturedPromptIds: [ownerB], leases: [] };
+			internals._lastRunTerminalStopReason = undefined;
+			const continueCalls: string[][] = [];
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				continueCalls.push([...internals._lastRunPromptIds]);
+				internals._lastRunTerminalStopReason = "stop";
+				(internals as unknown as RetryInternals)._resolveRetry();
+			});
+			const reentryFacts = {
+				seen: false,
+				sameWindow: false,
+				owners: [] as string[],
+				leases: [] as unknown[],
+				messages: [] as AgentMessage[],
+				revision: -1,
+				state: "" as string,
+				pumpOwned: false,
+				overflowOwners: [] as string[],
+				scheduled: false,
+				timerDefined: false,
+				snapshot: [] as AgentMessage[],
+				pauseSame: false,
+				closeReturned: false,
+			};
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "prompt_outcome" || event.outcome.promptId !== ownerB) return;
+				// The remaining A tuple MUST already be coherent at this synchronous
+				// reentry point: B's continuation lease release is the first side
+				// effect that can reenter session APIs, and it must observe A fully
+				// detached from B and rearmed at the newer revision. Facts are
+				// recorded here (assertions inside a session listener would be
+				// swallowed by `_emit` observer isolation).
+				const window = internals._continuationSettlementWindow;
+				reentryFacts.seen = true;
+				reentryFacts.sameWindow = window === mixedWindow;
+				reentryFacts.owners = window?.owners ? [...window.owners] : [];
+				reentryFacts.leases = window?.leases ? [...window.leases] : [];
+				reentryFacts.messages = window?.obligationMessages ? [...window.obligationMessages] : [];
+				reentryFacts.revision = window?.revision ?? -1;
+				reentryFacts.state = window?.state ?? "";
+				reentryFacts.pumpOwned = window?.pumpOwned ?? false;
+				reentryFacts.overflowOwners = window?.overflowRecoveryOwners ? [...window.overflowRecoveryOwners] : [];
+				reentryFacts.scheduled = internals._postCompactionContinuationScheduled;
+				reentryFacts.timerDefined = internals._postCompactionContinuationTimer !== undefined;
+				reentryFacts.snapshot = [...internals._scheduledPostCompactionContinuationMessages];
+				reentryFacts.pauseSame = internals._continuationSchedulingPause === aPause;
+				// The listener closes/cancels the remaining A tuple exactly once.
+				reentryFacts.closeReturned = internals._cancelPostCompactionContinue({ owners: "cancel" });
+			});
+
+			await vi.advanceTimersByTimeAsync(100);
+			// B recovered exactly once under B and got exactly B's recovery status.
+			expect(reentryFacts.seen).toBe(true);
+			expect(reentryFacts.sameWindow).toBe(true);
+			expect(reentryFacts.owners).toEqual([ownerA]);
+			expect(reentryFacts.leases).toEqual([aLease]);
+			expect(reentryFacts.messages).toEqual([messageA]);
+			expect(reentryFacts.revision).toBe(3);
+			expect(reentryFacts.state).toBe("scheduled");
+			expect(reentryFacts.pumpOwned).toBe(false);
+			expect(reentryFacts.overflowOwners).toEqual([]);
+			expect(reentryFacts.scheduled).toBe(true);
+			expect(reentryFacts.timerDefined).toBe(true);
+			expect(reentryFacts.snapshot).toEqual([messageA]);
+			expect(reentryFacts.pauseSame).toBe(true);
+			expect(reentryFacts.closeReturned).toBe(true);
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "completed",
+			});
+
+			await vi.advanceTimersByTimeAsync(100);
+			// B recovered exactly once under B and got exactly B's recovery status.
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "completed",
+			});
+			expect(harness.session.getPromptOutcome(ownerB)?.failure).toBeUndefined();
+			// The reentrant close released A exactly once with the cancel classification.
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+				promptId: ownerA,
+				status: "cancelled",
+			});
+			expect(harness.session.getPromptOutcome(ownerA)?.failure).toBeUndefined();
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(continueCalls).toEqual([[ownerB]]);
+			// After the callback returns, no stale/ownerless scheduler or timer is
+			// resurrected and no late continue() occurs.
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([]);
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			await vi.advanceTimersByTimeAsync(200);
+			expect(continueCalls).toEqual([[ownerB]]);
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
+			unsubscribe();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] partial subset removal leaves a listener-created replacement window/timer/snapshot untouched after B release", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("mixed reentry replacement summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "mixed-reentry-replacement-a";
+			const ownerB = "mixed-reentry-replacement-b";
+			const replacementOwner = "mixed-reentry-replacement-new";
+			admitOwners(harness, ownerA, ownerB, replacementOwner);
+			const messageA = continuationMessage("mixed reentry replacement A obligation");
+			const replacementMessage = continuationMessage("mixed reentry replacement obligation");
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			internals._schedulePostCompactionContinue();
+			const mixedWindow = internals._continuationSettlementWindow!;
+			internals._lastRunPromptIds = [ownerB];
+			await internals._runAutoCompaction("overflow", true);
+			internals._retryPromise = new Promise<void>((resolve) => {
+				internals._retryResolve = resolve;
+			});
+			internals._retryWindow = { capturedPromptIds: [ownerB], leases: [] };
+			internals._lastRunTerminalStopReason = undefined;
+			const continueCalls: string[][] = [];
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				continueCalls.push([...internals._lastRunPromptIds]);
+				internals._lastRunTerminalStopReason = "stop";
+				(internals as unknown as RetryInternals)._resolveRetry();
+			});
+			const replacementFacts = {
+				seenCallbackEntry: false,
+				sameWindow: false,
+				owners: [] as string[],
+				revision: -1,
+				state: "" as string,
+				overflowOwners: [] as string[],
+				scheduled: false,
+				timerDefined: false,
+				snapshot: [] as AgentMessage[],
+				closeReturned: false,
+				replacementCreated: false,
+			};
+			let replacementWindow: ContinuationInternals["_continuationSettlementWindow"] | undefined;
+			let replacementTimer: unknown;
+			let replacementSnapshot: AgentMessage[] | undefined;
+			let replacementPause: unknown | undefined;
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "prompt_outcome" || event.outcome.promptId !== ownerB) return;
+				// Record the coherent A tuple at callback entry, then close A and
+				// publish a replacement sibling from inside the listener. Facts are
+				// recorded here because a throwing assertion inside a session
+				// listener is isolated by `_emit`.
+				const window = internals._continuationSettlementWindow;
+				replacementFacts.seenCallbackEntry = true;
+				replacementFacts.sameWindow = window === mixedWindow;
+				replacementFacts.owners = window?.owners ? [...window.owners] : [];
+				replacementFacts.revision = window?.revision ?? -1;
+				replacementFacts.state = window?.state ?? "";
+				replacementFacts.overflowOwners = window?.overflowRecoveryOwners ? [...window.overflowRecoveryOwners] : [];
+				replacementFacts.scheduled = internals._postCompactionContinuationScheduled;
+				replacementFacts.timerDefined = internals._postCompactionContinuationTimer !== undefined;
+				replacementFacts.snapshot = [...internals._scheduledPostCompactionContinuationMessages];
+				replacementFacts.closeReturned = internals._cancelPostCompactionContinue({ owners: "cancel" });
+				internals._postCompactionContinuationMessages = [replacementMessage];
+				internals._scheduleContinuationForObligation([replacementOwner], [replacementMessage]);
+				internals._schedulePostCompactionContinue();
+				replacementFacts.replacementCreated =
+					internals._continuationSettlementWindow !== undefined &&
+					internals._postCompactionContinuationTimer !== undefined;
+				replacementWindow = internals._continuationSettlementWindow;
+				replacementTimer = internals._postCompactionContinuationTimer;
+				replacementSnapshot = internals._scheduledPostCompactionContinuationMessages;
+				replacementPause = internals._continuationSchedulingPause;
+			});
+
+			await vi.advanceTimersByTimeAsync(100);
+			expect(replacementFacts.seenCallbackEntry).toBe(true);
+			expect(replacementFacts.sameWindow).toBe(true);
+			expect(replacementFacts.owners).toEqual([ownerA]);
+			expect(replacementFacts.revision).toBe(3);
+			expect(replacementFacts.state).toBe("scheduled");
+			expect(replacementFacts.overflowOwners).toEqual([]);
+			expect(replacementFacts.scheduled).toBe(true);
+			expect(replacementFacts.timerDefined).toBe(true);
+			expect(replacementFacts.snapshot).toEqual([messageA]);
+			expect(replacementFacts.closeReturned).toBe(true);
+			expect(replacementFacts.replacementCreated).toBe(true);
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "completed",
+			});
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+				promptId: ownerA,
+				status: "cancelled",
+			});
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			// The partial helper must leave the exact replacement object/timer/
+			// snapshot/pause untouched after it released B.
+			expect(replacementWindow).toBeDefined();
+			expect(internals._continuationSettlementWindow).toBe(replacementWindow);
+			expect(internals._postCompactionContinuationTimer).toBe(replacementTimer);
+			expect(internals._scheduledPostCompactionContinuationMessages).toBe(replacementSnapshot);
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			expect(internals._continuationSchedulingPause).toBe(replacementPause);
+			// The replacement's lease is untouched by the partial helper.
+			expect(observer.continuationLeases[2]!.releaseCalls).toBe(0);
+			// The replacement then runs exactly once under its own owner and settles.
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(continueCalls).toEqual([[ownerB], [replacementOwner]]);
+			expect(observer.continuationLeases[2]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(replacementOwner)).toMatchObject({
+				promptId: replacementOwner,
+				status: "completed",
+			});
+			expect(harness.session.getPromptOutcome(replacementOwner)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(3);
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			unsubscribe();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] production: B retry->overflow->recovery runs once under B inside A's live mixed window; A then C settle once with no B message residue", async () => {
+			vi.useRealTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("mixed production summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "mixed-prod-a";
+			admitOwners(harness, ownerA);
+			const messageA = continuationMessage("mixed production A obligation");
+			const callLog: string[] = [];
+			let releaseBFirst = () => {};
+			const bFirstGate = new Promise<void>((resolve) => {
+				releaseBFirst = resolve;
+			});
+			let bFirstStarted = false;
+			let releaseRecovery = () => {};
+			const recoveryGate = new Promise<void>((resolve) => {
+				releaseRecovery = resolve;
+			});
+			let recoveryStarted = false;
+			let aStarted = false;
+			let cStarted = false;
+			let aBoundaryFacts:
+				| {
+						owners: string[];
+						overflowOwners: string[];
+						windowMessages: AgentMessage[];
+						globalMessages: AgentMessage[];
+						scheduledMessages: AgentMessage[];
+						actionTexts: string[];
+				  }
+				| undefined;
+			harness.setResponses([
+				async () => {
+					callLog.push("B-first-run");
+					bFirstStarted = true;
+					await bFirstGate;
+					return retryableError();
+				},
+				() => {
+					callLog.push("B-overflow-error");
+					return fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" });
+				},
+				async () => {
+					callLog.push("B-recovery");
+					recoveryStarted = true;
+					await recoveryGate;
+					return fauxAssistantMessage("B recovered after overflow");
+				},
+				async () => {
+					callLog.push("A-continuation");
+					aStarted = true;
+					// At the instant A's continuation starts, B's subset removal is
+					// complete: the window/global/scheduled obligation sets and the
+					// action store must contain only A's surviving work (plus queued
+					// C), never a completed/failed B obligation message or action.
+					aBoundaryFacts = {
+						owners: [...(internals._continuationSettlementWindow?.owners ?? [])],
+						overflowOwners: [...(internals._continuationSettlementWindow?.overflowRecoveryOwners ?? [])],
+						windowMessages: [...(internals._continuationSettlementWindow?.obligationMessages ?? [])],
+						globalMessages: [...internals._postCompactionContinuationMessages],
+						scheduledMessages: [...internals._scheduledPostCompactionContinuationMessages],
+						actionTexts: turnActions(harness).map((action) => action.payload.text),
+					};
+					return fauxAssistantMessage("A continuation done");
+				},
+				async () => {
+					callLog.push("C-run");
+					cStarted = true;
+					return fauxAssistantMessage("C done");
+				},
+			]);
+			// B is admitted and dispatched FIRST (gated on its first provider call)
+			// so the production pump selects it ahead of A's tracked continuation
+			// action; B's whole retry->overflow->recovery chain stays inside B's
+			// single dispatch (completionIncludesRetryChain), so no queued work can
+			// start until that dispatch returns.
+			const bOwnerIds: string[] = [];
+			let resolveBAdmitted = () => {};
+			const bAdmitted = new Promise<void>((resolve) => {
+				resolveBAdmitted = resolve;
+			});
+			const bOutcomeP = harness.session.promptAndSettle("mixed production B", {
+				settlementAdmission: (info) => {
+					bOwnerIds.push(info.promptId!);
+					resolveBAdmitted();
+				},
+			});
+			await bAdmitted;
+			await vi.waitFor(() => expect(bFirstStarted).toBe(true));
+			// Narrow seam: establish A's pre-existing continuation window (owner,
+			// lease, obligation message, tracked pump action, armed scheduler)
+			// while B is already streaming. Production threshold staging would
+			// require A to have run first, which reorders the sequence this test
+			// needs; everything after this seam (B retry, overflow compaction,
+			// recovery, A/C runs) is real.
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			admitTrackedContinuationAction(harness, messageA);
+			internals._schedulePostCompactionContinue();
+			expect(internals._continuationSettlementWindow).toMatchObject({ owners: [ownerA] });
+			const aLease = internals._continuationSettlementWindow!.leases[0]!;
+			const aLeaseRecord = observer.continuationLeases[0]!;
+			await harness.session.followUp("queued C after mixed production recovery", undefined, { resumeIfIdle: true });
+			const ownerC = actionByText(harness, "queued C after mixed production recovery").promptIds![0]!;
+
+			const agent = harness.session.agent;
+			const realContinue = agent.continue.bind(agent);
+			const ownersAtContinue: string[][] = [];
+			const continueSpy = vi.spyOn(agent, "continue").mockImplementation(async () => {
+				ownersAtContinue.push([...internals._lastRunPromptIds]);
+				await realContinue();
+			});
+
+			releaseBFirst();
+			await vi.waitFor(() => expect(recoveryStarted).toBe(true));
+			// Exactly two production continues, both under B: the retry continue
+			// (after the retryable error) and the overflow recovery continue. The
+			// recovery is the one following the overflow compaction inside the
+			// shared [A,B] window; A has not falsely started or terminated.
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(ownersAtContinue).toEqual([[bOwnerIds[0]], [bOwnerIds[0]]]);
+			expect(callLog).toEqual(["B-first-run", "B-overflow-error", "B-recovery"]);
+			expect(harness.faux.state.callCount).toBe(3);
+			// B's recovery runs exactly once under B while B is still inside the
+			// SHARED [A,B] window; A is not falsely terminal; A/C have not started.
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA, ...bOwnerIds]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual(bOwnerIds);
+			expect((internals._continuationSettlementWindow?.leases ?? [])[0]).toBe(aLease);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(bOwnerIds[0]!)).toBeUndefined();
+			expect(aStarted).toBe(false);
+			expect(cStarted).toBe(false);
+			expect(observer.retryLeases).toHaveLength(1);
+			expect(observer.continuationLeases).toHaveLength(2);
+			expect(observer.retryLeases[0]!.promptId).toBe(bOwnerIds[0]);
+			expect(observer.continuationLeases[1]!.promptId).toBe(bOwnerIds[0]);
+
+			releaseRecovery();
+			const outcomeB = await bOutcomeP;
+			await vi.waitFor(() => expect(aStarted).toBe(true));
+			// Boundary proof: after B's subset removal, no completed/failed B
+			// obligation/message/action remains under A — only A's work and the
+			// genuinely unrelated queued C.
+			expect(aBoundaryFacts).toMatchObject({
+				owners: [ownerA],
+				overflowOwners: [],
+				windowMessages: [messageA],
+				globalMessages: [messageA],
+				scheduledMessages: [messageA],
+			});
+			expect(aBoundaryFacts?.actionTexts).toEqual([
+				"mixed production A obligation",
+				"queued C after mixed production recovery",
+			]);
+			expect(aBoundaryFacts?.actionTexts).not.toContain("mixed production B");
+			const outcomeA = await harness.session.waitForPromptOutcome(ownerA);
+			await vi.waitFor(() => expect(cStarted).toBe(true));
+			const outcomeC = await harness.session.waitForPromptOutcome(ownerC);
+			expect(callLog).toEqual(["B-first-run", "B-overflow-error", "B-recovery", "A-continuation", "C-run"]);
+			expect(harness.faux.state.callCount).toBe(5);
+			expect(outcomeB).toMatchObject({ promptId: bOwnerIds[0], status: "completed" });
+			expect(outcomeB?.failure).toBeUndefined();
+			expect(outcomeA).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(outcomeA?.failure).toBeUndefined();
+			expect(outcomeC).toMatchObject({ promptId: ownerC, status: "completed" });
+			// Exactly two production continues, both under B (retry chain +
+			// overflow recovery); A's continuation and C run through the session
+			// pump `agent.prompt`, never a B-contaminated continue. The retry
+			// window and both continuation leases cleared exactly once.
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(ownersAtContinue).toEqual([[bOwnerIds[0]], [bOwnerIds[0]]]);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryWindow).toBeUndefined();
+			expect(internals._retryResolve).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._postCompactionContinuationMessages).toEqual([]);
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([]);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+			expect(aLeaseRecord.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerA),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === bOwnerIds[0]),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerC),
+			).toHaveLength(1);
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[mixed-owner fix] requested compaction failure resumes the same run with ownership acquired before old ownership releases", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				withConfiguredAuth: false,
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("requested resume summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerId = "requested-failure-resume";
+			admitOwners(harness, ownerId);
+			const runLease = internals._promptSettlementTracker.acquire(ownerId, "run");
+			const message = continuationMessage("requested failure resume work");
+			internals._postCompactionContinuationMessages = [message];
+			internals._continueAfterThresholdCompaction = true;
+			internals._lastRunPromptIds = [ownerId];
+
+			// First requested compaction fails (auth missing): the same run must
+			// resume, the continuation ownership is acquired before the old run
+			// lease is released, and NO generation is bumped.
+			await internals._runAutoCompaction("requested", false);
+			expect(observer.generationBumps).toEqual([]);
+			const window = internals._continuationSettlementWindow!;
+			expect(window).toMatchObject({
+				owners: [ownerId],
+				obligationMessages: [message],
+				revision: 1,
+				state: "scheduled",
+			});
+			expect(observer.acquiresOfContinuation()).toEqual([{ promptId: ownerId, kind: "compaction_continuation" }]);
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			// The acquire happened while the owner was still settling (no outcome yet).
+			expect(observer.acquireContexts[0]).toMatchObject({
+				promptId: ownerId,
+				outcomeAtAcquire: undefined,
+			});
+			// Old run lease release: owner STILL settling (the continuation lease
+			// was acquired before the old ownership released — no 0-lease gap and
+			// no premature completed outcome).
+			runLease.release();
+			expect(harness.session.getPromptOutcome(ownerId)).toBeUndefined();
+			// The continuation runs once and settles the resumed run completed.
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+				promptId: ownerId,
+				status: "completed",
+				traceGeneration: 0,
+			});
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
 			continueSpy.mockRestore();
 			observer.restore();
 		});
