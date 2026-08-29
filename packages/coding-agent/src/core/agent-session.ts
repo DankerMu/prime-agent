@@ -1194,6 +1194,7 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+	private _retryContinueTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 	/**
 	 * Runtime-only retry-window tuple (group 3): the deduped identity-bearing
 	 * owner snapshot captured at first window creation and the parallel
@@ -1274,6 +1275,12 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	/** One-shot dispose seal: settleAll(cancelled, session_disposed, {released:true}) at most once. */
+	private _promptSettlementDisposeSealed = false;
+	/** True while settleAll for dispose is emitting; blocks public dispose() teardown reentry. */
+	private _promptSettlementDisposeSealing = false;
+	/** AbortSignal of the retry sleep closed by dispose-owned detach; late catch must no-op. */
+	private _disposeOwnedRetryAbortSignal: AbortSignal | undefined = undefined;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
@@ -3926,6 +3933,11 @@ export class AgentSession {
 		if (!resolve) {
 			return;
 		}
+		const continueTimer = this._retryContinueTimer;
+		this._retryContinueTimer = undefined;
+		if (continueTimer !== undefined) {
+			clearTimeout(continueTimer);
+		}
 		for (const lease of window?.leases ?? []) {
 			lease.release();
 		}
@@ -4146,7 +4158,7 @@ export class AgentSession {
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
 		}
-		this._disposeAsyncPromise = (async () => {
+		const run = (async () => {
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
 			await this._drainPendingRefinementForDisposal();
@@ -4154,10 +4166,18 @@ export class AgentSession {
 				return this._disposeCallbacksPromise;
 			}
 			this._disposing = true;
+			try {
+				this._sealPromptSettlementForDispose();
+			} catch (error) {
+				this._disposing = false;
+				this._disposeAsyncPromise = undefined;
+				throw error;
+			}
 			this._sessionActionCommitDisposeAbortController.abort();
 			await this._disposeAsyncOnce();
 		})();
-		return this._disposeAsyncPromise;
+		this._disposeAsyncPromise = run;
+		return run;
 	}
 
 	/**
@@ -4338,11 +4358,52 @@ export class AgentSession {
 		return this._disposeCallbacksPromise;
 	}
 
+	private _sealPromptSettlementForDispose(): void {
+		if (this._promptSettlementDisposeSealed) {
+			return;
+		}
+		this._promptSettlementDisposeSealing = true;
+		try {
+			this._promptSettlementTracker.settleAll("cancelled", "session_disposed", { released: true });
+			this._promptSettlementDisposeSealed = true;
+		} finally {
+			this._promptSettlementDisposeSealing = false;
+		}
+	}
+
+	/** Detach retry sleep/window/leases after dispose seal. Does not fail-fence overflow owners. */
+	private _detachRetryResourcesForDispose(): void {
+		const controller = this._retryAbortController;
+		this._retryAbortController = undefined;
+		if (controller) {
+			this._disposeOwnedRetryAbortSignal = controller.signal;
+		}
+		if (this._retryAttempt > 0) {
+			this._autoCompactionAbortController?.abort();
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: "Retry cancelled",
+			});
+			this._retryAttempt = 0;
+		}
+		this._retryAuthFailureSources = [];
+		this._resolveRetry();
+		controller?.abort();
+	}
+
 	dispose(): void {
-		if (this._disposed) {
+		if (this._disposed || this._promptSettlementDisposeSealing) {
 			return;
 		}
 		this._disposed = true;
+		try {
+			this._sealPromptSettlementForDispose();
+		} catch (error) {
+			this._disposed = false;
+			throw error;
+		}
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
@@ -4356,10 +4417,10 @@ export class AgentSession {
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
-			// #29 transition: dispose cancels window owners then closes so waiters
-			// do not hang. Group 6 moves the session-wide atomic
-			// settleAll(...,{released:true}) before window/action lease close.
+			// Settlement is already sealed cancelled+released; window/action/retry
+			// leases still detach/release exact-once and are tracker no-ops.
 			this._discardPendingAutoRefine({ cancelPostCompactionContinue: true, cancelPostCompactionOwners: "cancel" });
+			this._detachRetryResourcesForDispose();
 			this._autoRefineBranchVersion++;
 			this._cancelActiveRlmChildRuns("Parent session disposed");
 			for (const unsubscribe of this._rlmChildUnsubscribes.values()) {
@@ -7274,6 +7335,75 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	private _isSessionInternalAutonomousInheritedAction(
+		action: QueuedSessionAction,
+		currentOwners: ReadonlySet<string>,
+	): boolean {
+		if (action.payload.kind !== "turn") return false;
+		const inherit = action.lineage?.inherit;
+		if (!inherit || inherit.length === 0) return false;
+		const owners = action.promptIds ?? [];
+		if (owners.length === 0) return false;
+		if (!owners.some((owner) => currentOwners.has(owner))) return false;
+		const primary: AgentMessage = primaryDeliveryRecord(action).message;
+		return (
+			this._postCompactionContinuationMessages.includes(primary) ||
+			this._pendingThresholdCompactionAutonomousMessages.includes(primary) ||
+			this._queuedAutonomousContinuationSnapshots.get(primary) !== undefined
+		);
+	}
+
+	/** Capture current-run owners and detach matching internal inherited children/window/retry. */
+	private _abortCurrentOwnerOwnedWork(
+		preserveContinuationSettlement: boolean,
+		options: { clearIndependentHiddenActions: boolean } = { clearIndependentHiddenActions: true },
+	): void {
+		const currentOwners = [...new Set(this._currentRunOwners)];
+		const currentOwnerSet = new Set(currentOwners);
+		const matching = this._actionStore
+			.clearableActions()
+			.filter((action) => this._isSessionInternalAutonomousInheritedAction(action, currentOwnerSet));
+		const matchingIds = new Set(matching.map((action) => action.id));
+		const matchingMessages: AgentMessage[] = matching.flatMap((action) =>
+			action.payload.kind === "turn" ? [primaryDeliveryRecord(action).message] : [],
+		);
+		const matchingMessageSet = new Set<AgentMessage>(matchingMessages);
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(message) => !matchingMessageSet.has(message),
+		);
+		this._pendingThresholdCompactionAutonomousMessages = this._pendingThresholdCompactionAutonomousMessages.filter(
+			(message) => !matchingMessageSet.has(message),
+		);
+		for (const message of matchingMessages) {
+			this._queuedAutonomousContinuationSnapshots.delete(message);
+		}
+		this.agent.removeQueuedMessages((message) => matchingMessageSet.has(message));
+		if (this._continuationPumpOwnerAction && matchingIds.has(this._continuationPumpOwnerAction.id)) {
+			this._continuationPumpOwnerAction = undefined;
+			if (this._continuationSettlementWindow) this._continuationSettlementWindow.pumpOwned = false;
+		}
+		if (matchingIds.size > 0) {
+			this._cancelSessionActions(
+				(action) => matchingIds.has(action.id),
+				new Error("Prompt aborted before delivery."),
+			);
+			this._emitQueueUpdate();
+		}
+		if (options.clearIndependentHiddenActions) {
+			this._cancelSessionActions(
+				(action) => action.payload.kind === "turn" && !action.payload.queueVisible && !matchingIds.has(action.id),
+				new Error("Prompt aborted before delivery."),
+			);
+		}
+		if (!preserveContinuationSettlement) {
+			this._cancelPostCompactionContinue({ owners: "cancel" });
+		}
+		this._abortRetry(preserveContinuationSettlement);
+		for (const owner of currentOwners) {
+			this._promptSettlementTracker.requestCancel(owner);
+		}
+	}
+
 	requestAbort(): void {
 		this._requestAbort();
 	}
@@ -7292,15 +7422,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
-		this._cancelSessionActions(
-			(action) => action.payload.kind === "turn" && !action.payload.queueVisible,
-			new Error("Prompt aborted before delivery."),
-		);
-		if (!preserveContinuationSettlement) {
-			// Explicit abort: cancel fence on captured window owners, then exact-once close.
-			this._cancelPostCompactionContinue({ owners: "cancel" });
-		}
-		this._abortRetry(preserveContinuationSettlement);
+		this._abortCurrentOwnerOwnedWork(preserveContinuationSettlement);
 		this.abortCompaction();
 		this.abortBranchSummary();
 		this.abortBash();
@@ -7342,8 +7464,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
-		this._cancelPostCompactionContinue({ owners: "cancel" });
-		this.abortRetry();
+		this._abortCurrentOwnerOwnedWork(false, { clearIndependentHiddenActions: false });
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
@@ -12021,6 +12142,11 @@ export class AgentSession {
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
+			const disposeOwnedSignal = this._disposeOwnedRetryAbortSignal;
+			if (disposeOwnedSignal?.aborted) {
+				this._retryAbortController = undefined;
+				return false;
+			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this._retryAttempt;
 			this._markProviderAuthStaleForRetryFailure(message, options);
@@ -12038,12 +12164,20 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
-		// Retry via continue() - use setTimeout to break out of event handler chain
-		setTimeout(() => {
+		// Retry via continue() - use setTimeout to break out of event handler chain.
+		// Publish the handle so abort/dispose after sleep but before the callback
+		// can cancel it through `_resolveRetry`. The callback detaches only the
+		// exact handle it scheduled; a later retry's timer is left intact.
+		const continueTimer = setTimeout(() => {
+			if (this._retryContinueTimer !== continueTimer) {
+				return;
+			}
+			this._retryContinueTimer = undefined;
 			this.agent.continue().catch(() => {
 				// Retry failed - will be caught by next agent_end
 			});
 		}, 0);
+		this._retryContinueTimer = continueTimer;
 
 		return true;
 	}

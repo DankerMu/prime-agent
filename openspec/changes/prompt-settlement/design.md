@@ -98,8 +98,8 @@ export class PromptSettlementTracker {
 - **promptId admission**：turn action新增非空 `promptIds` 与同长度/owner对应的 `runLeases`。公共 action单 owner，内部 inherit可多 owner。`_createPreparedTurnAction` 只准备候选/lineage；`_admitSessionInput` 通过所有 pre-admission检查后、enqueue前：default先 admit再 acquire一个 run lease，inherit校验每个 owner仍 settling并逐 owner acquire（同 kind实例允许并存）；任一 owner已终态则放弃整个 inherit action且不入队。host internalPrompt总是新的单 owner；session command无这些字段。
 - **共享 run owners**：当前 pump 在 `steeringMode`/`followUpMode === "all"` 时会把多个 turn action 合并为一次 `agent.prompt(preparedMessages)`，因此 owner 不能用单数表示。session 在调用 `agent.prompt` 前把本次所有 turn action 的 promptIds 去重为 `_lastRunPromptIds: string[]`，同时设置 `_currentRunOwners`；retry 对 `_lastRunPromptIds`、compaction continuation 对调度时捕获的 owner 快照逐 id 调用现有 tracker API。tracker 仍按单个 promptId 记账，不新增集合类型、不合并 promptId，也不改变 `"all"` batching userspace。A 的 continuation 被 B 重排时继续使用 A 的captured owner/lease tuple；runner调用`agent.continue()`前临时把A owners安装到`_lastRunPromptIds`，使continuation内group3 retry继承A而不是B或zero-owner，结束后恢复此前snapshot。消息归属仍由组7使用 `_currentRunOwners`（D5）。
 - **steer/followUp**：`steer()`（`:4850`）、`followUp()`（`:4883`）与 `/goal` 斜杠命令的 goal context 入队（`_runOrQueueGoalContext` `:2063`，由用户命令触发）都经 `_createPreparedTurnAction` 缺省 lineage → 新 promptId；它们不会并入正在结算的 prompt，即使随后因 `"all"` batching 与其他 action 共享一次 run——共享 run 只使各自 outcome 等待同一份 run-owned work，不合并 lineage identity。
-- **abort 与清队边界**：挂点是 `requestAbort()`。普通 abort保留真正的可见用户队列，但必须先识别并移除当前 owners的内部 inherited autonomous actions（即使其 `queueVisible` 默认 true，它们也不是用户队列）：对其 owners置 cancel fence并释放action已存 leases；同时取消/释放 compaction continuation leases，再对当前 run owners requestCancel，当前 action completion最终释放自己的 run leases。`clearQueue`/mutate delete/abortAndClearQueue取消实际移除的用户 action：default先cancel再release，inherit非-abort只release。任何取消路径禁止临时 acquire或让终态 inherit action恢复后执行。
-- **dispose**：`dispose()`（`:3976`）在拒绝 `_agentMessageOutcomes`（`:4009-4013`）的同一处调用 `tracker.settleAll("cancelled", "session_disposed", { released: true })`。终态、released fence、persist、emit 与 waiter resolve 在一次同步操作内完成，不再随后逐项 `release()`；每个 prompt 因而仍只有 admission 与终态/released 两条 ledger 记录。
+- **abort 与清队边界**：挂点是 `requestAbort()`。普通 abort保留真正的可见用户队列，但必须先复制当前 run owners，识别并移除与其相交的内部 inherited autonomous actions（即使其 `queueVisible` 默认 true，它们也不是用户队列），同时删除对应autonomous message/map/pending bookkeeping并释放action已存child leases；随后取消/释放 compaction continuation leases、对captured current owners requestCancel，当前 action completion最终释放自己的 run leases。`abortForUpdateRestart()`复用相同owner cleanup但继续保留visible queue/recovery snapshot。`clearQueue`/mutate delete/abortAndClearQueue取消实际移除的用户 action：default先cancel再release，inherit非-abort只release。任何取消路径禁止临时 acquire或让终态 inherit action恢复后执行。
+- **dispose**：一个session-private幂等seal helper调用`tracker.settleAll("cancelled", "session_disposed", { released: true })`且每session最多执行一次。直接`dispose()`在置`_disposed=true`后、任何settlement-owned resource cleanup前调用；`disposeAsync()`保留既有graceful pre-drain，但在置`_disposing=true`后、abort commit-fence controller或异步child/kernel cleanup前调用。终态、released fence、persist、emit 与 waiter resolve 在一次同步操作内完成，不再随后逐项tracker `release(promptId)`；stored action/window/retry lease仍detach/release exact-once，但对terminal/released record为无副作用no-op，每个 prompt 因而仍只有 admission 与终态/released两条 ledger记录。
 - **排除项**：auto-refine（`_scheduledAutoRefineTimers`）、cron/heartbeat、detached subagent、`session_command` 不取 lease；它们产生的后续消息不调用 `recordFinalMessage`。
 
 ### D4 `promptAndSettle` 与 `prompt_outcome` 事件
@@ -578,3 +578,83 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不实现#31主动abort/dispose ownership清理，不记录finalMessageIds，不接ledger/recovery/wire/modes，不改变compaction或autonomous决策策略。
 - 不把`/goal` goal context改为inherit；它仍是独立default prompt identity。发现其他producer/abort问题只报告，不顺手修。
+
+## Issue #31 implementation fixture
+
+Fixture level: expanded（上游建议compact；本切片修改`requestAbort`/update-restart/dispose的取消与共享owner状态转换，命中cancellation、shared state transition及project teardown mandatory expanded triggers）
+Repair intensity: high（顺序错误会使current owner提前completed、queued user prompt被误cancel、终态owner被重新inherit，或dispose先写出未released终态）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts` 的`_requestAbort`、`abortForUpdateRestart`、`dispose`及一个共享的current-owner/internal-inherit cleanup helper；focused settlement/queue/action-race/update-restart tests。tracker、ActionStore与wire API不改。
+- Must preserve: ordinary abort与update restart保留真正可见的queued user/session-command actions、其稳定promptIds/run leases、delivery waiters与recovery snapshot；`clearQueue`/mutate delete/in-process `abortAndClearQueue`仍只取消实际移除项；retry、manual-compaction preserve token、queue visibility、AgentMessageOutcome、goal abort与RLM/bash/refine teardown保持现有时序。
+- Must add: abort同步捕获当前shared Agent run的去重owners，摘除与其相交的queued/selected/preparing internal inherited autonomous actions及对应message/map/pending bookkeeping，释放这些child action leases；关闭continuation/retry resources，对captured current owners置cancel fence，再abort Agent。一个幂等session-private dispose seal在任何可能释放action/window/retry lease或同步触发cleanup listener之前，对全部active prompts至多一次`settleAll("cancelled","session_disposed",{released:true})`。
+- Staged boundary: #32记录`finalMessageIds`；#33写ledger，因此本切片用tracker snapshot/settleAll spy验证terminal record，persist仍为session no-op callback；#34+ recovery/wire/modes不改。`disposeAsync()`既有graceful pre-drain不改，但pre-drain结束后必须在abort commit-fence controller与child/kernel teardown前seal；随后同步`dispose()`复用该幂等seal。
+- Seam under test: in-process `AgentSession` + faux provider/fake timer，结合只读ActionStore、tracker snapshot与lease/settleAll spies；production threshold producer必须建立真实inherited action，不能仅手工伪造queueVisible flag。
+
+### Abort and dispose ownership contract
+
+- **Current owner source**: `_currentRunOwners`是ordinary action-pump正在执行的shared Agent run owner snapshot；在调用abort helper入口同步复制去重数组，后续action removal、lease release、terminal event或snapshot clear不得改变本次scope。direct post-compaction runner仍由其captured continuation window owners负责；不得从全部active tracker records、visible queue或之后的`_lastRunPromptIds`猜owner。
+- **Internal inherited classification**: 待摘除action必须同时满足turn、`lineage?.inherit`非空、其accepted `promptIds`与captured current owners相交，并来自session internal autonomous obligation；`queueVisible`不是分类依据。移除一个multi-owner action是整项原子操作并消费其全部stored child leases；独立default-lineage用户B即使owner不同/同lane也不得移除。
+- **Bookkeeping close**: 在action release的同一事务中，从`_postCompactionContinuationMessages`、`_pendingThresholdCompactionAutonomousMessages`、queued autonomous snapshot map、Agent queued messages及continuation pump-owner引用移除对应message；不得留下resume时会尝试对terminal owner重新admit/acquire的orphan obligation。只清本次matching children，不回滚已消费的autonomous usage，也不删除其他owner/ownerless obligation。
+- **Ordinary/update abort order**: capture current owners → detach/remove matching internal children and their bookkeeping → release those child leases → cancel/detach continuation window exact-once → close matching retry state → `requestCancel`每个captured current owner → abort compaction/branch/bash/refine/Agent。当前running action自己的run lease仍由既有terminal/finally路径exact-once消费；cancel fence必须先于它可能成为最后一份lease。已有failure intent不覆盖cancel优先级。
+- `requestAbort()`与`abortForUpdateRestart()`复用上述ownership cleanup。两者均保留可见queued B；restart继续suspend pump并保留B的delivery waiter/recovery manifest语义。manual compact的有效park token仍只保护其exact parked continuation tuple，不跳过current owner fence或无关外部abort。
+- `clearQueue`、mutate delete与`abortAndClearQueue`不按owner批量清理：只有从store实际移除的default B先requestCancel再release；ordinary abort留下的B可在`resumeQueuedWork()`后以原id/lease执行。
+- **Dispose atomic point**: session-private seal helper以自身one-shot标志调用tracker `settleAll(...,{released:true})`。直接`dispose()`先置`_disposed=true`阻止reentrant admission，随后立即seal；`disposeAsync()`完成既有graceful pre-drain后先置`_disposing=true`，随后立即seal，再abort commit-fence controller并做child/kernel teardown。两路在seal后才允许auto-refine/window/retry/action cleanup、queue clear或外部listener触发的lease release。同步`prompt_outcome` listener重入任一路dispose必须no-op；后续所有stored lease仍detach/release exact-once，但tracker视其为terminal/released no-op，不得追加terminal/released record或emit。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: not selected - 方法签名与connection/CLI wire不变；只修既有abort/dispose语义。
+- Config / project setup: not selected - 无配置/default变化。
+- File IO / path safety / overwrite: not selected - #33前tracker persist callback仍不写JSONL。
+- Schema / columns / units / field names: selected - dispose terminal record必须同时为`cancelled`、`released:true`、`settleReason:"session_disposed"`且无failure；不新增字段。
+- Auth / permissions / secrets: not selected - 无授权或secret边界。
+- Concurrency / shared state / ordering: selected - current snapshot、multi-owner child/window/retry/current lease顺序与同步outcome reentry是核心。
+- Resource limits / large input / discovery: not selected - 只遍历当前有界action/owner/message集合，不新增timer或polling。
+- Legacy compatibility / examples: selected - visible queue、restart manifest、manual compact、retry/goal/AgentMessageOutcome与ownerless work必须保持。
+- Error handling / rollback / partial outputs: selected - partial cleanup、repeated abort/dispose、terminal owner resume与listener reentry必须无orphan/double release。
+- Release / packaging / dependency compatibility: not selected - 无export、dependency或build shape变化。
+- Documentation / migration notes: not selected - shared运行时文档由#42收口；本fixture记录阶段契约。
+- TUI focus/render lifecycle: not selected - TUI无改动；connection组合行为只做回归。
+- Session/extension teardown lifecycle: selected - abort/update restart/dispose及同步cleanup listener是直接修改面。
+
+### Required evidence
+
+- production A threshold在provider仍active时已queue inherited child；另排default visible B。`requestAbort()` -> child action/message/pending/pump bookkeeping全部消失且child lease各release一次，continuation lease各release一次，A先有failure也只得到一个cancelled/no-failure outcome；B仍在store、同promptId/lease且无outcome。`resumeQueuedWork()`后B执行completed，零terminal-owner inherit acquire/throw。
+- `"all"` A/B current run + one multi-owner inherited child -> abort整项摘除、每owner child/window lease exact release、A/B各一次cancelled；不按owner重复删除action。无关owner C的default visible action或ownerless internal work不被current-owner filter误删。
+- `abortForUpdateRestart()`同样清current/inherited/window owners并cancel current outcome，但visible queued B、agent-message delivery waiter与recovery snapshot保持；suspended期间provider不执行B，既有restart恢复测试不变。
+- ordinary abort后`clearQueue`/mutate delete/`abortAndClearQueue`边界：未实际移除时B持续settling；实际移除后B恰一次cancelled。重复abort/clear不增加release/event。
+- dispose有1个running A、2个queued B/C，并至少让window或retry/action lease成为任一owner的最后潜在资源；direct `dispose()`与`disposeAsync()`分别spy证明`settleAll`发生在第一份cleanup lease release及commit-fence abort-controller之前，且两路串行/重复调用只执行一次seal。A/B/C各一次cancelled outcome、无failure，snapshot各只有一个terminal record形状`released:true, settleReason:"session_disposed"`；lease close后不变。同步outcome subscriber重入dispose亦不重复cleanup。
+- focused settlement Group 6、queue/action-race/update-restart/compaction-retry teardown siblings；root `npm run check`（无写入）、workspace build与strict OpenSpec均exit 0。
+
+### Invariant Matrix
+
+- Governing invariant: abort只取消调用时current run及其owned internal descendants而保留独立visible queue；dispose则在任何资源release前把调用时全部active prompts一次性封为cancelled+released，任一路径不得重开或重复settle。
+- Source-of-truth identity/contract: abort入口复制的`_currentRunOwners`；`action.lineage`与`action.promptIds[i] ↔ runLeases[i]`；continuation/retry captured tuples；dispose invocation-start tracker active set与terminal record。
+- Producers: action pump安装current owners；threshold producer建立internal inherit/action bookkeeping；tracker admission；dispose seal不产生新identity。
+- Validators/preflight: internal turn+inherit+source/message+owner-intersection classification、manual preserve token、one-shot dispose seal、tracker terminal/released guards与session admission `_disposed/_disposing` fence。
+- Storage/cache/query: ActionStore、autonomous message/maps/pending arrays、continuation/retry tuples及tracker Map/snapshot/query；recovery snapshot保留visible actions但不序列化live leases。
+- Public routes/entrypoints: `requestAbort`、`abort`、`abortForUpdateRestart`、`dispose`/`disposeAsync`；`clearQueue`/mutate与connection `abortAndClearQueue`为unchanged sibling routes。
+- Frontend/downstream consumers: session pump、update-restart manifest、AgentMessageOutcome/delivery waiters、goal/RLM/bash/refine/manual compaction与future persistence。
+- Failure paths/rollback/stale state: prior failure+abort precedence、multi-owner overlap、queued child orphan bookkeeping、late terminal/finally、repeated/reentrant abort/dispose、terminal-owner resume、parked continuation与queued B。
+- Evidence/audit/readiness: production faux-provider/fake-timer tests、direct order spies/snapshot record assertions、existing queue/update restart regressions、check/build/OpenSpec。
+- Regression rows:
+  - current A(+B shared) with queued inherited child/window + independent visible C -> abort exact current descendants cancelled once，C保留原identity/lease并可resume。
+  - matching child默认`queueVisible:true`或multi-owner ->仍按lineage/source/owner摘除一次；default user action同lane不误删。
+  - current owners有failure intent、late terminal或重复abort -> cancel优先且每lease/event exact-once，无orphan再admit。
+  - dispose active+queued+window/retry/action resources -> invocation-start active set先terminal+released，后cleanup全为tracker no-op；reentrant/repeated dispose不新增记录。
+  - update restart/manual compact/clear-mutate/ownerless sibling consumers ->既有queue recovery、park/resume、actual-removal与settlement-exclusion行为保持。
+
+### Boundary-surface checklist
+
+- Shared helper roots: current-owner internal-child cleanup由`requestAbort`与update restart共用；dispose只复用tracker `settleAll`，不复制terminal循环。
+- Public entrypoints: abort family与dispose family；queue mutation/connection组合只做兼容回归。
+- Producer/consumer evidence: action lineage、message bookkeeping、captured leases与tracker record/outcome必须在同一测试关联，不能以queue文本或最终状态单独代替。
+- Stale-state/idempotency: snapshot-before-release、detach-before-callback、terminal/released no-op、重复abort/dispose与late action finally全覆盖。
+- Unchanged downstream consumers: visible queue/restart snapshot、manual compaction token、retry/events、goal/RLM/bash/refine、recovery/wire。
+
+### Non-goals for #31
+
+- 不实现JSONL persist/recovery、finalMessageIds、AgentConnection/daemon/RPC/Print/ACP wire，不改tracker API或action recovery schema。
+- 不改变abort是否终止bash/refine/RLM/goal、update restart manifest格式、clearQueue返回文本、autonomous usage回滚策略、retry/compaction eligibility；范围外发现只报告。
