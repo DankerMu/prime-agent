@@ -354,6 +354,20 @@ function compactRequestTool(getHarness: () => Harness): AgentTool {
 	};
 }
 
+/** Same large-context tool the existing production threshold oracle uses to cross compaction. */
+function largeContextThresholdTool(): AgentTool {
+	return {
+		name: "large-context",
+		label: "Large context",
+		description: "Returns enough context to cross the compaction threshold",
+		parameters: Type.Object({}),
+		execute: async () => ({
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			details: {},
+		}),
+	};
+}
+
 function admitTrackedContinuationAction(harness: Harness, message: AgentMessage, wake = false): void {
 	const session = harness.session as unknown as {
 		_createPreparedTurnAction(
@@ -6386,6 +6400,915 @@ describe("AgentSession prompt settlement (group 2)", () => {
 				traceGeneration: 0,
 			});
 			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		// ===========================================================================
+		// [partition-model fix] Round 2 depth closure: first-error overflow subset
+		// is authoritative for scheduler priority/abortRetry; pump complement A is
+		// consumed at A's own terminal while B's overflow recovery remains pending.
+		// ===========================================================================
+
+		it("[partition-production fix] production: during A's streaming run, B admitted after A queued first-error overflow + C; B recovery runs once under B before A/C", async () => {
+			// Fake timers are incompatible with this fully production path: gated
+			// `agent.prompt`/tool execution plus `advanceTimersByTimeAsync(0)`
+			// timer-storms, and `vi.waitFor` auto-advances 50ms into the 100ms
+			// recovery timer. Real timers + an observational overflow-stamp
+			// deferred are the deterministic subset-stamp signal. A 0ms
+			// A-before-B discriminator could not be constructed without
+			// manufacturing timing; see the follow-up report.
+			vi.useRealTimers();
+			const largeContextTool = largeContextThresholdTool();
+			const harness = await createHarness({
+				tools: [largeContextTool],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 1,
+					maxTurns: 100,
+					gates: { commands: [], maxRetries: 1 },
+				},
+				settings: {
+					retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+					compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 },
+				},
+				models: [{ id: "faux-1", contextWindow: 200_000 }],
+				extensionFactories: [compactSummaryExtension("partition production threshold summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const callLog: string[] = [];
+			const aFirstGate = createDeferred();
+			let aFirstStarted = false;
+			const bFirstGate = createDeferred();
+			let bFirstStarted = false;
+			const recoveryGate = createDeferred();
+			let recoveryStarted = false;
+			const aContinuationGate = createDeferred();
+			let aContinuationStarted = false;
+			const cGate = createDeferred();
+			let cStarted = false;
+			const overflowStamp = createDeferred();
+			const stampFacts = {
+				recoveryStarted: false,
+				aContinuationStarted: false,
+				cStarted: false,
+				continueCalls: 0,
+				callLog: [] as string[],
+			};
+			let aBoundaryFacts:
+				| {
+						owners: string[];
+						overflowOwners: string[];
+						windowMessages: string[];
+						actionTexts: string[];
+				  }
+				| undefined;
+			harness.setResponses([
+				async () => {
+					callLog.push("A-initial-tool");
+					aFirstStarted = true;
+					await aFirstGate.promise;
+					return fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" });
+				},
+				async () => {
+					callLog.push("B-first-error");
+					bFirstStarted = true;
+					await bFirstGate.promise;
+					return fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: "prompt is too long",
+					});
+				},
+				async () => {
+					callLog.push("B-recovery");
+					recoveryStarted = true;
+					await recoveryGate.promise;
+					return fauxAssistantMessage("B recovered after first-error overflow");
+				},
+				async () => {
+					callLog.push("A-continuation");
+					aContinuationStarted = true;
+					aBoundaryFacts = {
+						owners: [...(internals._continuationSettlementWindow?.owners ?? [])],
+						overflowOwners: [...(internals._continuationSettlementWindow?.overflowRecoveryOwners ?? [])],
+						windowMessages: (internals._continuationSettlementWindow?.obligationMessages ?? []).map((message) =>
+							getMessageText(message),
+						),
+						actionTexts: turnActions(harness).map((action) => action.payload.text),
+					};
+					await aContinuationGate.promise;
+					return fauxAssistantMessage("A continuation done");
+				},
+				async () => {
+					callLog.push("C-run");
+					cStarted = true;
+					await cGate.promise;
+					return fauxAssistantMessage("C done");
+				},
+			]);
+
+			const aOwnerIds: string[] = [];
+			const aSettledP = harness.session.promptAndSettle("partition production A", {
+				settlementAdmission: (info) => aOwnerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => {
+				expect(aFirstStarted).toBe(true);
+				expect(harness.session.isStreaming).toBe(true);
+			});
+			expect(aOwnerIds).toHaveLength(1);
+			const ownerA = aOwnerIds[0]!;
+
+			// Public independent B: promptAndSettle while A streams throws without
+			// streamingBehavior (documented `_prompt` contract). followUp-mode
+			// queues B into the FIFO `when_run_idle` lane with its own admitted
+			// prompt identity and run lease, before A's later threshold continuation.
+			const bOwnerIds: string[] = [];
+			const bSettledP = harness.session.promptAndSettle("partition production B", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+				settlementAdmission: (info) => bOwnerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => expect(bOwnerIds).toHaveLength(1));
+			expect(harness.session.getFollowUpMessages()).toEqual(["partition production B"]);
+			expect(actionByText(harness, "partition production B").runLeases).toHaveLength(1);
+			const ownerB = bOwnerIds[0]!;
+
+			const agent = harness.session.agent;
+			const realContinue = agent.continue.bind(agent);
+			const ownersAtContinue: string[][] = [];
+			const continueSpy = vi.spyOn(agent, "continue").mockImplementation(async () => {
+				ownersAtContinue.push([...internals._lastRunPromptIds]);
+				await realContinue();
+			});
+			const promptSpy = vi.spyOn(agent, "prompt");
+			const realRunAutoCompaction = internals._runAutoCompaction.bind(internals);
+			const compactionSpy = vi
+				.spyOn(internals, "_runAutoCompaction")
+				.mockImplementation(async (reason: "overflow" | "threshold" | "requested", willRetry: boolean) => {
+					const result = await realRunAutoCompaction(reason, willRetry);
+					if (reason === "overflow") {
+						stampFacts.recoveryStarted = recoveryStarted;
+						stampFacts.aContinuationStarted = aContinuationStarted;
+						stampFacts.cStarted = cStarted;
+						stampFacts.continueCalls = continueSpy.mock.calls.length;
+						stampFacts.callLog = [...callLog];
+						overflowStamp.resolve();
+					}
+					return result;
+				});
+
+			aFirstGate.resolve();
+			await vi.waitFor(() => {
+				expect(harness.eventsOfType("compaction_end").some((event) => event.reason === "threshold")).toBe(true);
+				expect(observer.generationBumps).toEqual([ownerA]);
+				expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			});
+			expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
+				reason: "threshold",
+				aborted: false,
+				result: expect.objectContaining({ summary: "partition production threshold summary" }),
+			});
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+			expect(observer.acquiresOfContinuation()).toEqual([{ promptId: ownerA, kind: "compaction_continuation" }]);
+			const aLeaseRecord = observer.continuationLeases[0]!;
+			expect(aLeaseRecord.releaseCalls).toBe(0);
+
+			await harness.session.followUp("queued C after partition recovery", undefined, { resumeIfIdle: true });
+			const ownerC = actionByText(harness, "queued C after partition recovery").promptIds![0]!;
+
+			await vi.waitFor(() => expect(bFirstStarted).toBe(true));
+			expect(aContinuationStarted).toBe(false);
+			expect(cStarted).toBe(false);
+			expect(callLog).toEqual(["A-initial-tool", "B-first-error"]);
+
+			bFirstGate.resolve();
+			await overflowStamp.promise;
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([ownerB]);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA, ownerB]);
+			expect(harness.eventsOfType("compaction_end").map((event) => event.reason)).toEqual(["threshold", "overflow"]);
+			expect(observer.continuationLeases[1]!.promptId).toBe(ownerB);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(0);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryWindow).toBeUndefined();
+			expect(internals._retryAttempt).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			// Stamp-boundary snapshot: captured synchronously when production
+			// overflow compaction returns, before the 100ms timer is relevant.
+			expect(stampFacts.aContinuationStarted).toBe(false);
+			expect(stampFacts.recoveryStarted).toBe(false);
+			expect(stampFacts.cStarted).toBe(false);
+			expect(stampFacts.continueCalls).toBe(0);
+			expect(stampFacts.callLog).toEqual(["A-initial-tool", "B-first-error"]);
+			expect(aContinuationStarted).toBe(false);
+			expect(cStarted).toBe(false);
+
+			await vi.waitFor(() => expect(recoveryStarted || aContinuationStarted).toBe(true));
+			expect(aContinuationStarted).toBe(false);
+			expect(recoveryStarted).toBe(true);
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(ownersAtContinue).toEqual([[ownerB]]);
+			expect(cStarted).toBe(false);
+			expect(promptSpy).toHaveBeenCalledTimes(1);
+			expect(callLog).toEqual(["A-initial-tool", "B-first-error", "B-recovery"]);
+			recoveryGate.resolve();
+			const outcomeB = await bSettledP;
+			expect(outcomeB).toMatchObject({ promptId: ownerB, status: "completed" });
+			expect(outcomeB?.failure).toBeUndefined();
+			await vi.waitFor(() => expect(aContinuationStarted).toBe(true));
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([]);
+			expect(aBoundaryFacts?.owners).toEqual([ownerA]);
+			expect(aBoundaryFacts?.overflowOwners).toEqual([]);
+			expect(aBoundaryFacts?.windowMessages.join("\n")).not.toMatch(/partition production B/i);
+			expect(aBoundaryFacts?.actionTexts).not.toContain("partition production B");
+			aContinuationGate.resolve();
+			const outcomeA = await aSettledP;
+			await vi.waitFor(() => expect(cStarted).toBe(true));
+			cGate.resolve();
+			const outcomeC = await harness.session.waitForPromptOutcome(ownerC);
+			expect(callLog).toEqual(["A-initial-tool", "B-first-error", "B-recovery", "A-continuation", "C-run"]);
+			expect(outcomeA).toMatchObject({ promptId: ownerA, status: "completed", traceGeneration: 1 });
+			expect(outcomeA?.failure).toBeUndefined();
+			expect(outcomeC).toMatchObject({ promptId: ownerC, status: "completed" });
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(ownersAtContinue).toEqual([[ownerB]]);
+			expect(promptSpy).toHaveBeenCalledTimes(3);
+			expect(aLeaseRecord.releaseCalls).toBe(1);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryWindow).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerA),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerB),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerC),
+			).toHaveLength(1);
+			compactionSpy.mockRestore();
+			continueSpy.mockRestore();
+			promptSpy.mockRestore();
+			observer.restore();
+		}, 30_000);
+
+		it("[partition-production fix] abortRetry on production first-error overflow subset fails exactly B without retry tuple; A then C still settle once", async () => {
+			vi.useRealTimers();
+			const largeContextTool = largeContextThresholdTool();
+			const harness = await createHarness({
+				tools: [largeContextTool],
+				autonomous: {
+					enabled: true,
+					maxContinuations: 1,
+					maxTurns: 100,
+					gates: { commands: [], maxRetries: 1 },
+				},
+				settings: {
+					retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+					compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 },
+				},
+				models: [{ id: "faux-1", contextWindow: 200_000 }],
+				extensionFactories: [compactSummaryExtension("partition abort threshold summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const callLog: string[] = [];
+			const aFirstGate = createDeferred();
+			let aFirstStarted = false;
+			const bFirstGate = createDeferred();
+			let bFirstStarted = false;
+			const aContinuationGate = createDeferred();
+			let aContinuationStarted = false;
+			const cGate = createDeferred();
+			let cStarted = false;
+			harness.setResponses([
+				async () => {
+					callLog.push("A-initial-tool");
+					aFirstStarted = true;
+					await aFirstGate.promise;
+					return fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" });
+				},
+				async () => {
+					callLog.push("B-first-error");
+					bFirstStarted = true;
+					await bFirstGate.promise;
+					return fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: "prompt is too long",
+					});
+				},
+				async () => {
+					callLog.push("A-continuation");
+					aContinuationStarted = true;
+					await aContinuationGate.promise;
+					return fauxAssistantMessage("A continuation done after abort");
+				},
+				async () => {
+					callLog.push("C-run");
+					cStarted = true;
+					await cGate.promise;
+					return fauxAssistantMessage("C done after abort");
+				},
+			]);
+
+			const aOwnerIds: string[] = [];
+			const aSettledP = harness.session.promptAndSettle("partition abort A", {
+				settlementAdmission: (info) => aOwnerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => {
+				expect(aFirstStarted).toBe(true);
+				expect(harness.session.isStreaming).toBe(true);
+			});
+			const ownerA = aOwnerIds[0]!;
+			const bOwnerIds: string[] = [];
+			const bSettledP = harness.session.promptAndSettle("partition abort B", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				resumeIfIdle: true,
+				settlementAdmission: (info) => bOwnerIds.push(info.promptId!),
+			});
+			await vi.waitFor(() => expect(bOwnerIds).toHaveLength(1));
+			const ownerB = bOwnerIds[0]!;
+
+			const agent = harness.session.agent;
+			const realContinue = agent.continue.bind(agent);
+			const ownersAtContinue: string[][] = [];
+			const continueSpy = vi.spyOn(agent, "continue").mockImplementation(async () => {
+				ownersAtContinue.push([...internals._lastRunPromptIds]);
+				await realContinue();
+			});
+
+			aFirstGate.resolve();
+			await vi.waitFor(() => {
+				expect(harness.eventsOfType("compaction_end").some((event) => event.reason === "threshold")).toBe(true);
+				expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			});
+			expect(observer.generationBumps).toEqual([ownerA]);
+			const aLeaseRecord = observer.continuationLeases[0]!;
+			await harness.session.followUp("queued C after partition abort", undefined, { resumeIfIdle: true });
+			const ownerC = actionByText(harness, "queued C after partition abort").promptIds![0]!;
+			await vi.waitFor(() => expect(bFirstStarted).toBe(true));
+			const realRunAutoCompaction = internals._runAutoCompaction.bind(internals);
+			const abortFacts = {
+				aborted: false,
+				retryPromiseDefined: false,
+				retryAttempt: -1,
+				aContinuationStarted: false,
+				recoveryStarted: false,
+				callLog: [] as string[],
+			};
+			const compactionSpy = vi
+				.spyOn(internals, "_runAutoCompaction")
+				.mockImplementation(async (reason: "overflow" | "threshold" | "requested", willRetry: boolean) => {
+					const result = await realRunAutoCompaction(reason, willRetry);
+					if (reason === "overflow" && !abortFacts.aborted) {
+						// Production overflow just stamped the subset and armed recovery;
+						// this is still the agent_end continuation, before the 100ms
+						// timer and before the finally-queued pump can start A.
+						abortFacts.retryPromiseDefined = internals._retryPromise !== undefined;
+						abortFacts.retryAttempt = internals._retryAttempt;
+						abortFacts.aContinuationStarted = aContinuationStarted;
+						abortFacts.recoveryStarted = callLog.includes("B-recovery");
+						abortFacts.callLog = [...callLog];
+						harness.session.abortRetry();
+						abortFacts.aborted = true;
+					}
+					return result;
+				});
+			bFirstGate.resolve();
+			await vi.waitFor(() => expect(abortFacts.aborted).toBe(true));
+			expect(abortFacts.retryPromiseDefined).toBe(false);
+			expect(abortFacts.retryAttempt).toBe(0);
+			expect(abortFacts.aContinuationStarted).toBe(false);
+			expect(abortFacts.recoveryStarted).toBe(false);
+			expect(abortFacts.callLog).toEqual(["A-initial-tool", "B-first-error"]);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryWindow).toBeUndefined();
+			expect(internals._retryAttempt).toBe(0);
+			await vi.waitFor(() => expect(harness.session.getPromptOutcome(ownerB)).toBeDefined());
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(observer.continuationLeases[1]!.promptId).toBe(ownerB);
+			expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+			expect(aLeaseRecord.releaseCalls).toBe(0);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([]);
+			const outcomeB = await bSettledP;
+			expect(outcomeB).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(callLog).not.toContain("B-recovery");
+			expect(continueSpy).toHaveBeenCalledTimes(0);
+
+			await vi.waitFor(() => expect(aContinuationStarted).toBe(true));
+			aContinuationGate.resolve();
+			const outcomeA = await aSettledP;
+			await vi.waitFor(() => expect(cStarted).toBe(true));
+			cGate.resolve();
+			const outcomeC = await harness.session.waitForPromptOutcome(ownerC);
+			expect(callLog).toEqual(["A-initial-tool", "B-first-error", "A-continuation", "C-run"]);
+			expect(outcomeA).toMatchObject({ promptId: ownerA, status: "completed", traceGeneration: 1 });
+			expect(outcomeA?.failure).toBeUndefined();
+			expect(outcomeC).toMatchObject({ promptId: ownerC, status: "completed" });
+			expect(continueSpy).toHaveBeenCalledTimes(0);
+			expect(aLeaseRecord.releaseCalls).toBe(1);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toBeUndefined();
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerA),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerB),
+			).toHaveLength(1);
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerC),
+			).toHaveLength(1);
+			compactionSpy.mockRestore();
+			continueSpy.mockRestore();
+			observer.restore();
+		}, 30_000);
+
+		/**
+		 * Deterministic complement construction helper: mixed `[A,B]` window where
+		 * A is the tracked pump complement and B is the first-error overflow
+		 * subset pending with NO retry tuple. A's tracked action is admitted and
+		 * the scheduler armed (pump-owned); the REAL scheduler handoff dispatches
+		 * A's tracked action FIRST (gated on its provider response); B's subset
+		 * is stamped mid-flight (no revision bump, no retry resources); then A's
+		 * real terminal drives the REAL pump complement consumption. Everything
+		 * after the stamp is production scheduling/consumption code.
+		 */
+		async function stageTrackedComplementWindow(
+			harness: Harness,
+			internals: ContinuationInternals,
+			ownerA: string,
+			ownerB: string,
+			messageA: AgentMessage,
+			releaseA: () => void,
+			aStarted: () => boolean,
+		): Promise<{ scheduledRun: Promise<void> }> {
+			admitOwners(harness, ownerA, ownerB);
+			internals._postCompactionContinuationMessages = [messageA];
+			expect(internals._scheduleContinuationForObligation([ownerA], [messageA])).toBe(true);
+			admitTrackedContinuationAction(harness, messageA);
+			internals._schedulePostCompactionContinue();
+			const scheduledRun = internals._runScheduledPostCompactionContinue();
+			await vi.waitFor(() => expect(aStarted()).toBe(true));
+			// B's first-error overflow happens WHILE A's tracked run streams: no
+			// retry tuple, no synthetic message; only the exact owner/lease/subset
+			// runtime partition metadata is added to the SAME window object.
+			internals._lastRunPromptIds = [ownerB];
+			internals._postCompactionContinuationMessages = [messageA];
+			await internals._runAutoCompaction("overflow", true);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA, ownerB]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([ownerB]);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryAttempt).toBe(0);
+			internals._lastRunTerminalStopReason = undefined;
+			releaseA();
+			return { scheduledRun };
+		}
+
+		it.each([
+			{
+				label: "success",
+				assistant: fauxAssistantMessage("complement success"),
+				expected: { status: "completed" },
+			},
+			{
+				label: "error",
+				assistant: fauxAssistantMessage("", { stopReason: "error", errorMessage: "complement failed" }),
+				expected: { status: "failed", failure: { reason: "run_error" } },
+			},
+			{
+				label: "aborted",
+				assistant: fauxAssistantMessage("", { stopReason: "aborted" }),
+				expected: { status: "cancelled" },
+			},
+		])(
+			"[partition-model fix] tracked pump complement $label consumes A once at its own terminal while B first-error overflow subset remains pending; B recovery runs once under B",
+			async ({ assistant, expected }) => {
+				vi.useFakeTimers();
+				const harness = await createHarness({
+					settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1 } },
+					extensionFactories: [compactSummaryExtension("complement summary")],
+				});
+				continuationHarnesses.push(harness);
+				seedSessionForCompaction(harness);
+				const observer = installContinuationObserver(harness);
+				const internals = continuationInternals(harness);
+				const ownerA = `partition-complement-${expected.status}`;
+				const ownerB = `partition-complement-b-${expected.status}`;
+				const messageA = continuationMessage(`${expected.status} complement A obligation`);
+				let releaseA = () => {};
+				const aGate = new Promise<void>((resolve) => {
+					releaseA = resolve;
+				});
+				let aStarted = false;
+				harness.setResponses([
+					async () => {
+						aStarted = true;
+						await aGate;
+						return assistant;
+					},
+				]);
+				const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+					// B's recovery: run under B exactly once, after A's complement
+					// consumption.
+					internals._lastRunTerminalStopReason = "stop";
+				});
+				// Start A's pump dispatch, stamp B mid-flight, then release A's real
+				// terminal: the pump consumes A's complement at its terminal,
+				// leaving only B pending, then B recovers once under B.
+				const { scheduledRun } = await stageTrackedComplementWindow(
+					harness,
+					internals,
+					ownerA,
+					ownerB,
+					messageA,
+					releaseA,
+					() => aStarted,
+				);
+				await scheduledRun;
+				await vi.advanceTimersByTimeAsync(100);
+				await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+				// A got its own real terminal; B recovered once under B.
+				expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, ...expected });
+				expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({ promptId: ownerB, status: "completed" });
+				expect(harness.session.getPromptOutcome(ownerB)?.failure).toBeUndefined();
+				expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+				expect(observer.continuationLeases[1]!.releaseCalls).toBe(1);
+				expect(internals._continuationSettlementWindow).toBeUndefined();
+				expect(internals._postCompactionContinuationScheduled).toBe(false);
+				expect(harness.eventsOfType("prompt_outcome")).toHaveLength(2);
+				continueSpy.mockRestore();
+				observer.restore();
+			},
+		);
+
+		it("[partition-model fix] tracked A error with remaining direct D and first-error overflow B preserves A,D owners/leases and D's message until B recovery; D then settles from retained tracked intent", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("remainder ADB summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "partition-remainder-a";
+			const ownerD = "partition-remainder-d";
+			const ownerB = "partition-remainder-b";
+			admitOwners(harness, ownerA, ownerD, ownerB);
+			const messageA = continuationMessage("remainder tracked A obligation");
+			const messageD = continuationMessage("remainder direct D obligation");
+			internals._postCompactionContinuationMessages = [messageA, messageD];
+			expect(internals._scheduleContinuationForObligation([ownerA, ownerD], [messageA, messageD])).toBe(true);
+			admitTrackedContinuationAction(harness, messageA);
+			internals._schedulePostCompactionContinue();
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerA, ownerD],
+				obligationMessages: [messageA, messageD],
+			});
+			const aLease = observer.continuationLeases[0]!;
+			const dLease = observer.continuationLeases[1]!;
+			let releaseA = () => {};
+			const aGate = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			let aStarted = false;
+			harness.setResponses([
+				async () => {
+					aStarted = true;
+					await aGate;
+					return fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: "tracked A remainder failed",
+					});
+				},
+			]);
+			const ownersAtContinue: string[][] = [];
+			const dContinueGate = createDeferred();
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				const owners = [...(internals._lastRunPromptIds ?? [])];
+				ownersAtContinue.push(owners);
+				if (ownersAtContinue.length > 1) await dContinueGate.promise;
+				internals._lastRunTerminalStopReason = "stop";
+			});
+
+			const scheduledRun = internals._runScheduledPostCompactionContinue();
+			await vi.waitFor(() => expect(aStarted).toBe(true));
+			// Mid-flight first-error overflow of B: no retry tuple, no independent
+			// overflow message. Window becomes [A,D,B] with overflow subset [B].
+			internals._lastRunPromptIds = [ownerB];
+			internals._postCompactionContinuationMessages = [messageA, messageD];
+			await internals._runAutoCompaction("overflow", true);
+			expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA, ownerD, ownerB]);
+			expect(internals._continuationSettlementWindow?.overflowRecoveryOwners).toEqual([ownerB]);
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryAttempt).toBe(0);
+			expect(observer.continuationLeases[2]!.promptId).toBe(ownerB);
+			const bLease = observer.continuationLeases[2]!;
+			internals._lastRunTerminalStopReason = undefined;
+			releaseA();
+			await scheduledRun;
+
+			// After A's tracked terminal and BEFORE B recovery: remaining
+			// non-overflow obligation D still exists, so A,D owners/leases stay
+			// in the window with D's message. Overflow subset [B] is pending.
+			// Existing mixed tracked/direct contract: tracked error fences A and D
+			// as run_error intent, but neither lease is released yet.
+			expect(aLease.releaseCalls).toBe(0);
+			expect(dLease.releaseCalls).toBe(0);
+			expect(bLease.releaseCalls).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerD)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerA, ownerD, ownerB],
+				obligationMessages: [messageD],
+				overflowRecoveryOwners: [ownerB],
+				state: "scheduled",
+				pumpOwned: false,
+			});
+			expect(internals._postCompactionContinuationMessages).toEqual([messageD]);
+			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([messageD]);
+			expect(internals._continuationPumpOwnerAction).toBeUndefined();
+
+			await vi.advanceTimersByTimeAsync(100);
+			// B recovered once under B; remaining window is A,D with D only.
+			// Do not waitFor here: fake-timer waitFor auto-advances 50ms and
+			// would fire D's rearmed 100ms timer.
+			expect(bLease.releaseCalls).toBe(1);
+			expect(ownersAtContinue[0]).toEqual([ownerB]);
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(ownersAtContinue[1]).toEqual([ownerA, ownerD]);
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "completed",
+			});
+			expect(harness.session.getPromptOutcome(ownerB)?.failure).toBeUndefined();
+			expect(aLease.releaseCalls).toBe(0);
+			expect(dLease.releaseCalls).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerD)).toBeUndefined();
+			expect(internals._continuationSettlementWindow).toMatchObject({
+				owners: [ownerA, ownerD],
+				obligationMessages: [messageD],
+				overflowRecoveryOwners: [],
+			});
+
+			dContinueGate.resolve();
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			// D's direct run executed once (second continue, owners A,D) then the
+			// retained tracked-error intent settled both A and D failed/run_error.
+			expect(continueSpy).toHaveBeenCalledTimes(2);
+			expect(ownersAtContinue).toEqual([[ownerB], [ownerA, ownerD]]);
+			expect(aLease.releaseCalls).toBe(1);
+			expect(dLease.releaseCalls).toBe(1);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+				promptId: ownerA,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.session.getPromptOutcome(ownerD)).toMatchObject({
+				promptId: ownerD,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			expect(harness.eventsOfType("prompt_outcome")).toHaveLength(3);
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[partition-model fix] complement-removal synchronous reentry: A prompt_outcome listener observes coherent B-only publication, can close B, and no stale timer survives", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("complement reentry close summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "partition-reentry-a";
+			const ownerB = "partition-reentry-b";
+			const messageA = continuationMessage("partition reentry A obligation");
+			let releaseA = () => {};
+			const aGate = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			let aStarted = false;
+			harness.setResponses([
+				async () => {
+					aStarted = true;
+					await aGate;
+					return fauxAssistantMessage("complement done");
+				},
+			]);
+			const reentryFacts = {
+				seen: false,
+				owners: [] as string[],
+				overflowOwners: [] as string[],
+				leases: [] as unknown[],
+				messages: [] as AgentMessage[],
+				revision: -1,
+				state: "" as string,
+				scheduled: false,
+				timerDefined: false,
+				snapshot: [] as AgentMessage[],
+				closeReturned: false,
+			};
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "prompt_outcome" || event.outcome.promptId !== ownerA) return;
+				// A's complement release is the first synchronous reentry: the
+				// remaining tuple must be EXACTLY B (owner/lease/subset/revision/
+				// state/timer/snapshot/pause) and coherent.
+				const window = internals._continuationSettlementWindow;
+				reentryFacts.seen = true;
+				reentryFacts.owners = window?.owners ? [...window.owners] : [];
+				reentryFacts.overflowOwners = window?.overflowRecoveryOwners ? [...window.overflowRecoveryOwners] : [];
+				reentryFacts.leases = window?.leases ? [...window.leases] : [];
+				reentryFacts.messages = window?.obligationMessages ? [...window.obligationMessages] : [];
+				reentryFacts.revision = window?.revision ?? -1;
+				reentryFacts.state = window?.state ?? "";
+				reentryFacts.scheduled = internals._postCompactionContinuationScheduled;
+				reentryFacts.timerDefined = internals._postCompactionContinuationTimer !== undefined;
+				reentryFacts.snapshot = [...internals._scheduledPostCompactionContinuationMessages];
+				// Listener closes B exactly once; no stale ownerless timer after return.
+				reentryFacts.closeReturned = internals._cancelPostCompactionContinue({ owners: "fail" });
+			});
+			const { scheduledRun } = await stageTrackedComplementWindow(
+				harness,
+				internals,
+				ownerA,
+				ownerB,
+				messageA,
+				releaseA,
+				() => aStarted,
+			);
+			await scheduledRun;
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(reentryFacts.seen).toBe(true);
+			expect(reentryFacts.owners).toEqual([ownerB]);
+			expect(reentryFacts.overflowOwners).toEqual([ownerB]);
+			expect(reentryFacts.leases).toHaveLength(1);
+			expect(reentryFacts.messages).toEqual([]);
+			expect(reentryFacts.state).toBe("scheduled");
+			expect(reentryFacts.scheduled).toBe(true);
+			expect(reentryFacts.timerDefined).toBe(true);
+			expect(reentryFacts.closeReturned).toBe(true);
+			// B failed via the reentrant close; A completed at its own terminal.
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			// No stale timer/window residue after the listener returns.
+			expect(internals._postCompactionContinuationTimer).toBeUndefined();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			expect(continueSpy).toHaveBeenCalledTimes(0);
+			await vi.advanceTimersByTimeAsync(300);
+			expect(continueSpy).toHaveBeenCalledTimes(0);
+			unsubscribe();
+			continueSpy.mockRestore();
+			observer.restore();
+		});
+
+		it("[partition-model fix] complement-removal synchronous reentry: listener-created B replacement survives untouched after A release", async () => {
+			vi.useFakeTimers();
+			const harness = await createHarness({
+				settings: { retry: { enabled: false }, compaction: { keepRecentTokens: 1 } },
+				extensionFactories: [compactSummaryExtension("complement reentry replacement summary")],
+			});
+			continuationHarnesses.push(harness);
+			seedSessionForCompaction(harness);
+			const observer = installContinuationObserver(harness);
+			const internals = continuationInternals(harness);
+			const ownerA = "partition-reentry-repl-a";
+			const ownerB = "partition-reentry-repl-b";
+			const ownerC = "partition-reentry-repl-c";
+			admitOwners(harness, ownerC);
+			const messageA = continuationMessage("partition reentry replacement A obligation");
+			const replacementMessage = continuationMessage("partition reentry replacement C obligation");
+			let releaseA = () => {};
+			const aGate = new Promise<void>((resolve) => {
+				releaseA = resolve;
+			});
+			let aStarted = false;
+			harness.setResponses([
+				async () => {
+					aStarted = true;
+					await aGate;
+					return fauxAssistantMessage("complement done");
+				},
+				fauxAssistantMessage("replacement C done"),
+			]);
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementation(async () => {
+				internals._lastRunTerminalStopReason = "stop";
+			});
+			const replacementFacts = {
+				seen: false,
+				owners: [] as string[],
+				overflowOwners: [] as string[],
+				revision: -1,
+				scheduled: false,
+				timerDefined: false,
+			};
+			let replacementWindow: unknown;
+			let replacementTimer: unknown;
+			let replacementSnapshot: AgentMessage[] | undefined;
+			let replacementPause: unknown | undefined;
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "prompt_outcome" || event.outcome.promptId !== ownerA) return;
+				const window = internals._continuationSettlementWindow;
+				replacementFacts.seen = true;
+				replacementFacts.owners = window?.owners ? [...window.owners] : [];
+				replacementFacts.overflowOwners = window?.overflowRecoveryOwners ? [...window.overflowRecoveryOwners] : [];
+				replacementFacts.revision = window?.revision ?? -1;
+				replacementFacts.scheduled = internals._postCompactionContinuationScheduled;
+				replacementFacts.timerDefined = internals._postCompactionContinuationTimer !== undefined;
+				// Close B and publish a replacement C obligation from inside the listener.
+				internals._cancelPostCompactionContinue({ owners: "fail" });
+				internals._postCompactionContinuationMessages = [replacementMessage];
+				internals._scheduleContinuationForObligation([ownerC], [replacementMessage]);
+				internals._schedulePostCompactionContinue();
+				replacementWindow = internals._continuationSettlementWindow;
+				replacementTimer = internals._postCompactionContinuationTimer;
+				replacementSnapshot = internals._scheduledPostCompactionContinuationMessages;
+				replacementPause = internals._continuationSchedulingPause;
+			});
+			const { scheduledRun } = await stageTrackedComplementWindow(
+				harness,
+				internals,
+				ownerA,
+				ownerB,
+				messageA,
+				releaseA,
+				() => aStarted,
+			);
+			await scheduledRun;
+			// The A-outcome listener fired synchronously during A's complement
+			// release and published a replacement C window; the helper must not
+			// have touched it. (No timer advance yet: the replacement's own timer
+			// must still be pending here.)
+			expect(replacementFacts.seen).toBe(true);
+			expect(replacementFacts.owners).toEqual([ownerB]);
+			expect(replacementFacts.overflowOwners).toEqual([ownerB]);
+			expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ promptId: ownerA, status: "completed" });
+			expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({
+				promptId: ownerB,
+				status: "failed",
+				failure: { reason: "run_error" },
+			});
+			// The replacement object/timer/snapshot/pause are untouched by the helper.
+			expect(internals._continuationSettlementWindow).toBe(replacementWindow);
+			expect(internals._postCompactionContinuationTimer).toBe(replacementTimer);
+			expect(internals._scheduledPostCompactionContinuationMessages).toBe(replacementSnapshot);
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+			expect(internals._continuationSchedulingPause).toBe(replacementPause);
+			// The replacement C obligation was acquired exactly once (the release
+			// record index follows A/B acquisition order and is not asserted by
+			// index here because the wrapped record list is what the observer
+			// captured; the acquire log is the exact acquisition evidence).
+			expect(observer.acquiresOfContinuation().map((entry) => entry.promptId)).toEqual([ownerA, ownerB, ownerC]);
+			// Replacement runs once under C.
+			internals._lastRunTerminalStopReason = undefined;
+			await vi.advanceTimersByTimeAsync(150);
+			await vi.waitFor(() => expect(internals._continuationSettlementWindow).toBeUndefined());
+			expect(harness.session.getPromptOutcome(ownerC)).toMatchObject({ promptId: ownerC, status: "completed" });
+			expect(observer.continuationLeases.at(-1)!.promptId).toBe(ownerC);
+			expect(observer.continuationLeases.at(-1)!.releaseCalls).toBe(1);
+			expect(internals._continuationSchedulingPause).toBeUndefined();
+			unsubscribe();
 			continueSpy.mockRestore();
 			observer.restore();
 		});
