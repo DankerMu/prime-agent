@@ -19,7 +19,22 @@ session 经公共入口（`prompt`、`promptAndWait`、`promptAndSettle`、`prom
 #### Scenario: session 内部 autonomous continuation 继承 lineage
 
 - WHEN prompt A 的 run 触发 threshold compaction 且 session 为其内部排队 autonomous continuation
-- THEN 该 continuation action 的 `promptIds` 为 `[A.promptId]`，A 的 outcome 在该 continuation 完成前不产生
+- THEN 该 continuation action 的 `promptIds` 为 `[A.promptId]`、持有独立 inherited run lease，A 的 outcome 在该 continuation 完成前不产生
+
+#### Scenario: shared run 只排一个 autonomous continuation 并继承全部 owner
+
+- WHEN `"all"` batching 的 A/B 共享 run 触发一次 threshold compaction并排队 autonomous continuation
+- THEN session只创建/执行一个 continuation action；其`promptIds`为触发run在异步decision前捕获的去重`[A.promptId,B.promptId]`，A/B各增加一份独立run lease且各自只产生一次outcome
+
+#### Scenario: 清除 queued inherited autonomous continuation 只释放 lineage
+
+- WHEN threshold compaction随后skipped或其他非abort清理在delivery前移除该inherited autonomous action
+- THEN session对全部captured owners只释放该action的run leases、不调用`requestCancel`；owners由其余owned work自然推导终态且不得永久settling
+
+#### Scenario: inherited autonomous admission 失败不发布孤儿 obligation
+
+- WHEN autonomous decision返回message后某captured owner已终态，或multi-owner action的后续`run` lease acquire失败
+- THEN整个action不入队，本次已取得的child sibling leases逆序release且parent/window ownership不变；producer恢复autonomous runtime snapshot并只删除本次message/maps/pending bookkeeping，不发布pump owner、不置cancel fence、不产生outcome
 
 #### Scenario: run 中 steer/followUp 不合并 identity
 
@@ -90,10 +105,10 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 - WHEN A的compaction后只因session中存在独立prompt B的queued action而需要唤醒scheduler，且不存在A自己的post-compaction work
 - THEN scheduler可以运行B，但不得把A放入continuation window、不得让A等待B，也不得把B并入A的captured owner tuple
 
-#### Scenario: staged ownerless continuation 保持既有 timer 行为
+#### Scenario: ownerless continuation 保持既有 timer 行为
 
-- WHEN #30接入autonomous lineage之前，settlement-excluded autonomous/background continuation或既有private scheduler seam没有active prompt owner但确有continuation work
-- THEN session保留100ms continuation/message处理与internal rearm行为，但不创建settlement lease；它与只唤醒queued prompt的generic wake仍为不同分类
+- WHEN settlement-excluded autonomous/background run或既有private scheduler seam没有active prompt owner但确有continuation work
+- THEN session保留100ms continuation/message处理与internal rearm行为，但不创建settlement identity或lease；它与只唤醒queued prompt的generic wake仍为不同分类
 
 #### Scenario: continuation owner acquire 失败时 fail closed
 
