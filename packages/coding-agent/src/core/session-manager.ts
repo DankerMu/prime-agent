@@ -93,6 +93,36 @@ export interface NewSessionOptions {
 
 export type SessionPersistListener = (sessionFile: string) => void;
 
+/** Observer invoked after a successful append commit and before persist listeners. */
+type SessionAppendCommitHook = (entryId: string) => void;
+
+type PendingAppendCommitHook = {
+	message: Message | CustomMessage | BashExecutionMessage;
+	onCommitted: SessionAppendCommitHook;
+	boundEntryId?: string;
+	invoked: boolean;
+};
+
+const pendingAppendCommitHooks = new WeakMap<SessionManager, PendingAppendCommitHook[]>();
+
+function installPendingAppendCommitHook(
+	sessionManager: SessionManager,
+	message: Message | CustomMessage | BashExecutionMessage,
+	onCommitted: SessionAppendCommitHook,
+): () => void {
+	const stack = pendingAppendCommitHooks.get(sessionManager) ?? [];
+	const hook: PendingAppendCommitHook = { message, onCommitted, invoked: false };
+	stack.push(hook);
+	pendingAppendCommitHooks.set(sessionManager, stack);
+	return () => {
+		const current = pendingAppendCommitHooks.get(sessionManager);
+		if (!current) return;
+		const index = current.lastIndexOf(hook);
+		if (index >= 0) current.splice(index, 1);
+		if (current.length === 0) pendingAppendCommitHooks.delete(sessionManager);
+	};
+}
+
 export interface SessionEntryBase {
 	type: string;
 	id: string;
@@ -1342,7 +1372,7 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(): void {
+	private _rewriteFile(onCommitted?: SessionAppendCommitHook, entryId?: string): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		const targetPath = realpathIfPresent(this.sessionFile);
@@ -1360,6 +1390,7 @@ export class SessionManager {
 		} finally {
 			rmSync(tempPath, { force: true });
 		}
+		this._invokeAppendCommitHook(onCommitted, entryId);
 		this._notifyPersistListeners();
 	}
 
@@ -1454,7 +1485,39 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
+		this._persistEntry(entry, this._takeAppendCommitHook(entry));
+	}
+
+	private _bindAppendCommitHook(message: Message | CustomMessage | BashExecutionMessage, entryId: string): void {
+		const stack = pendingAppendCommitHooks.get(this);
+		if (!stack) return;
+		for (let index = stack.length - 1; index >= 0; index -= 1) {
+			const hook = stack[index]!;
+			if (hook.message === message && hook.boundEntryId === undefined) {
+				hook.boundEntryId = entryId;
+				return;
+			}
+		}
+	}
+
+	private _takeAppendCommitHook(entry: SessionEntry): SessionAppendCommitHook | undefined {
+		const stack = pendingAppendCommitHooks.get(this);
+		if (!stack) return undefined;
+		for (let index = stack.length - 1; index >= 0; index -= 1) {
+			const hook = stack[index]!;
+			if (hook.boundEntryId === entry.id && !hook.invoked) {
+				hook.invoked = true;
+				return hook.onCommitted;
+			}
+		}
+		return undefined;
+	}
+
+	private _persistEntry(entry: SessionEntry, onCommitted?: SessionAppendCommitHook): void {
+		if (!this.persist || !this.sessionFile) {
+			this._invokeAppendCommitHook(onCommitted, entry.id);
+			return;
+		}
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
@@ -1465,12 +1528,22 @@ export class SessionManager {
 		}
 
 		if (!this.flushed || !existsSync(this.sessionFile)) {
-			this._rewriteFile();
+			this._rewriteFile(onCommitted, entry.id);
 			this.flushed = true;
 		} else {
 			mkdirSync(dirname(this.sessionFile), { recursive: true });
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._invokeAppendCommitHook(onCommitted, entry.id);
 			this._notifyPersistListeners();
+		}
+	}
+
+	private _invokeAppendCommitHook(onCommitted: SessionAppendCommitHook | undefined, entryId?: string): void {
+		if (!onCommitted || entryId === undefined) return;
+		try {
+			onCommitted(entryId);
+		} catch {
+			// Attribution observers must not roll back a successful append or block persist notification.
 		}
 	}
 
@@ -1481,13 +1554,8 @@ export class SessionManager {
 		this._persist(entry);
 	}
 
-	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
-	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
-	 * Reason: we want these to be top-level entries in the session, not message session entries,
-	 * so it is easier to find them.
-	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
-	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+	/** Module-internal: public appendMessage stays single-argument. */
+	private _appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1495,8 +1563,19 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
+		this._bindAppendCommitHook(message, entry.id);
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
+	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
+	 * Reason: we want these to be top-level entries in the session, not message session entries,
+	 * so it is easier to find them.
+	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
+	 */
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this._appendMessage(message);
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
@@ -2320,5 +2399,22 @@ export class SessionManager {
 		const sessions = await listSessionsFromDir(sessionsDir, callbacks);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
+	}
+}
+
+/**
+ * Module-internal assistant append bridge. Not re-exported from the package root.
+ * Public `SessionManager.appendMessage(message)` stays a single-argument method.
+ */
+export function appendSessionMessageWithCommitHook(
+	sessionManager: SessionManager,
+	message: Message | CustomMessage | BashExecutionMessage,
+	onCommitted: (entryId: string) => void,
+): string {
+	const restore = installPendingAppendCommitHook(sessionManager, message, onCommitted);
+	try {
+		return sessionManager.appendMessage(message);
+	} finally {
+		restore();
 	}
 }
