@@ -465,6 +465,7 @@ interface Group6Internals {
 	_promptSettlementDisposeSealed: boolean;
 	_disposeAsyncPromise?: Promise<void>;
 	_sessionActionCommitDisposeAbortController: AbortController;
+	_ipythonKernelProvisioner?: { dispose(): Promise<void> };
 	_createPreparedTurnAction(
 		schedule: "followUp",
 		text: string,
@@ -9483,6 +9484,135 @@ describe("abort and dispose ownership (group 6)", () => {
 		expect(visibleSettled).toBe(false);
 		expect(harness.session.getPromptOutcome(hiddenId)).toBeUndefined();
 		expect(observer.requestCancels).toEqual([]);
+		observer.restore();
+	});
+
+	it("disposeAsync detaches a post-sleep retry continuation timer before child/kernel teardown", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 25 } },
+		});
+		group6Harnesses.push(harness);
+		vi.useFakeTimers();
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after async dispose")]);
+		const internals = group6Internals(harness);
+		const retry = retryInternals(harness);
+
+		const retryEvents: Array<{ type: string; attempt?: number; success?: boolean; finalError?: string }> = [];
+		const originalEmit = (
+			harness.session as unknown as {
+				_emit(event: { type: string; attempt?: number; success?: boolean; finalError?: string }): void;
+			}
+		)._emit.bind(harness.session);
+		const emitSpy = vi
+			.spyOn(harness.session as unknown as { _emit(event: { type: string }): void }, "_emit")
+			.mockImplementation((event) => {
+				if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					retryEvents.push(event as { type: string; attempt?: number; success?: boolean; finalError?: string });
+				}
+				originalEmit(event);
+			});
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "auto_retry_start") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		let ownerId: string | undefined;
+		const settled = harness.session.promptAndSettle("async dispose during post-sleep retry", {
+			settlementAdmission: (info) => (ownerId = info.promptId),
+		});
+		await sawRetryStart;
+		await Promise.resolve();
+		expect(ownerId).toBeDefined();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(observer.retryLeases).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(retry._retryAbortController).toBeDefined();
+		const providerCallsBeforeSleep = harness.faux.state.callCount;
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+		vi.advanceTimersByTime(25);
+		await Promise.resolve();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+		const teardownGate = createDeferred();
+		let provisionerDisposeCalls = 0;
+		internals._ipythonKernelProvisioner = {
+			async dispose() {
+				provisionerDisposeCalls += 1;
+				await teardownGate.promise;
+			},
+		};
+
+		const disposing = harness.session.disposeAsync();
+		for (let i = 0; i < 20 && !internals._promptSettlementDisposeSealed; i++) {
+			await Promise.resolve();
+		}
+		expect(internals._promptSettlementDisposeSealed).toBe(true);
+		expect(internals._disposing).toBe(true);
+		expect(internals._disposed).toBe(false);
+		expect(provisionerDisposeCalls).toBe(1);
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+
+		if (vi.getTimerCount() > 0) {
+			await vi.advanceTimersToNextTimerAsync();
+		}
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.faux.state.callCount).toBe(providerCallsBeforeSleep);
+		expect(retry._retryPromise).toBeUndefined();
+		expect(retry._retryResolve).toBeUndefined();
+		expect(retry._retryWindow).toBeUndefined();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(retry._retryContinueTimer).toBeUndefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		const settleIndex = observer.timeline.indexOf("settleAll");
+		const firstRetryRelease = observer.timeline.findIndex((entry) => entry.startsWith("lease.release:retry:"));
+		const controllerAbort = observer.timeline.indexOf("controller.abort");
+		expect(settleIndex).toBeGreaterThanOrEqual(0);
+		expect(firstRetryRelease).toBeGreaterThan(settleIndex);
+		expect(firstRetryRelease).toBeLessThan(controllerAbort);
+		expect(internals._disposed).toBe(false);
+
+		const outcome = await settled;
+		expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome).toBe(harness.session.getPromptOutcome(ownerId!));
+		expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId)).toHaveLength(
+			1,
+		);
+		const retryStarts = retryEvents.filter((event) => event.type === "auto_retry_start");
+		const retryEnds = retryEvents.filter((event) => event.type === "auto_retry_end");
+		expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1 })]);
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0]).toMatchObject({ success: false, attempt: 1, finalError: "Retry cancelled" });
+
+		teardownGate.resolve();
+		await disposing;
+		expect(internals._disposed).toBe(true);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+
+		harness.session.dispose();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+
+		continueSpy.mockRestore();
+		emitSpy.mockRestore();
 		observer.restore();
 	});
 });

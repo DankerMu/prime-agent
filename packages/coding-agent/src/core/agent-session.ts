@@ -4173,6 +4173,7 @@ export class AgentSession {
 				this._disposeAsyncPromise = undefined;
 				throw error;
 			}
+			this._detachRetryResourcesForDispose();
 			this._sessionActionCommitDisposeAbortController.abort();
 			await this._disposeAsyncOnce();
 		})();
