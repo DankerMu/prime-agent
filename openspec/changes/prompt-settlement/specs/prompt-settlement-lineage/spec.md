@@ -158,7 +158,7 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 #### Scenario: explicit abort 关闭 continuation window 推导为 cancelled
 
 - WHEN scheduled/running continuation存在时调用`requestAbort()`或`abortForUpdateRestart()`
-- THEN captured window owners在lease release前先置cancel fence，window/timer detach-first且每个lease只release一次，不得错误`completed`或永久settling；完整current/inherited owner清理由组6共用同一cancel顺序
+- THEN captured window owners在lease release前先置cancel fence，window/timer detach-first且每个lease只release一次，不得错误`completed`或永久settling；完整current/inherited owner清理由组6共用同一cancel顺序，update restart仍保留独立visible queue及其recovery snapshot
 
 #### Scenario: abortRetry 停止 overflow continuation 推导为 failed
 
@@ -197,7 +197,22 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 #### Scenario: abort 推导当前 run 为 cancelled 且保留可见队列
 
 - WHEN `requestAbort()`（含 `session.abort()` 与连接层普通 abort 路径）在 A 的 run 进行中被调用，且可见 prompt B 仍在队列
-- THEN A及其所有内部 inherited autonomous actions/compaction continuations被摘除、置 cancel fence并释放各自已有 leases（即使此前有 failure，cancel优先）；真正的可见用户 prompt B不置 fence、保留 action run lease，恢复 pump后仍可执行且不因终态 A的 inherit action抛错
+- THEN session在任何child lease release前复制本次current run owners；按internal autonomous message、nonempty inherit lineage及owner交集整项摘除A的所有queued/selected/preparing inherited actions，删除其message/snapshot/pending/pump bookkeeping，依次释放child leases、cancel/close compaction与matching retry resources，再对captured owners置cancel fence（即使此前有failure，cancel优先），之后才abort Agent；current action completion只释放自身lease且cancel fence必须先于该release；真正的可见用户prompt B不置fence、保留原action/promptId/run lease，恢复pump后仍可执行且不因终态A留下的orphan inherit action抛错
+
+#### Scenario: all batching abort 整项清理 multi-owner child
+
+- WHEN A/B共享current run且只有一个internal autonomous child继承`[A,B]`，另有独立可见prompt C排队，随后ordinary abort
+- THEN inherited child只从store移除一次但其A/B两份child leases各release一次，A/B各只产生一个cancelled outcome；C的identity、action lease与queue entry均保持，ownerless或不相交的internal work不得被误删
+
+#### Scenario: update restart 复用 current-owner cleanup 并保留恢复队列
+
+- WHEN A执行中、其internal inherited child/continuation已入队，visible B仍等待delivery时调用`abortForUpdateRestart()`
+- THEN A及其owned descendants按ordinary abort同序cancel/close；B不置fence，原promptId/run lease、delivery waiter与action recovery snapshot保持，suspended pump不得在restart前执行B
+
+#### Scenario: manual compact 的 operation-local token 只保护 parked window
+
+- WHEN ordinary manual compact先park exact continuation window并以private token调用其紧邻internal abort
+- THEN该token只阻止本次abort关闭exact parked window/retry obligation，window随后按manual success/failure契约resume或cancel；它不成为public/concurrent abort的豁免，也不改变internal compact abort对当时current run的既有取消语义
 
 #### Scenario: abortAndClearQueue 取消可见队列
 
@@ -313,9 +328,14 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 
 ### Requirement: dispose 结算
 
-`dispose()` MUST 通过一次 `settleAll("cancelled", "session_disposed", { released: true })` 对全部未终态且未 released 的 prompt 原子结算 `cancelled` 并同时标记 released fence（`outcome.failure` 不填；原因只写入 ledger 的 `settleReason`）；终态/released 记录 MUST 只 persist 一次，dispose MUST NOT 随后逐项 `release()` 产生第三条记录。`promptAndSettle` 的 waiter MUST 得到 `cancelled` outcome 而非悬空。
+session MUST 通过一个幂等one-shot seal对全部未终态且未released的prompt调用至多一次`settleAll("cancelled", "session_disposed", { released: true })`，原子结算`cancelled`并同时标记released fence（`outcome.failure`不填；原因只写入ledger的`settleReason`）。direct `dispose()` MUST在置`_disposed`后、任何cleanup/abort-controller之前seal；`disposeAsync()` MUST保留既有graceful pre-drain，但在置`_disposing`后、commit-fence abort与child/kernel/resource teardown之前seal。终态/released记录MUST只persist一次；后续stored lease仍可exact-once detach/release，但MUST对tracker无副作用且不得产生第三条记录。`promptAndSettle` waiter MUST得到`cancelled` outcome而非悬空。
 
 #### Scenario: dispose 时在途与排队 prompt 各结算一次
 
-- WHEN session 存在一个执行中 prompt 与两个排队 prompt 时 `dispose()`
-- THEN 三者各产生一次 `cancelled` outcome（`failure === undefined`）、各发出一次 `prompt_outcome`、ledger 各写一条 `released: true, settleReason: "session_disposed"` 的终态；重复 `dispose()` 为 no-op
+- WHEN session 存在一个执行中 prompt 与两个排队 prompt 时调用direct `dispose()`
+- THEN 三者在第一份action/window/retry lease cleanup前各产生一次`cancelled` outcome（`failure === undefined`）、各发出一次`prompt_outcome`、ledger各写一条`released:true, settleReason:"session_disposed"`终态；后续cleanup不改变record/outcome，重复或subscriber重入`dispose()`为no-op
+
+#### Scenario: disposeAsync pre-drain 后先 seal 再异步 teardown
+
+- WHEN `disposeAsync()`完成既有pending refinement graceful pre-drain后仍有active/queued prompts，且commit-fence waiter或child/kernel teardown可触发action cleanup
+- THEN session先置disposing fence并执行同一个one-shot seal，再abort commit fence或await child/kernel cleanup；最终同步`dispose()`不得第二次调用settleAll，和direct dispose得到相同的cancelled+released outcomes/records

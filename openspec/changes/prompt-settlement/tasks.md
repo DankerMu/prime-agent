@@ -72,11 +72,36 @@ Risk packs:
 
 ## 6. cancel 路径：abort、admission 后未执行、dispose
 
-- [ ] 6.1 `requestAbort` 保留真实可见用户队列，但先移除当前 owners的所有 internal inherited autonomous actions（不受默认 queueVisible迷惑）并释放已有 run leases，取消/释放 compaction leases，再对当前 owners requestCancel；current action completion释放自身 lease。clear/mutate/abortAndClearQueue按组2只释放实际移除action。dispose原子 settleAll released，不先release
-- [ ] 6.2 测试：普通 abort当前 owners cancelled、真实用户队列lease保留且可恢复；已入队 threshold inherit action被摘除，resume不对终态owner acquire/不抛；continuation leases cancelled；abortAndClearQueue才清用户队列；dispose一次终态persist/emit且released；重复no-op
+- [x] 6.1 建立共享current-owner abort cleanup：入口复制`_currentRunOwners`；按internal autonomous message + nonempty inherit lineage + accepted owner交集识别child（不看`queueVisible`），整项删除action与message/snapshot-map/pending/pump bookkeeping并消费全部child leases；随后cancel/close continuation与matching retry，对captured current owners `requestCancel`，current action terminal/finally消费自身lease。`requestAbort`与`abortForUpdateRestart`复用，后者仍保留visible queue/recovery snapshot；clear/mutate/abortAndClearQueue仍只cancel实际移除的default actions。增加session-private one-shot dispose seal：direct `dispose()`在`_disposed=true`后立即seal；`disposeAsync()`保留graceful pre-drain，但在`_disposing=true`后、commit-fence abort controller与child/kernel/resource cleanup前seal；seal只调用一次`settleAll("cancelled","session_disposed",{released:true})`。后续window/retry/action leases仍detach/release exact-once，对terminal/released tracker record为no-op
+- [x] 6.2 行为测试：production ordinary abort与`"all"` multi-owner child当前owners cancelled、prior failure仍cancel优先、child/window lease及bookkeeping exact cleanup，真正visible B保留同id/lease并resume completed；update restart同cleanup且B/waiter/recovery snapshot保留；clear/mutate/abortAndClearQueue实际移除才cancel B；direct/async dispose的1 running + 2 queued各一次cancelled/no-failure/released+settleReason，seal先于任一cleanup release/controller abort，同步reentry与重复调用no-op
 
-Suggested fixture level: compact - abort 与 dispose 各有独立触发，需逐条场景
-Minimal mergeable slice: atomic - 取消语义一组内闭环，依赖组 2/4，独立合并保绿
+Suggested fixture level: compact（overridden）- cancellation、shared-state transition与session teardown是mandatory expanded triggers
+Fixture level: expanded
+Repair intensity: high - owner/lease或dispose seal顺序错误会导致误cancel、提前终态、orphan inherit或未released terminal record
+Minimal mergeable slice: atomic - agent-session abort/dispose共享取消语义 + focused tests，依赖组2/4/5，独立合并保绿
+
+Required evidence:
+- production threshold child + current A + visible B -> ordinary abort removes exact child/bookkeeping, releases child/window once, A cancelled once; B same identity/lease remains settling then resumes completed
+- `"all"` A/B child + unrelated C -> one child removed as a unit, A/B each cancelled once, C untouched; repeated abort has no extra release/event
+- update restart -> current descendants cancelled while visible queue, delivery waiter and recovery snapshot survive suspended pump
+- clear/mutate/abortAndClearQueue -> only actually removed default action becomes cancelled
+- direct `dispose()` and `disposeAsync()` with running/queued/window-or-retry ownership -> one seal precedes controller abort/first cleanup release; each prompt one `cancelled + released + session_disposed` terminal record/event, no failure; reentrant/repeated disposal no-op
+- focused settlement/queue/action-race/update-restart/compaction-retry suites, root check/build and strict OpenSpec exit 0
+
+Risk packs:
+- Public API / CLI / script entry: not selected - signatures and wire unchanged
+- Config / project setup: not selected - no config changes
+- File IO / path safety / overwrite: not selected - ledger persist remains no-op until group8
+- Schema / columns / units / field names: selected - dispose terminal record conditional fields are asserted
+- Auth / permissions / secrets: not selected - no auth boundary
+- Concurrency / shared state / ordering: selected - captured owners, leases, synchronous callbacks and cleanup order
+- Resource limits / large input / discovery: not selected - bounded runtime-owned collections only
+- Legacy compatibility / examples: selected - visible queue, restart, manual/retry/goal and ownerless behavior preserved
+- Error handling / rollback / partial outputs: selected - orphan bookkeeping, partial/repeated/reentrant cleanup and cancel-over-failure
+- Release / packaging / dependency compatibility: not selected - no exports/dependencies
+- Documentation / migration notes: not selected - group17 owns final docs
+- TUI focus/render lifecycle: not selected - no TUI change
+- Session/extension teardown lifecycle: selected - direct/async dispose and abort families are the change surface
 
 ## 7. finalMessageIds 记录
 

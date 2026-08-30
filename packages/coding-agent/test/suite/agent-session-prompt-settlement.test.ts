@@ -1,5 +1,5 @@
 /**
- * OpenSpec prompt-settlement, groups 2-5, shared session-level suite.
+ * OpenSpec prompt-settlement, groups 2-6, shared session-level suite.
  *
  * Group 2 (issue #27): action promptId + main run lease + promptAndSettle
  * API. These tests use the retry-disabled faux provider so each error is
@@ -15,6 +15,12 @@
  * Production threshold/autonomous staging plus the producer seam. Tests
  * observe exact inherited `promptIds`/`runLeases`, provider continuation
  * count, and delayed outcomes — not timer flags or text labels.
+ *
+ * Group 6 (issue #31): abort/update-restart current-owner cleanup and the
+ * one-shot dispose `cancelled + released` seal. Production threshold
+ * children default `queueVisible:true`; tests observe identity, lease
+ * release counts, bookkeeping, records/outcomes, and order — not
+ * final-state-only.
  *
  * Seam 2: in-process AgentSession + faux provider. Tests observe behavior
  * through the public callback / query / event APIs and read-only action-store
@@ -36,15 +42,16 @@ import type {
 } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { createHeartbeatPromptMessage, createRlmChildFailureMessage } from "../../src/core/messages.js";
-import type { PromptLease, PromptLeaseKind } from "../../src/core/prompt-settlement.js";
+import type { PromptLease, PromptLeaseKind, PromptSettlementRecord } from "../../src/core/prompt-settlement.js";
 import type { SessionAction } from "../../src/core/session-action-store.js";
 import type { ExtensionFactory } from "../../src/index.js";
+import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
 import { bindActiveSessionState } from "../../src/modes/daemon/daemon-extension-binding.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
-type TurnAction = SessionAction & { payload: { kind: "turn"; text: string } };
+type TurnAction = SessionAction & { payload: { kind: "turn"; text: string; queueVisible?: boolean } };
 
 function isTurnAction(action: SessionAction): action is TurnAction {
 	return action.payload.kind === "turn";
@@ -418,6 +425,242 @@ function inheritedAutonomousActions(harness: Harness, owners: string[]): TurnAct
 	});
 }
 
+function group6ThresholdHarnessOptions(
+	summary: string,
+	extra: { extensionFactories?: Array<(pi: Parameters<ExtensionFactory>[0]) => void> } = {},
+): Parameters<typeof createHarness>[0] {
+	return {
+		tools: [largeContextThresholdTool()],
+		autonomous: {
+			enabled: true,
+			maxContinuations: 1,
+			maxTurns: 100,
+			gates: { commands: [], maxRetries: 1 },
+		},
+		settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 } },
+		models: [{ id: "faux-1", contextWindow: 200_000 }],
+		extensionFactories: [compactSummaryExtension(summary), ...(extra.extensionFactories ?? [])],
+	};
+}
+
+interface Group6Internals {
+	_currentRunOwners: string[];
+	_lastRunPromptIds: string[];
+	_postCompactionContinuationMessages: AgentMessage[];
+	_pendingThresholdCompactionAutonomousMessages: AgentMessage[];
+	_queuedAutonomousContinuationSnapshots: { get(message: AgentMessage): unknown };
+	_continuationPumpOwnerAction: unknown | undefined;
+	_continuationSettlementWindow:
+		| {
+				owners: string[];
+				leases: unknown[];
+				obligationMessages: AgentMessage[];
+				revision: number;
+				state: "scheduled" | "running" | "parked";
+				pumpOwned: boolean;
+		  }
+		| undefined;
+	_disposed: boolean;
+	_disposing: boolean;
+	_promptSettlementDisposeSealed: boolean;
+	_disposeAsyncPromise?: Promise<void>;
+	_sessionActionCommitDisposeAbortController: AbortController;
+	_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+	_createPreparedTurnAction(
+		schedule: "followUp",
+		text: string,
+		images: undefined,
+		options: {
+			message?: AgentMessage;
+			resumeIfIdle?: boolean;
+			noSettlementIdentity?: boolean;
+			agentMessageId?: string;
+			lineage?: { inherit: string[] };
+		},
+	): SessionAction;
+	_admitSessionInput(action: SessionAction, options?: { wake?: boolean }): { accepted: boolean };
+	_scheduleContinuationForObligation(owners: string[], obligationMessages: AgentMessage[]): boolean;
+	_schedulePostCompactionContinue(): void;
+	_scheduleSessionInputPump(): void;
+	_promptSettlementTracker: {
+		acquire(promptId: string, kind: PromptLeaseKind): PromptLease;
+		requestCancel(promptId: string): void;
+		recordFailure(promptId: string, reason: string): void;
+		release(promptId: string): void;
+		settleAll(status: "cancelled" | "failed", reason: string, options?: { released?: boolean }): void;
+		snapshot(): PromptSettlementRecord[];
+		isSettling(promptId: string): boolean;
+	};
+}
+
+function group6Internals(harness: Harness): Group6Internals {
+	return harness.session as unknown as Group6Internals;
+}
+
+function installGroup6Observer(harness: Harness): {
+	acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }>;
+	runLeases: InheritedRunLeaseRecord[];
+	continuationLeases: ContinuationLeaseRecord[];
+	retryLeases: RetryLeaseRecord[];
+	timeline: string[];
+	requestCancels: string[];
+	settleAllCalls: Array<{ status: "cancelled" | "failed"; reason: string; released?: boolean }>;
+	trackerReleaseCalls: string[];
+	throwNextSettleAll: (error: Error) => void;
+	acquiresOfKind: (kind: PromptLeaseKind) => Array<{ promptId: string; kind: PromptLeaseKind }>;
+	restore: () => void;
+} {
+	const internals = group6Internals(harness);
+	const tracker = internals._promptSettlementTracker;
+	const originalAcquire = tracker.acquire.bind(tracker);
+	const originalSettleAll = tracker.settleAll.bind(tracker);
+	const originalRequestCancel = tracker.requestCancel.bind(tracker);
+	const originalRelease = tracker.release.bind(tracker);
+	const originalControllerAbort = internals._sessionActionCommitDisposeAbortController.abort.bind(
+		internals._sessionActionCommitDisposeAbortController,
+	);
+	const originalAgentAbort = harness.session.agent.abort.bind(harness.session.agent);
+	const acquireLog: Array<{ promptId: string; kind: PromptLeaseKind }> = [];
+	const runLeases: InheritedRunLeaseRecord[] = [];
+	const continuationLeases: ContinuationLeaseRecord[] = [];
+	const retryLeases: RetryLeaseRecord[] = [];
+	const timeline: string[] = [];
+	const requestCancels: string[] = [];
+	const settleAllCalls: Array<{ status: "cancelled" | "failed"; reason: string; released?: boolean }> = [];
+	const trackerReleaseCalls: string[] = [];
+	let pendingSettleAllError: Error | undefined;
+	const acquireSpy = vi.spyOn(tracker, "acquire").mockImplementation((promptId: string, kind: PromptLeaseKind) => {
+		acquireLog.push({ promptId, kind });
+		const lease = originalAcquire(promptId, kind);
+		const baseRelease = lease.release.bind(lease);
+		const wrapped = lease as PromptLease & { release: () => void };
+		if (kind === "run") {
+			const record: InheritedRunLeaseRecord = { promptId, kind: "run", releaseCalls: 0 };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				timeline.push(`lease.release:run:${promptId}`);
+				baseRelease();
+			};
+			runLeases.push(record);
+		} else if (kind === "compaction_continuation") {
+			const record: ContinuationLeaseRecord = { promptId, kind: "compaction_continuation", releaseCalls: 0 };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				timeline.push(`lease.release:compaction_continuation:${promptId}`);
+				baseRelease();
+			};
+			continuationLeases.push(record);
+		} else if (kind === "retry") {
+			const record: RetryLeaseRecord = { promptId, kind: "retry", releaseCalls: 0 };
+			wrapped.release = () => {
+				record.releaseCalls += 1;
+				timeline.push(`lease.release:retry:${promptId}`);
+				baseRelease();
+			};
+			retryLeases.push(record);
+		} else {
+			wrapped.release = () => {
+				timeline.push(`lease.release:${kind}:${promptId}`);
+				baseRelease();
+			};
+		}
+		return lease;
+	});
+	const settleAllSpy = vi
+		.spyOn(tracker, "settleAll")
+		.mockImplementation((status: "cancelled" | "failed", reason: string, options?: { released?: boolean }) => {
+			if (pendingSettleAllError) {
+				const error = pendingSettleAllError;
+				pendingSettleAllError = undefined;
+				throw error;
+			}
+			timeline.push("settleAll");
+			settleAllCalls.push({ status, reason, released: options?.released });
+			originalSettleAll(status, reason, options);
+		});
+	const requestCancelSpy = vi.spyOn(tracker, "requestCancel").mockImplementation((promptId: string) => {
+		timeline.push(`requestCancel:${promptId}`);
+		requestCancels.push(promptId);
+		originalRequestCancel(promptId);
+	});
+	const trackerReleaseSpy = vi.spyOn(tracker, "release").mockImplementation((promptId: string) => {
+		timeline.push(`tracker.release:${promptId}`);
+		trackerReleaseCalls.push(promptId);
+		originalRelease(promptId);
+	});
+	const controllerAbortSpy = vi
+		.spyOn(internals._sessionActionCommitDisposeAbortController, "abort")
+		.mockImplementation((reason?: unknown) => {
+			timeline.push("controller.abort");
+			originalControllerAbort(reason);
+		});
+	const agentAbortSpy = vi.spyOn(harness.session.agent, "abort").mockImplementation(() => {
+		timeline.push("agent.abort");
+		originalAgentAbort();
+	});
+	return {
+		acquireLog,
+		runLeases,
+		continuationLeases,
+		retryLeases,
+		timeline,
+		requestCancels,
+		settleAllCalls,
+		trackerReleaseCalls,
+		throwNextSettleAll: (error: Error) => {
+			pendingSettleAllError = error;
+		},
+		acquiresOfKind: (kind) => acquireLog.filter((entry) => entry.kind === kind),
+		restore: () => {
+			acquireSpy.mockRestore();
+			settleAllSpy.mockRestore();
+			requestCancelSpy.mockRestore();
+			trackerReleaseSpy.mockRestore();
+			controllerAbortSpy.mockRestore();
+			agentAbortSpy.mockRestore();
+		},
+	};
+}
+
+function childPrimaryMessage(action: TurnAction): AgentMessage {
+	const record = action.payload.records.find((candidate) => candidate.role === "primary");
+	if (!record) throw new Error("inherited action has no primary record");
+	return record.message;
+}
+
+function matchingChildBookkeeping(
+	harness: Harness,
+	childMessage: AgentMessage,
+): {
+	postCompaction: boolean;
+	pending: boolean;
+	snapshot: boolean;
+	pumpOwner: boolean;
+} {
+	const internals = group6Internals(harness);
+	return {
+		postCompaction: internals._postCompactionContinuationMessages.includes(childMessage),
+		pending: internals._pendingThresholdCompactionAutonomousMessages.includes(childMessage),
+		snapshot: internals._queuedAutonomousContinuationSnapshots.get(childMessage) !== undefined,
+		pumpOwner: internals._continuationPumpOwnerAction !== undefined,
+	};
+}
+
+function terminalSnapshot(harness: Harness, promptId: string): PromptSettlementRecord | undefined {
+	return group6Internals(harness)
+		._promptSettlementTracker.snapshot()
+		.find((record) => record.promptId === promptId);
+}
+
+function inProcessConnectionFor(harness: Harness): InProcessAgentConnection {
+	return new InProcessAgentConnection({
+		session: harness.session,
+		setRebindSession() {},
+		setBeforeSessionInvalidate() {},
+		async dispose() {},
+	} as unknown as AgentSessionRuntime);
+}
+
 function createFauxIpythonTool(sessionRef: { current?: AgentSession }): AgentTool {
 	return {
 		name: "ipython",
@@ -571,6 +814,8 @@ interface RetryInternals {
 	_retryAttempt: number;
 	_retryPromise: Promise<void> | undefined;
 	_retryResolve: (() => void) | undefined;
+	_retryAbortController: AbortController | undefined;
+	_retryContinueTimer: ReturnType<typeof setTimeout> | undefined;
 	_resolveRetry: () => void;
 	_createRetryWindow: () => boolean;
 	_handleRetryableError: (message: AssistantMessage) => Promise<boolean>;
@@ -3725,7 +3970,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			await vi.waitFor(() => expect(retryRecoveryStarted).toBe(true));
 			expect(harness.faux.state.callCount).toBe(2);
 			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
-			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
 			expect(observer.retryLeases).toHaveLength(1);
 			expect(observer.retryLeases[0]!.promptId).toBe(ownerA);
 			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
@@ -5475,7 +5720,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(continueSpy).toHaveBeenCalledTimes(1);
 			expect(harness.faux.state.callCount).toBe(3);
 			expect(harness.session.getPromptOutcome(ownerAIds[0]!)).toBeUndefined();
-			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
 			expect(observer.retryLeases).toHaveLength(1);
 			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
 			expect(observer.continuationLeases).toHaveLength(1);
@@ -5736,7 +5981,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			});
 			expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual([0, 0]);
 			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
-			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
 			expect(internals._scheduledPostCompactionContinuationMessages).toEqual([messageA]);
 
 			internals._cancelPostCompactionContinue();
@@ -6765,7 +7010,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(internals._retryWindow).toBeUndefined();
 			expect(internals._retryAttempt).toBe(0);
 			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
-			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
 			// Stamp-boundary snapshot: captured synchronously when production
 			// overflow compaction returns, before the 100ms timer is relevant.
 			expect(stampFacts.aContinuationStarted).toBe(false);
@@ -7211,7 +7456,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			expect(bLease.releaseCalls).toBe(0);
 			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
 			expect(harness.session.getPromptOutcome(ownerD)).toBeUndefined();
-			expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+			expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
 			expect(internals._continuationSettlementWindow).toMatchObject({
 				owners: [ownerA, ownerD, ownerB],
 				obligationMessages: [messageD],
@@ -8258,5 +8503,1248 @@ describe("AgentSession prompt settlement (group 2)", () => {
 			requestCancelSpy.mockRestore();
 			observer.restore();
 		});
+	});
+});
+
+describe("abort and dispose ownership (group 6)", () => {
+	const group6Harnesses: Harness[] = [];
+
+	afterEach(() => {
+		vi.useRealTimers();
+		while (group6Harnesses.length > 0) group6Harnesses.pop()?.cleanup();
+	});
+
+	it("ordinary abort removes a production queueVisible inherited child and preserves independent visible B for resume", async () => {
+		const harness = await createHarness(group6ThresholdHarnessOptions("group-6 abort single-owner summary"));
+		group6Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("B completed after abort resume"),
+		]);
+
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("cross the production threshold", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "cross the production threshold").promptIds![0];
+		await harness.session.followUp("visible B", undefined, { resumeIfIdle: true });
+		const bAction = actionByText(harness, "visible B");
+		const ownerB = bAction.promptIds![0];
+		const bLease = bAction.runLeases![0]!;
+		const a = harness.session.waitForPromptOutcome(ownerA);
+		const b = harness.session.waitForPromptOutcome(ownerB);
+		expect(outcomeCount(harness)).toBe(0);
+
+		let aborted = false;
+		const internals = group6Internals(harness);
+		const originalSchedule = internals._schedulePostCompactionContinue.bind(internals);
+		const scheduleSpy = vi.spyOn(internals, "_schedulePostCompactionContinue").mockImplementation(() => {
+			originalSchedule();
+			if (aborted) return;
+			if (inheritedAutonomousActions(harness, [ownerA]).length !== 1) return;
+			if (!group6Internals(harness)._continuationSettlementWindow) return;
+			if (!group6Internals(harness)._currentRunOwners.includes(ownerA)) return;
+			aborted = true;
+			group6Internals(harness)._promptSettlementTracker.recordFailure(ownerA, "run_error");
+			const inheritedNow = inheritedAutonomousActions(harness, [ownerA])[0]!;
+			expect(inheritedNow.payload.queueVisible).toBe(true);
+			(harness.session as unknown as { _childMessage?: AgentMessage })._childMessage =
+				childPrimaryMessage(inheritedNow);
+			harness.session.requestAbort();
+		});
+		pause.release();
+		await vi.waitFor(() => expect(aborted).toBe(true));
+		scheduleSpy.mockRestore();
+		const childMessage = (harness.session as unknown as { _childMessage?: AgentMessage })._childMessage;
+		expect(childMessage).toBeDefined();
+		expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+		expect(matchingChildBookkeeping(harness, childMessage!)).toEqual({
+			postCompaction: false,
+			pending: false,
+			snapshot: false,
+			pumpOwner: false,
+		});
+		const aOutcome = await a;
+		expect(aOutcome).toMatchObject({ promptId: ownerA, status: "cancelled" });
+		expect(aOutcome.failure).toBeUndefined();
+		expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+		expect(matchingChildBookkeeping(harness, childMessage!)).toEqual({
+			postCompaction: false,
+			pending: false,
+			snapshot: false,
+			pumpOwner: false,
+		});
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(observer.continuationLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+		expect(observer.timeline.indexOf(`requestCancel:${ownerA}`)).toBeGreaterThanOrEqual(0);
+		expect(observer.timeline.indexOf(`requestCancel:${ownerA}`)).toBeLessThan(
+			observer.timeline.indexOf("agent.abort"),
+		);
+		expect(actionByText(harness, "visible B")).toBe(bAction);
+		expect(bAction!.promptIds).toEqual([ownerB]);
+		expect(bAction!.runLeases).toEqual([bLease]);
+		expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
+		expect(outcomeCount(harness)).toBe(1);
+		expect(observer.requestCancels).not.toContain(ownerB);
+
+		const acquireCountAfterAbort = observer.acquireLog.length;
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForSessionInputIdle();
+		const bOutcome = await b;
+		expect(bOutcome).toMatchObject({ promptId: ownerB, status: "completed" });
+		expect(bOutcome.failure).toBeUndefined();
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(observer.acquireLog.slice(acquireCountAfterAbort).some((entry) => entry.kind === "run")).toBe(false);
+		expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerA)).toHaveLength(
+			1,
+		);
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerB)).toHaveLength(
+			1,
+		);
+		observer.restore();
+	});
+
+	it('"all" current A/B abort removes one multi-owner child once and leaves unrelated visible C', async () => {
+		const harness = await createHarness(group6ThresholdHarnessOptions("group-6 abort all-batch summary"));
+		group6Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		harness.session.setFollowUpMode("all");
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("C completed after abort resume"),
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("batch A", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("batch B", undefined, { resumeIfIdle: true });
+		const ids = [actionByText(harness, "batch A").promptIds![0], actionByText(harness, "batch B").promptIds![0]];
+		expect(new Set(ids).size).toBe(2);
+		expect(outcomeCount(harness)).toBe(0);
+
+		let aborted = false;
+		let childMessage: AgentMessage | undefined;
+		let cAction: TurnAction | undefined;
+		let ownerC: string | undefined;
+		let cLease: PromptLease | undefined;
+		const internals = group6Internals(harness);
+		const originalSchedule = internals._schedulePostCompactionContinue.bind(internals);
+		const scheduleSpy = vi.spyOn(internals, "_schedulePostCompactionContinue").mockImplementation(() => {
+			originalSchedule();
+			if (aborted) return;
+			const inheritedNow = turnActions(harness).filter((action) => action.lineage?.inherit !== undefined);
+			if (inheritedNow.length !== 1) return;
+			if (!group6Internals(harness)._continuationSettlementWindow) return;
+			if ([...group6Internals(harness)._currentRunOwners].sort().join() !== [...ids].sort().join()) return;
+			aborted = true;
+			childMessage = childPrimaryMessage(inheritedNow[0]!);
+			expect(inheritedNow[0]!.payload.queueVisible).toBe(true);
+			expect(
+				group6Internals(harness)._admitSessionInput(
+					group6Internals(harness)._createPreparedTurnAction("followUp", "visible C", undefined, {
+						resumeIfIdle: true,
+					}),
+					{ wake: false },
+				),
+			).toMatchObject({ accepted: true });
+			cAction = actionByText(harness, "visible C");
+			ownerC = cAction.promptIds![0];
+			cLease = cAction.runLeases![0]!;
+			const ownerless = continuationMessage("ownerless internal work");
+			expect(
+				group6Internals(harness)._admitSessionInput(
+					group6Internals(harness)._createPreparedTurnAction("followUp", "ownerless internal work", undefined, {
+						message: ownerless,
+						noSettlementIdentity: true,
+					}),
+					{ wake: false },
+				),
+			).toMatchObject({ accepted: true });
+			harness.session.requestAbort();
+		});
+		pause.release();
+		await vi.waitFor(() => expect(aborted).toBe(true));
+		scheduleSpy.mockRestore();
+		expect(turnActions(harness).filter((action) => action.lineage?.inherit !== undefined)).toHaveLength(0);
+		expect(matchingChildBookkeeping(harness, childMessage!).postCompaction).toBe(false);
+		expect(observer.continuationLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+		for (const id of ids) {
+			expect(harness.session.getPromptOutcome(id)).toMatchObject({ promptId: id, status: "cancelled" });
+			expect(harness.session.getPromptOutcome(id)?.failure).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === id)).toHaveLength(
+				1,
+			);
+		}
+		expect(actionByText(harness, "visible C")).toBe(cAction);
+		expect(cAction!.promptIds).toEqual([ownerC]);
+		expect(cAction!.runLeases).toEqual([cLease]);
+		expect(harness.session.getPromptOutcome(ownerC!)).toBeUndefined();
+		expect(actionByText(harness, "ownerless internal work").noSettlementIdentity).toBe(true);
+		expect(observer.requestCancels).not.toContain(ownerC);
+
+		const eventsAfterFirstAbort = outcomeCount(harness);
+		const continuationReleases = observer.continuationLeases.map((lease) => lease.releaseCalls);
+		harness.session.requestAbort();
+		expect(observer.continuationLeases.map((lease) => lease.releaseCalls)).toEqual(continuationReleases);
+		expect(outcomeCount(harness)).toBe(eventsAfterFirstAbort);
+
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForSessionInputIdle();
+		expect(await harness.session.waitForPromptOutcome(ownerC!)).toMatchObject({
+			promptId: ownerC,
+			status: "completed",
+		});
+		expect(harness.faux.state.callCount).toBe(2);
+		observer.restore();
+	});
+
+	it("abortForUpdateRestart reuses current-owner cleanup while preserving B, delivery waiter, and recovery snapshot", async () => {
+		const harness = await createHarness(group6ThresholdHarnessOptions("group-6 update-restart summary"));
+		group6Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("B completed after update restart resume"),
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("cross the production threshold", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "cross the production threshold").promptIds![0];
+		const a = harness.session.waitForPromptOutcome(ownerA);
+		expect(outcomeCount(harness)).toBe(0);
+
+		let aborted = false;
+		let childMessage: AgentMessage | undefined;
+		let bAction: TurnAction | undefined;
+		let ownerB: string | undefined;
+		let bLease: PromptLease | undefined;
+		let delivery: Promise<void> | undefined;
+		let deliverySettled = false;
+		let providerCallsAtAbortStart = 0;
+		const internals = group6Internals(harness);
+		const originalSchedule = internals._schedulePostCompactionContinue.bind(internals);
+		const scheduleSpy = vi.spyOn(internals, "_schedulePostCompactionContinue").mockImplementation(() => {
+			originalSchedule();
+			if (aborted) return;
+			if (inheritedAutonomousActions(harness, [ownerA]).length !== 1) return;
+			if (!group6Internals(harness)._continuationSettlementWindow) return;
+			if (!group6Internals(harness)._currentRunOwners.includes(ownerA)) return;
+			aborted = true;
+			childMessage = childPrimaryMessage(inheritedAutonomousActions(harness, [ownerA])[0]!);
+			delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg-visible-b");
+			expect(
+				group6Internals(harness)._admitSessionInput(
+					group6Internals(harness)._createPreparedTurnAction("followUp", "visible B", undefined, {
+						resumeIfIdle: true,
+						agentMessageId: "agentmsg-visible-b",
+					}),
+					{ wake: false },
+				),
+			).toMatchObject({ accepted: true });
+			bAction = actionByText(harness, "visible B");
+			ownerB = bAction.promptIds![0];
+			bLease = bAction.runLeases![0]!;
+			void delivery.then(
+				() => {
+					deliverySettled = true;
+				},
+				() => {
+					deliverySettled = true;
+				},
+			);
+			providerCallsAtAbortStart = harness.faux.state.callCount;
+			harness.session.abortForUpdateRestart();
+		});
+		pause.release();
+		await vi.waitFor(() => expect(aborted).toBe(true));
+		scheduleSpy.mockRestore();
+		expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+		expect(matchingChildBookkeeping(harness, childMessage!).postCompaction).toBe(false);
+		const aOutcome = await a;
+		expect(aOutcome).toMatchObject({ promptId: ownerA, status: "cancelled" });
+		expect(aOutcome.failure).toBeUndefined();
+		expect(turnActions(harness).some((action) => action.lineage?.inherit !== undefined)).toBe(false);
+		expect(matchingChildBookkeeping(harness, childMessage!).postCompaction).toBe(false);
+		expect(observer.continuationLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+		expect(actionByText(harness, "visible B")).toBe(bAction);
+		expect(bAction!.promptIds).toEqual([ownerB]);
+		expect(bAction!.runLeases).toEqual([bLease]);
+		expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
+		expect(deliverySettled).toBe(false);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions.map((action) => action.payload.text)).toEqual([
+			"visible B",
+		]);
+		await harness.session.waitForSessionInputIdle();
+		expect(harness.faux.state.callCount).toBe(providerCallsAtAbortStart);
+		expect(harness.session.getPromptOutcome(ownerB!)).toBeUndefined();
+
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		const bOutcome = await harness.session.waitForPromptOutcome(ownerB!);
+		await delivery!;
+		expect(bOutcome).toMatchObject({ promptId: ownerB, status: "completed" });
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(0);
+		observer.restore();
+	});
+
+	it("ordinary abort leaves visible B settling until actual clear/mutate/abortAndClearQueue removal", async () => {
+		let releaseA: (() => void) | undefined;
+		const gateA = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				await gateA;
+				return fauxAssistantMessage("a done");
+			},
+			fauxAssistantMessage("unused"),
+		]);
+
+		const a = harness.session.promptAndSettle("A streaming");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		const aId = actionByText(harness, "A streaming").promptIds![0];
+		let bId: string | undefined;
+		const b = harness.session.promptAndSettle("visible B", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+			settlementAdmission: (info) => (bId = info.promptId),
+		});
+		await vi.waitFor(() => expect(bId).toBeDefined());
+		const bAction = actionByText(harness, "visible B");
+		const bLease = bAction.runLeases![0]!;
+
+		harness.session.requestAbort();
+		expect(await a).toMatchObject({ promptId: aId, status: "cancelled" });
+		expect(actionByText(harness, "visible B")).toBe(bAction);
+		expect(bAction.promptIds).toEqual([bId]);
+		expect(bAction.runLeases).toEqual([bLease]);
+		expect(harness.session.getPromptOutcome(bId!)).toBeUndefined();
+		expect(outcomeCount(harness)).toBe(1);
+
+		expect(harness.session.clearQueue().followUp).toEqual(["visible B"]);
+		expect(await b).toMatchObject({ promptId: bId, status: "cancelled" });
+		expect(outcomeCount(harness)).toBe(2);
+		harness.session.clearQueue();
+		expect(outcomeCount(harness)).toBe(2);
+		releaseA?.();
+	});
+
+	it("mutate delete cancels only the actually removed visible B exactly once", async () => {
+		let releaseA: (() => void) | undefined;
+		const gateA = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				await gateA;
+				return fauxAssistantMessage("a done");
+			},
+			fauxAssistantMessage("unused"),
+		]);
+
+		const a = harness.session.promptAndSettle("A streaming");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		let bId: string | undefined;
+		const b = harness.session.promptAndSettle("visible B", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+			settlementAdmission: (info) => (bId = info.promptId),
+		});
+		await vi.waitFor(() => expect(bId).toBeDefined());
+		harness.session.requestAbort();
+		await a;
+		expect(harness.session.getPromptOutcome(bId!)).toBeUndefined();
+		expect(harness.session.mutateQueuedMessage("followUp", 0, "visible B", { type: "delete" })).toBe("applied");
+		expect(await b).toMatchObject({ promptId: bId, status: "cancelled" });
+		expect(outcomeCount(harness)).toBe(2);
+		expect(harness.session.mutateQueuedMessage("followUp", 0, "visible B", { type: "delete" })).toBe("rejected");
+		expect(outcomeCount(harness)).toBe(2);
+		releaseA?.();
+	});
+
+	it("in-process abortAndClearQueue cancels only the actually removed visible B exactly once", async () => {
+		let releaseA: (() => void) | undefined;
+		const gateA = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				await gateA;
+				return fauxAssistantMessage("a done");
+			},
+			fauxAssistantMessage("unused"),
+		]);
+		const connection = inProcessConnectionFor(harness);
+
+		const a = harness.session.promptAndSettle("A streaming");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		const aId = actionByText(harness, "A streaming").promptIds![0];
+		let bId: string | undefined;
+		const b = harness.session.promptAndSettle("visible B", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+			settlementAdmission: (info) => (bId = info.promptId),
+		});
+		await vi.waitFor(() => expect(bId).toBeDefined());
+		expect(await connection.abortAndClearQueue()).toEqual({ steering: [], followUp: ["visible B"] });
+		expect(await a).toMatchObject({ promptId: aId, status: "cancelled" });
+		expect(await b).toMatchObject({ promptId: bId, status: "cancelled" });
+		expect(outcomeCount(harness)).toBe(2);
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === bId)).toHaveLength(1);
+		expect(await connection.abortAndClearQueue()).toEqual({ steering: [], followUp: [] });
+		expect(outcomeCount(harness)).toBe(2);
+		releaseA?.();
+	});
+
+	it("direct dispose seals cancelled+released before controller abort or cleanup lease release", async () => {
+		const harness = await createHarness(group6ThresholdHarnessOptions("group-6 dispose direct summary"));
+		group6Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must not continue after dispose"),
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("cross the production threshold", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "cross the production threshold").promptIds![0];
+		await harness.session.followUp("queued B", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("queued C", undefined, { resumeIfIdle: true });
+		const ownerB = actionByText(harness, "queued B").promptIds![0];
+		const ownerC = actionByText(harness, "queued C").promptIds![0];
+		const a = harness.session.waitForPromptOutcome(ownerA);
+		const b = harness.session.waitForPromptOutcome(ownerB);
+		const c = harness.session.waitForPromptOutcome(ownerC);
+
+		let reentryDisposeCalls = 0;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type !== "prompt_outcome") return;
+			reentryDisposeCalls += 1;
+			harness.session.dispose();
+		});
+		let disposed = false;
+		const internals = group6Internals(harness);
+		const originalSchedule = internals._schedulePostCompactionContinue.bind(internals);
+		const scheduleSpy = vi.spyOn(internals, "_schedulePostCompactionContinue").mockImplementation(() => {
+			originalSchedule();
+			if (disposed) return;
+			expect(observer.continuationLeases.length).toBeGreaterThan(0);
+			expect(group6Internals(harness)._continuationSettlementWindow).toBeDefined();
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			disposed = true;
+			harness.session.dispose();
+		});
+		pause.release();
+		await vi.waitFor(() => expect(disposed).toBe(true));
+		scheduleSpy.mockRestore();
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(observer.timeline.indexOf("settleAll")).toBeGreaterThanOrEqual(0);
+		expect(observer.timeline.indexOf("settleAll")).toBeLessThan(observer.timeline.indexOf("controller.abort"));
+		const firstCleanupRelease = observer.timeline.findIndex((entry) => entry.startsWith("lease.release:"));
+		expect(firstCleanupRelease).toBeGreaterThan(observer.timeline.indexOf("settleAll"));
+		expect(observer.trackerReleaseCalls).toEqual([]);
+
+		const aOutcome = await a;
+		const bOutcome = await b;
+		const cOutcome = await c;
+		for (const [outcome, id] of [
+			[aOutcome, ownerA],
+			[bOutcome, ownerB],
+			[cOutcome, ownerC],
+		] as const) {
+			expect(outcome).toMatchObject({ promptId: id, status: "cancelled" });
+			expect(outcome.failure).toBeUndefined();
+			expect(outcome).toBe(harness.session.getPromptOutcome(id));
+			const record = terminalSnapshot(harness, id);
+			expect(record).toMatchObject({
+				promptId: id,
+				status: "cancelled",
+				released: true,
+				settleReason: "session_disposed",
+			});
+			expect(record?.failureReason).toBeUndefined();
+			expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === id)).toHaveLength(
+				1,
+			);
+		}
+		expect(reentryDisposeCalls).toBe(3);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.continuationLeases.every((lease) => lease.releaseCalls === 1)).toBe(true);
+
+		const snapshotAfter = group6Internals(harness)._promptSettlementTracker.snapshot();
+		harness.session.dispose();
+		await harness.session.disposeAsync();
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(group6Internals(harness)._promptSettlementTracker.snapshot()).toEqual(snapshotAfter);
+		expect(outcomeCount(harness)).toBe(3);
+		unsubscribe();
+		observer.restore();
+	});
+
+	it("disposeAsync seals after graceful pre-drain and before commit-fence abort, then reuses the one-shot seal", async () => {
+		const harness = await createHarness(group6ThresholdHarnessOptions("group-6 dispose async summary"));
+		group6Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("must not continue after disposeAsync"),
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("cross the production threshold", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "cross the production threshold").promptIds![0];
+		await harness.session.followUp("queued B", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("queued C", undefined, { resumeIfIdle: true });
+		const ownerB = actionByText(harness, "queued B").promptIds![0];
+		const ownerC = actionByText(harness, "queued C").promptIds![0];
+		const a = harness.session.waitForPromptOutcome(ownerA);
+		const b = harness.session.waitForPromptOutcome(ownerB);
+		const c = harness.session.waitForPromptOutcome(ownerC);
+		let reentryCalls = 0;
+		harness.session.subscribe((event) => {
+			if (event.type !== "prompt_outcome") return;
+			reentryCalls += 1;
+			void harness.session.disposeAsync();
+		});
+		let disposed = false;
+		const internals = group6Internals(harness);
+		const originalSchedule = internals._schedulePostCompactionContinue.bind(internals);
+		const scheduleSpy = vi.spyOn(internals, "_schedulePostCompactionContinue").mockImplementation(() => {
+			originalSchedule();
+			if (disposed) return;
+			expect(observer.continuationLeases.length).toBeGreaterThan(0);
+			expect(group6Internals(harness)._continuationSettlementWindow).toBeDefined();
+			expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+			disposed = true;
+			void harness.session.disposeAsync();
+		});
+		pause.release();
+		await vi.waitFor(() => expect(disposed).toBe(true));
+		await vi.waitFor(() => expect(group6Internals(harness)._disposed).toBe(true));
+		scheduleSpy.mockRestore();
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(observer.timeline.indexOf("settleAll")).toBeGreaterThanOrEqual(0);
+		expect(observer.timeline.indexOf("settleAll")).toBeLessThan(observer.timeline.indexOf("controller.abort"));
+		const firstCleanupRelease = observer.timeline.findIndex((entry) => entry.startsWith("lease.release:"));
+		expect(firstCleanupRelease).toBeGreaterThan(observer.timeline.indexOf("settleAll"));
+		expect(group6Internals(harness)._disposed).toBe(true);
+
+		for (const [outcome, id] of [
+			[await a, ownerA],
+			[await b, ownerB],
+			[await c, ownerC],
+		] as const) {
+			expect(outcome).toMatchObject({ promptId: id, status: "cancelled" });
+			expect(outcome.failure).toBeUndefined();
+			expect(terminalSnapshot(harness, id)).toMatchObject({
+				status: "cancelled",
+				released: true,
+				settleReason: "session_disposed",
+			});
+		}
+		expect(reentryCalls).toBeGreaterThan(0);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.trackerReleaseCalls).toEqual([]);
+
+		await harness.session.disposeAsync();
+		harness.session.dispose();
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(outcomeCount(harness)).toBe(3);
+		observer.restore();
+	});
+
+	it("direct dispose detaches an active retry window after the cancelled+released seal and prevents later continue", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after dispose")]);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		const internals = retryInternals(harness);
+
+		const retryEvents: Array<{ type: string; attempt?: number; success?: boolean; finalError?: string }> = [];
+		const originalEmit = (
+			harness.session as unknown as {
+				_emit(event: { type: string; attempt?: number; success?: boolean; finalError?: string }): void;
+			}
+		)._emit.bind(harness.session);
+		const emitSpy = vi
+			.spyOn(harness.session as unknown as { _emit(event: { type: string }): void }, "_emit")
+			.mockImplementation((event) => {
+				if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					retryEvents.push(event as { type: string; attempt?: number; success?: boolean; finalError?: string });
+				}
+				originalEmit(event);
+			});
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "auto_retry_start") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		let ownerId: string | undefined;
+		const settled = harness.session.promptAndSettle("dispose during retry sleep", {
+			settlementAdmission: (info) => (ownerId = info.promptId),
+		});
+		await sawRetryStart;
+		await vi.waitFor(() => expect(observer.retryLeases).toHaveLength(1));
+		expect(ownerId).toBeDefined();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(internals._retryPromise).toBeDefined();
+		expect(internals._retryResolve).toBeDefined();
+		expect(internals._retryWindow).toBeDefined();
+		expect(internals._retryAbortController).toBeDefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(harness.session.getPromptOutcome(ownerId!)).toBeUndefined();
+		const providerCallsAtDispose = harness.faux.state.callCount;
+		harness.session.dispose();
+		const outcome = await settled;
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		const settleIndex = observer.timeline.indexOf("settleAll");
+		const firstRetryRelease = observer.timeline.findIndex((entry) => entry.startsWith("lease.release:retry:"));
+		expect(settleIndex).toBeGreaterThanOrEqual(0);
+		expect(firstRetryRelease).toBeGreaterThan(settleIndex);
+		expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome).toBe(harness.session.getPromptOutcome(ownerId!));
+		expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+			promptId: ownerId,
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(internals._retryPromise).toBeUndefined();
+		expect(internals._retryResolve).toBeUndefined();
+		expect(internals._retryWindow).toBeUndefined();
+		expect(internals._retryAbortController).toBeUndefined();
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId)).toHaveLength(
+			1,
+		);
+
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.faux.state.callCount).toBe(providerCallsAtDispose);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		const retryStarts = retryEvents.filter((event) => event.type === "auto_retry_start");
+		const retryEnds = retryEvents.filter((event) => event.type === "auto_retry_end");
+		expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1 })]);
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0]).toMatchObject({ success: false, attempt: 1, finalError: "Retry cancelled" });
+		expect(retryEnds.some((event) => event.attempt === 0)).toBe(false);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(internals._retryPromise).toBeUndefined();
+		expect(internals._retryResolve).toBeUndefined();
+		expect(internals._retryWindow).toBeUndefined();
+		expect(internals._retryAbortController).toBeUndefined();
+		emitSpy.mockRestore();
+		continueSpy.mockRestore();
+		observer.restore();
+	});
+
+	it("disposeAsync prompt_outcome reentry into direct dispose still emits one cancelled event per sibling", async () => {
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			async () => {
+				await new Promise(() => {});
+				return fauxAssistantMessage("must not complete");
+			},
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("running A", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("queued B", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("queued C", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "running A").promptIds![0];
+		const ownerB = actionByText(harness, "queued B").promptIds![0];
+		const ownerC = actionByText(harness, "queued C").promptIds![0];
+		const a = harness.session.waitForPromptOutcome(ownerA);
+		const b = harness.session.waitForPromptOutcome(ownerB);
+		const c = harness.session.waitForPromptOutcome(ownerC);
+		const ids = [ownerA, ownerB, ownerC];
+		const emitted: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type !== "prompt_outcome") return;
+			emitted.push(event.outcome.promptId);
+			if (emitted.length === 1) {
+				harness.session.dispose();
+			}
+		});
+		pause.release();
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		const disposing = harness.session.disposeAsync();
+		await disposing;
+		const outcomes = [await a, await b, await c];
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(emitted.sort()).toEqual([...ids].sort());
+		expect(new Set(emitted).size).toBe(3);
+		for (const [outcome, id] of [
+			[outcomes[0], ownerA],
+			[outcomes[1], ownerB],
+			[outcomes[2], ownerC],
+		] as const) {
+			expect(outcome).toMatchObject({ promptId: id, status: "cancelled" });
+			expect(outcome.failure).toBeUndefined();
+			expect(outcome).toBe(harness.session.getPromptOutcome(id));
+			expect(terminalSnapshot(harness, id)).toMatchObject({
+				status: "cancelled",
+				released: true,
+				settleReason: "session_disposed",
+			});
+			expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === id)).toHaveLength(
+				1,
+			);
+		}
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(outcomeCount(harness)).toBe(3);
+		observer.restore();
+	});
+
+	it("retries a failed direct dispose seal without latching disposed or cleaning resources first", async () => {
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			async () => {
+				await new Promise(() => {});
+				return fauxAssistantMessage("must not complete");
+			},
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("seal retry A", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "seal retry A").promptIds![0];
+		const settled = harness.session.waitForPromptOutcome(ownerA);
+		pause.release();
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		const internals = group6Internals(harness);
+		observer.throwNextSettleAll(new Error("injected settleAll persist failure"));
+		expect(() => harness.session.dispose()).toThrow("injected settleAll persist failure");
+		expect(internals._disposed).toBe(false);
+		expect(internals._promptSettlementDisposeSealed).toBe(false);
+		expect(internals._sessionActionCommitDisposeAbortController.signal.aborted).toBe(false);
+		expect(observer.settleAllCalls).toEqual([]);
+		expect(observer.timeline.filter((entry) => entry.startsWith("lease.release:"))).toEqual([]);
+		expect(observer.timeline).not.toContain("controller.abort");
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+		expect(isPromptSettling(harness, ownerA)).toBe(true);
+
+		harness.session.dispose();
+		const outcome = await settled;
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(outcome).toMatchObject({ promptId: ownerA, status: "cancelled" });
+		expect(outcome.failure).toBeUndefined();
+		expect(terminalSnapshot(harness, ownerA)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(internals._disposed).toBe(true);
+		expect(observer.timeline.indexOf("settleAll")).toBeGreaterThanOrEqual(0);
+		expect(observer.timeline.indexOf("settleAll")).toBeLessThan(observer.timeline.indexOf("controller.abort"));
+		expect(observer.settleAllCalls).toHaveLength(1);
+		observer.restore();
+	});
+
+	it("retries a failed disposeAsync seal without caching a permanent rejection or aborting the commit fence", async () => {
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([
+			async () => {
+				await new Promise(() => {});
+				return fauxAssistantMessage("must not complete");
+			},
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("async seal retry A", undefined, { resumeIfIdle: true });
+		const ownerA = actionByText(harness, "async seal retry A").promptIds![0];
+		const settled = harness.session.waitForPromptOutcome(ownerA);
+		pause.release();
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		const internals = group6Internals(harness);
+		observer.throwNextSettleAll(new Error("injected settleAll persist failure"));
+		await expect(harness.session.disposeAsync()).rejects.toThrow("injected settleAll persist failure");
+		expect(internals._disposed).toBe(false);
+		expect(internals._disposing).toBe(false);
+		expect(internals._promptSettlementDisposeSealed).toBe(false);
+		expect(internals._disposeAsyncPromise).toBeUndefined();
+		expect(internals._sessionActionCommitDisposeAbortController.signal.aborted).toBe(false);
+		expect(observer.settleAllCalls).toEqual([]);
+		expect(observer.timeline).not.toContain("controller.abort");
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+
+		await harness.session.disposeAsync();
+		const outcome = await settled;
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(outcome).toMatchObject({ promptId: ownerA, status: "cancelled" });
+		expect(outcome.failure).toBeUndefined();
+		expect(terminalSnapshot(harness, ownerA)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(internals._disposed).toBe(true);
+		expect(observer.timeline.indexOf("settleAll")).toBeLessThan(observer.timeline.indexOf("controller.abort"));
+		expect(observer.settleAllCalls).toHaveLength(1);
+		observer.restore();
+	});
+
+	it.each([
+		{
+			title: "requestAbort",
+			close: (session: AgentSession) => {
+				session.requestAbort();
+			},
+			expectDisposed: false,
+		},
+		{
+			title: "direct dispose",
+			close: (session: AgentSession) => {
+				session.dispose();
+			},
+			expectDisposed: true,
+		},
+	])(
+		"detaches a post-sleep retry continuation timer on $title before agent.continue",
+		async ({ close, expectDisposed }) => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 25 } },
+			});
+			group6Harnesses.push(harness);
+			vi.useFakeTimers();
+			const observer = installGroup6Observer(harness);
+			harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after close")]);
+			const internals = retryInternals(harness);
+
+			const sawRetryStart = new Promise<void>((resolve) => {
+				const unsubscribe = harness.session.subscribe((event) => {
+					if (event.type !== "auto_retry_start") return;
+					unsubscribe();
+					resolve();
+				});
+			});
+			let ownerId: string | undefined;
+			const settled = harness.session.promptAndSettle("post-sleep retry timer", {
+				settlementAdmission: (info) => (ownerId = info.promptId),
+			});
+			await sawRetryStart;
+			await Promise.resolve();
+			expect(ownerId).toBeDefined();
+			expect(harness.session.isRetrying).toBe(true);
+			expect(observer.retryLeases).toHaveLength(1);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+			expect(internals._retryAbortController).toBeDefined();
+			expect(harness.session.getPromptOutcome(ownerId!)).toBeUndefined();
+			const providerCallsBeforeSleep = harness.faux.state.callCount;
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+			// Fire only the retry sleep (sync). The async next-timer helper would also
+			// flush the 0ms continue that sleep schedules at the same fake now.
+			vi.advanceTimersByTime(25);
+			await Promise.resolve();
+			expect(harness.session.isRetrying).toBe(true);
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(internals._retryAbortController).toBeUndefined();
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+			expect(harness.session.getPromptOutcome(ownerId!)).toBeUndefined();
+			expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+			close(harness.session);
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(internals._retryContinueTimer).toBeUndefined();
+			await vi.advanceTimersToNextTimerAsync();
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(providerCallsBeforeSleep);
+			expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+
+			const outcome = await settled;
+			expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+			expect(outcome!.failure).toBeUndefined();
+			expect(
+				harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId),
+			).toHaveLength(1);
+			if (expectDisposed) {
+				expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+					status: "cancelled",
+					released: true,
+					settleReason: "session_disposed",
+				});
+			}
+			continueSpy.mockRestore();
+			observer.restore();
+		},
+	);
+
+	it("abortForUpdateRestart preserves an independent hidden trigger-turn action in the recovery snapshot", async () => {
+		const harness = await createHarness();
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([fauxAssistantMessage("must not run")]);
+		const internals = group6Internals(harness);
+		const scheduleSpy = vi.spyOn(internals, "_scheduleSessionInputPump").mockImplementation(() => {});
+		await harness.session.followUp("visible queued sibling");
+		const visible = actionByText(harness, "visible queued sibling");
+		const visibleId = visible.promptIds![0];
+		const visibleLease = visible.runLeases![0]!;
+		const visibleOutcome = harness.session.waitForPromptOutcome(visibleId);
+		let visibleSettled = false;
+		void visibleOutcome.then(
+			() => {
+				visibleSettled = true;
+			},
+			() => {
+				visibleSettled = true;
+			},
+		);
+
+		const hiddenCompletion = harness.session.sendCustomMessage(
+			{ customType: "hidden-trigger", content: "hidden queued prompt", display: false },
+			{ triggerTurn: true },
+		);
+		await vi.waitFor(() => expect(actionByText(harness, "hidden queued prompt").payload.queueVisible).toBe(false));
+		const hidden = actionByText(harness, "hidden queued prompt");
+		expect(hidden.payload.queueVisible).toBe(false);
+		expect(hidden.promptIds).toHaveLength(1);
+		const hiddenId = hidden.promptIds![0];
+		const hiddenLease = hidden.runLeases![0]!;
+		const hiddenOutcome = harness.session.waitForPromptOutcome(hiddenId);
+		let hiddenOutcomeSettled = false;
+		let hiddenCompletionSettled = false;
+		void hiddenOutcome.then(
+			() => {
+				hiddenOutcomeSettled = true;
+			},
+			() => {
+				hiddenOutcomeSettled = true;
+			},
+		);
+		void hiddenCompletion.then(
+			() => {
+				hiddenCompletionSettled = true;
+			},
+			() => {
+				hiddenCompletionSettled = true;
+			},
+		);
+		expect(internals._currentRunOwners).toEqual([]);
+		expect(observer.requestCancels).toEqual([]);
+		expect(observer.runLeases.map((lease) => lease.releaseCalls)).toEqual([0, 0]);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions.map((action) => action.payload.text)).toEqual([
+			"visible queued sibling",
+			"hidden queued prompt",
+		]);
+		const providerCallsAtAbort = harness.faux.state.callCount;
+
+		harness.session.abortForUpdateRestart();
+		scheduleSpy.mockRestore();
+
+		expect(actionByText(harness, "hidden queued prompt")).toBe(hidden);
+		expect(hidden.promptIds).toEqual([hiddenId]);
+		expect(hidden.runLeases).toEqual([hiddenLease]);
+		expect(actionByText(harness, "visible queued sibling")).toBe(visible);
+		expect(visible.promptIds).toEqual([visibleId]);
+		expect(visible.runLeases).toEqual([visibleLease]);
+		expect(harness.session.getPromptOutcome(hiddenId)).toBeUndefined();
+		expect(harness.session.getPromptOutcome(visibleId)).toBeUndefined();
+		expect(hiddenOutcomeSettled).toBe(false);
+		expect(hiddenCompletionSettled).toBe(false);
+		expect(visibleSettled).toBe(false);
+		expect(isPromptSettling(harness, hiddenId)).toBe(true);
+		expect(isPromptSettling(harness, visibleId)).toBe(true);
+		expect(observer.requestCancels).toEqual([]);
+		expect(observer.runLeases.map((lease) => lease.releaseCalls)).toEqual([0, 0]);
+		expect(outcomeCount(harness)).toBe(0);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions.map((action) => action.payload.text)).toEqual([
+			"visible queued sibling",
+			"hidden queued prompt",
+		]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["visible queued sibling"]);
+
+		await harness.session.waitForSessionInputIdle();
+		expect(harness.faux.state.callCount).toBe(providerCallsAtAbort);
+		expect(actionByText(harness, "hidden queued prompt")).toBe(hidden);
+		expect(hidden.promptIds).toEqual([hiddenId]);
+		expect(hidden.runLeases).toEqual([hiddenLease]);
+		expect(hiddenOutcomeSettled).toBe(false);
+		expect(hiddenCompletionSettled).toBe(false);
+		expect(visibleSettled).toBe(false);
+		expect(harness.session.getPromptOutcome(hiddenId)).toBeUndefined();
+		expect(observer.requestCancels).toEqual([]);
+		observer.restore();
+	});
+
+	it("disposeAsync detaches a post-sleep retry continuation timer before child/kernel teardown", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 25 } },
+		});
+		group6Harnesses.push(harness);
+		vi.useFakeTimers();
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after async dispose")]);
+		const internals = group6Internals(harness);
+		const retry = retryInternals(harness);
+
+		const retryEvents: Array<{ type: string; attempt?: number; success?: boolean; finalError?: string }> = [];
+		const originalEmit = (
+			harness.session as unknown as {
+				_emit(event: { type: string; attempt?: number; success?: boolean; finalError?: string }): void;
+			}
+		)._emit.bind(harness.session);
+		const emitSpy = vi
+			.spyOn(harness.session as unknown as { _emit(event: { type: string }): void }, "_emit")
+			.mockImplementation((event) => {
+				if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					retryEvents.push(event as { type: string; attempt?: number; success?: boolean; finalError?: string });
+				}
+				originalEmit(event);
+			});
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "auto_retry_start") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		let ownerId: string | undefined;
+		const settled = harness.session.promptAndSettle("async dispose during post-sleep retry", {
+			settlementAdmission: (info) => (ownerId = info.promptId),
+		});
+		await sawRetryStart;
+		await Promise.resolve();
+		expect(ownerId).toBeDefined();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(observer.retryLeases).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(retry._retryAbortController).toBeDefined();
+		const providerCallsBeforeSleep = harness.faux.state.callCount;
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+		vi.advanceTimersByTime(25);
+		await Promise.resolve();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+		const teardownGate = createDeferred();
+		let provisionerDisposeCalls = 0;
+		internals._ipythonKernelProvisioner = {
+			async dispose() {
+				provisionerDisposeCalls += 1;
+				await teardownGate.promise;
+			},
+		};
+
+		const disposing = harness.session.disposeAsync();
+		for (let i = 0; i < 20 && !internals._promptSettlementDisposeSealed; i++) {
+			await Promise.resolve();
+		}
+		expect(internals._promptSettlementDisposeSealed).toBe(true);
+		expect(internals._disposing).toBe(true);
+		expect(internals._disposed).toBe(false);
+		expect(provisionerDisposeCalls).toBe(1);
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+
+		if (vi.getTimerCount() > 0) {
+			await vi.advanceTimersToNextTimerAsync();
+		}
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.faux.state.callCount).toBe(providerCallsBeforeSleep);
+		expect(retry._retryPromise).toBeUndefined();
+		expect(retry._retryResolve).toBeUndefined();
+		expect(retry._retryWindow).toBeUndefined();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(retry._retryContinueTimer).toBeUndefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		const settleIndex = observer.timeline.indexOf("settleAll");
+		const firstRetryRelease = observer.timeline.findIndex((entry) => entry.startsWith("lease.release:retry:"));
+		const controllerAbort = observer.timeline.indexOf("controller.abort");
+		expect(settleIndex).toBeGreaterThanOrEqual(0);
+		expect(firstRetryRelease).toBeGreaterThan(settleIndex);
+		expect(firstRetryRelease).toBeLessThan(controllerAbort);
+		expect(internals._disposed).toBe(false);
+
+		const outcome = await settled;
+		expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome).toBe(harness.session.getPromptOutcome(ownerId!));
+		expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId)).toHaveLength(
+			1,
+		);
+		const retryStarts = retryEvents.filter((event) => event.type === "auto_retry_start");
+		const retryEnds = retryEvents.filter((event) => event.type === "auto_retry_end");
+		expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1 })]);
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0]).toMatchObject({ success: false, attempt: 1, finalError: "Retry cancelled" });
+
+		teardownGate.resolve();
+		await disposing;
+		expect(internals._disposed).toBe(true);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+
+		harness.session.dispose();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+
+		continueSpy.mockRestore();
+		emitSpy.mockRestore();
+		observer.restore();
+	});
+
+	it("disposeAsync auto_retry_end reentry into direct dispose emits exactly one retry-end", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after reentry")]);
+		const retry = retryInternals(harness);
+		const internals = group6Internals(harness);
+
+		const retryEvents: Array<{ type: string; attempt?: number; success?: boolean; finalError?: string }> = [];
+		const originalEmit = (
+			harness.session as unknown as {
+				_emit(event: { type: string; attempt?: number; success?: boolean; finalError?: string }): void;
+			}
+		)._emit.bind(harness.session);
+		const emitSpy = vi
+			.spyOn(harness.session as unknown as { _emit(event: { type: string }): void }, "_emit")
+			.mockImplementation((event) => {
+				if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					retryEvents.push(event as { type: string; attempt?: number; success?: boolean; finalError?: string });
+				}
+				originalEmit(event);
+			});
+
+		const reentryObservations: Array<{
+			retryAttempt: number;
+			retryPromise: unknown;
+			retryResolve: unknown;
+			retryWindow: unknown;
+			retryAbortController: unknown;
+			retryContinueTimer: unknown;
+			disposing: boolean;
+			disposed: boolean;
+			settleAllCalls: number;
+			retryLeaseReleases: number;
+		}> = [];
+		harness.session.subscribe((event) => {
+			if (event.type !== "auto_retry_end") return;
+			reentryObservations.push({
+				retryAttempt: retry._retryAttempt,
+				retryPromise: retry._retryPromise,
+				retryResolve: retry._retryResolve,
+				retryWindow: retry._retryWindow,
+				retryAbortController: retry._retryAbortController,
+				retryContinueTimer: retry._retryContinueTimer,
+				disposing: internals._disposing,
+				disposed: internals._disposed,
+				settleAllCalls: observer.settleAllCalls.length,
+				retryLeaseReleases: observer.retryLeases[0]?.releaseCalls ?? 0,
+			});
+			harness.session.dispose();
+		});
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "auto_retry_start") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		let ownerId: string | undefined;
+		const settled = harness.session.promptAndSettle("async dispose retry-end reentry", {
+			settlementAdmission: (info) => (ownerId = info.promptId),
+		});
+		await sawRetryStart;
+		await vi.waitFor(() => expect(observer.retryLeases).toHaveLength(1));
+		expect(ownerId).toBeDefined();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(retry._retryPromise).toBeDefined();
+		expect(retry._retryResolve).toBeDefined();
+		expect(retry._retryWindow).toBeDefined();
+		expect(retry._retryAbortController).toBeDefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(harness.session.getPromptOutcome(ownerId!)).toBeUndefined();
+
+		const disposing = harness.session.disposeAsync();
+		const outcome = await settled;
+		await disposing;
+
+		const retryStarts = retryEvents.filter((event) => event.type === "auto_retry_start");
+		const retryEnds = retryEvents.filter((event) => event.type === "auto_retry_end");
+		expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1 })]);
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0]).toMatchObject({ success: false, attempt: 1, finalError: "Retry cancelled" });
+		expect(retryEnds.some((event) => event.attempt === 0)).toBe(false);
+		expect(reentryObservations).toHaveLength(1);
+		expect(reentryObservations[0]).toMatchObject({
+			retryAttempt: 0,
+			retryPromise: undefined,
+			retryResolve: undefined,
+			retryWindow: undefined,
+			retryAbortController: undefined,
+			retryContinueTimer: undefined,
+			disposing: true,
+			disposed: false,
+			settleAllCalls: 1,
+			retryLeaseReleases: 1,
+		});
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome).toBe(harness.session.getPromptOutcome(ownerId!));
+		expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId)).toHaveLength(
+			1,
+		);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(retry._retryPromise).toBeUndefined();
+		expect(retry._retryResolve).toBeUndefined();
+		expect(retry._retryWindow).toBeUndefined();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(retry._retryContinueTimer).toBeUndefined();
+		expect(internals._disposed).toBe(true);
+		expect(internals._sessionActionCommitDisposeAbortController.signal.aborted).toBe(true);
+
+		await harness.session.disposeAsync();
+		harness.session.dispose();
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+
+		emitSpy.mockRestore();
+		observer.restore();
 	});
 });
