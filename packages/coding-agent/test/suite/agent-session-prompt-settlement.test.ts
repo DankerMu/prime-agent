@@ -9615,4 +9615,136 @@ describe("abort and dispose ownership (group 6)", () => {
 		emitSpy.mockRestore();
 		observer.restore();
 	});
+
+	it("disposeAsync auto_retry_end reentry into direct dispose emits exactly one retry-end", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		group6Harnesses.push(harness);
+		const observer = installGroup6Observer(harness);
+		harness.setResponses([retryableError(), fauxAssistantMessage("must not continue after reentry")]);
+		const retry = retryInternals(harness);
+		const internals = group6Internals(harness);
+
+		const retryEvents: Array<{ type: string; attempt?: number; success?: boolean; finalError?: string }> = [];
+		const originalEmit = (
+			harness.session as unknown as {
+				_emit(event: { type: string; attempt?: number; success?: boolean; finalError?: string }): void;
+			}
+		)._emit.bind(harness.session);
+		const emitSpy = vi
+			.spyOn(harness.session as unknown as { _emit(event: { type: string }): void }, "_emit")
+			.mockImplementation((event) => {
+				if (event.type === "auto_retry_start" || event.type === "auto_retry_end") {
+					retryEvents.push(event as { type: string; attempt?: number; success?: boolean; finalError?: string });
+				}
+				originalEmit(event);
+			});
+
+		const reentryObservations: Array<{
+			retryAttempt: number;
+			retryPromise: unknown;
+			retryResolve: unknown;
+			retryWindow: unknown;
+			retryAbortController: unknown;
+			retryContinueTimer: unknown;
+			disposing: boolean;
+			disposed: boolean;
+			settleAllCalls: number;
+			retryLeaseReleases: number;
+		}> = [];
+		harness.session.subscribe((event) => {
+			if (event.type !== "auto_retry_end") return;
+			reentryObservations.push({
+				retryAttempt: retry._retryAttempt,
+				retryPromise: retry._retryPromise,
+				retryResolve: retry._retryResolve,
+				retryWindow: retry._retryWindow,
+				retryAbortController: retry._retryAbortController,
+				retryContinueTimer: retry._retryContinueTimer,
+				disposing: internals._disposing,
+				disposed: internals._disposed,
+				settleAllCalls: observer.settleAllCalls.length,
+				retryLeaseReleases: observer.retryLeases[0]?.releaseCalls ?? 0,
+			});
+			harness.session.dispose();
+		});
+
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "auto_retry_start") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		let ownerId: string | undefined;
+		const settled = harness.session.promptAndSettle("async dispose retry-end reentry", {
+			settlementAdmission: (info) => (ownerId = info.promptId),
+		});
+		await sawRetryStart;
+		await vi.waitFor(() => expect(observer.retryLeases).toHaveLength(1));
+		expect(ownerId).toBeDefined();
+		expect(harness.session.isRetrying).toBe(true);
+		expect(retry._retryPromise).toBeDefined();
+		expect(retry._retryResolve).toBeDefined();
+		expect(retry._retryWindow).toBeDefined();
+		expect(retry._retryAbortController).toBeDefined();
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(0);
+		expect(harness.session.getPromptOutcome(ownerId!)).toBeUndefined();
+
+		const disposing = harness.session.disposeAsync();
+		const outcome = await settled;
+		await disposing;
+
+		const retryStarts = retryEvents.filter((event) => event.type === "auto_retry_start");
+		const retryEnds = retryEvents.filter((event) => event.type === "auto_retry_end");
+		expect(retryStarts).toEqual([expect.objectContaining({ attempt: 1 })]);
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0]).toMatchObject({ success: false, attempt: 1, finalError: "Retry cancelled" });
+		expect(retryEnds.some((event) => event.attempt === 0)).toBe(false);
+		expect(reentryObservations).toHaveLength(1);
+		expect(reentryObservations[0]).toMatchObject({
+			retryAttempt: 0,
+			retryPromise: undefined,
+			retryResolve: undefined,
+			retryWindow: undefined,
+			retryAbortController: undefined,
+			retryContinueTimer: undefined,
+			disposing: true,
+			disposed: false,
+			settleAllCalls: 1,
+			retryLeaseReleases: 1,
+		});
+		expect(observer.settleAllCalls).toEqual([{ status: "cancelled", reason: "session_disposed", released: true }]);
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(outcome).toMatchObject({ promptId: ownerId, status: "cancelled" });
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome).toBe(harness.session.getPromptOutcome(ownerId!));
+		expect(terminalSnapshot(harness, ownerId!)).toMatchObject({
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+		});
+		expect(harness.eventsOfType("prompt_outcome").filter((event) => event.outcome.promptId === ownerId)).toHaveLength(
+			1,
+		);
+		expect(harness.session.isRetrying).toBe(false);
+		expect(retry._retryPromise).toBeUndefined();
+		expect(retry._retryResolve).toBeUndefined();
+		expect(retry._retryWindow).toBeUndefined();
+		expect(retry._retryAbortController).toBeUndefined();
+		expect(retry._retryContinueTimer).toBeUndefined();
+		expect(internals._disposed).toBe(true);
+		expect(internals._sessionActionCommitDisposeAbortController.signal.aborted).toBe(true);
+
+		await harness.session.disposeAsync();
+		harness.session.dispose();
+		expect(observer.settleAllCalls).toHaveLength(1);
+		expect(observer.retryLeases[0]!.releaseCalls).toBe(1);
+		expect(retryEvents.filter((event) => event.type === "auto_retry_end")).toHaveLength(1);
+
+		emitSpy.mockRestore();
+		observer.restore();
+	});
 });

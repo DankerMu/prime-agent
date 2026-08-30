@@ -4379,18 +4379,21 @@ export class AgentSession {
 		if (controller) {
 			this._disposeOwnedRetryAbortSignal = controller.signal;
 		}
-		if (this._retryAttempt > 0) {
+		const attempt = this._retryAttempt;
+		this._retryAttempt = 0;
+		this._retryAuthFailureSources = [];
+		if (attempt > 0) {
 			this._autoCompactionAbortController?.abort();
+		}
+		this._resolveRetry();
+		if (attempt > 0) {
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
-				attempt: this._retryAttempt,
+				attempt,
 				finalError: "Retry cancelled",
 			});
-			this._retryAttempt = 0;
 		}
-		this._retryAuthFailureSources = [];
-		this._resolveRetry();
 		controller?.abort();
 	}
 
