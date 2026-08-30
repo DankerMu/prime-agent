@@ -18,33 +18,41 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+type AppendFileSync = typeof appendFileSync;
 type ChmodSync = typeof chmodSync;
 type ChownSync = typeof chownSync;
 type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
 
 const fsMocks = vi.hoisted(() => ({
+	actualAppendFileSync: undefined as AppendFileSync | undefined,
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
+	appendFileSync: vi.fn<AppendFileSync>(),
 	chmodSync: vi.fn<ChmodSync>(),
 	chownSync: vi.fn<ChownSync>(),
 	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
 }));
-vi.mock("node:fs", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("node:fs")>();
+async function mockFsModule(importOriginal: () => Promise<typeof import("node:fs")>) {
+	const actual = await importOriginal();
+	fsMocks.actualAppendFileSync = actual.appendFileSync;
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
+	fsMocks.appendFileSync.mockImplementation(actual.appendFileSync);
 	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
 	fsMocks.chownSync.mockImplementation(actual.chownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
 	return {
 		...actual,
+		appendFileSync: fsMocks.appendFileSync,
 		chmodSync: fsMocks.chmodSync,
 		chownSync: fsMocks.chownSync,
 		renameSync: fsMocks.renameSync,
 		writeFileSync: fsMocks.writeFileSync,
 	};
-});
+}
+vi.mock("node:fs", async (importOriginal) => mockFsModule(importOriginal));
+vi.mock("fs", async (importOriginal) => mockFsModule(importOriginal as () => Promise<typeof import("node:fs")>));
 
 import { appendSessionMessageWithCommitHook, SessionManager } from "../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "./utilities.js";
@@ -52,6 +60,15 @@ import { assistantMsg, userMsg } from "./utilities.js";
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	fsMocks.appendFileSync.mockReset();
+	fsMocks.writeFileSync.mockReset();
+	fsMocks.renameSync.mockClear();
+	if (fsMocks.actualAppendFileSync) {
+		fsMocks.appendFileSync.mockImplementation(fsMocks.actualAppendFileSync);
+	}
+	if (fsMocks.actualWriteFileSync) {
+		fsMocks.writeFileSync.mockImplementation(fsMocks.actualWriteFileSync);
+	}
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop()!;
 		rmSync(dir, { recursive: true, force: true });
@@ -600,5 +617,93 @@ describe("SessionManager append commit hook", () => {
 		expect(order).toEqual(["callback"]);
 		expect(mgr.getSessionFile()).toBeUndefined();
 		unsubscribe();
+	});
+
+	it("runs the commit hook after a flushed appendFileSync success and before persist listeners", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const firstAssistantId = mgr.appendMessage(assistantMsg("first"));
+		const file = mgr.getSessionFile()!;
+		expect(existsSync(file)).toBe(true);
+		const bytesBefore = readFileSync(file);
+		const order: string[] = [];
+		const unsubscribe = mgr.onPersist(() => {
+			order.push("listener");
+		});
+		const rewriteSpy = vi.spyOn(mgr as unknown as { _rewriteFile(): void }, "_rewriteFile");
+		const persistCalls: string[] = [];
+		const originalPersist = (mgr as unknown as { _persist(entry: { id: string }): void })._persist.bind(mgr);
+		(mgr as unknown as { _persist(entry: { id: string }): void })._persist = (entry) => {
+			persistCalls.push(entry.id);
+			originalPersist(entry);
+		};
+		const appendCallsBefore = fsMocks.appendFileSync.mock.calls.length;
+
+		const secondId = appendSessionMessageWithCommitHook(mgr, assistantMsg("second"), (entryId) => {
+			expect(entryId).toBe(mgr.getLeafId());
+			expect(mgr.getEntry(entryId)?.type).toBe("message");
+			expect(existsSync(file)).toBe(true);
+			expect(persistedFileEntries(file).at(-1)).toMatchObject({ id: entryId, type: "message" });
+			expect(order).toEqual([]);
+			order.push("callback");
+		});
+
+		expect(rewriteSpy).not.toHaveBeenCalled();
+		expect(fsMocks.appendFileSync.mock.calls.length).toBeGreaterThan(appendCallsBefore);
+		expect(persistCalls).toEqual([secondId]);
+		expect(secondId).toBe(mgr.getLeafId());
+		expect(secondId).not.toBe(firstAssistantId);
+		expect(
+			mgr
+				.getEntries()
+				.map((entry) => entry.id)
+				.slice(-2),
+		).toEqual([firstAssistantId, secondId]);
+		const fileEntries = persistedFileEntries(file);
+		expect(fileEntries.at(-1)).toMatchObject({ id: secondId, type: "message" });
+		expect(fileEntries.some((entry) => (entry as { id?: string }).id === firstAssistantId)).toBe(true);
+		expect(readFileSync(file).length).toBeGreaterThan(bytesBefore.length);
+		expect(order).toEqual(["callback", "listener"]);
+		unsubscribe();
+		rewriteSpy.mockRestore();
+	});
+
+	it("keeps prior durable bytes and skips hook/listener when a flushed appendFileSync throws", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const firstAssistantId = mgr.appendMessage(assistantMsg("first"));
+		const file = mgr.getSessionFile()!;
+		const bytesBefore = readFileSync(file);
+		const memoryBefore = mgr.getEntries().length;
+		const callback = vi.fn();
+		const listener = vi.fn();
+		const unsubscribe = mgr.onPersist(listener);
+		const rewriteSpy = vi.spyOn(mgr as unknown as { _rewriteFile(): void }, "_rewriteFile");
+		const persistCalls: string[] = [];
+		const originalPersist = (mgr as unknown as { _persist(entry: { id: string }): void })._persist.bind(mgr);
+		(mgr as unknown as { _persist(entry: { id: string }): void })._persist = (entry) => {
+			persistCalls.push(entry.id);
+			originalPersist(entry);
+		};
+		fsMocks.appendFileSync.mockImplementationOnce(() => {
+			throw new Error("appendFileSync failed");
+		});
+
+		expect(() => appendSessionMessageWithCommitHook(mgr, assistantMsg("lost-tail"), callback)).toThrow(
+			"appendFileSync failed",
+		);
+		expect(rewriteSpy).not.toHaveBeenCalled();
+		expect(persistCalls).toHaveLength(1);
+		expect(callback).not.toHaveBeenCalled();
+		expect(listener).not.toHaveBeenCalled();
+		expect(readFileSync(file)).toEqual(bytesBefore);
+		expect(persistedFileEntries(file).at(-1)).toMatchObject({ id: firstAssistantId, type: "message" });
+		expect(mgr.getEntries()).toHaveLength(memoryBefore + 1);
+		expect(mgr.getLeafId()).toBe(mgr.getEntries().at(-1)?.id);
+		expect(mgr.getLeafId()).not.toBe(firstAssistantId);
+		unsubscribe();
+		rewriteSpy.mockRestore();
 	});
 });

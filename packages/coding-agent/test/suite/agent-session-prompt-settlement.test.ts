@@ -9998,55 +9998,83 @@ describe("finalMessageIds attribution (group 7)", () => {
 	});
 
 	it("attributes a delayed A continuation only to captured A after B's ordinary run", async () => {
-		vi.useRealTimers();
-		const bGate = gatedHook({ prompt: "queued B after delayed A" });
-		const harness = await createHarness({
-			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
-			extensionFactories: [bGate.factory],
-		});
+		const harness = await createHarness();
 		group7Harnesses.push(harness);
 		const internals = continuationInternals(harness);
 		const ownerA = "group7-delayed-a";
 		admitOwners(harness, ownerA);
+		const aRunLease = internals._promptSettlementTracker.acquire(ownerA, "run");
 		const message = continuationMessage("delayed A continuation");
+		harness.session.agent.state.messages = [continuationMessage("continue delayed A")];
+
+		const before = new Set(assistantSessionEntryIds(harness));
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		let bStarted = false;
+		const bGate = createDeferred();
+		harness.setResponses([
+			async () => {
+				bStarted = true;
+				await bGate.promise;
+				return fauxAssistantMessage("B ordinary done");
+			},
+			fauxAssistantMessage("A continuation recovered"),
+		]);
+		const bSettled = harness.session.promptAndSettle("queued B after delayed A");
+		await vi.waitFor(() => expect(bStarted).toBe(true));
+		const ownerB = actionByText(harness, "queued B after delayed A").promptIds![0]!;
+		expect(ownerB).not.toBe(ownerA);
+		expect(internals._currentRunOwners).toEqual([ownerB]);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+
+		bGate.resolve();
+		const outcomeB = await bSettled;
+		const afterB = appendedAssistantEntries(harness, before);
+		expect(afterB).toHaveLength(1);
+		expect(getMessageText(afterB[0]!.message)).toBe("B ordinary done");
+		const mbId = afterB[0]!.id;
+		expect(outcomeB).toMatchObject({
+			promptId: ownerB,
+			status: "completed",
+			finalMessageIds: [mbId],
+		});
+		expect(outcomeB!.finalMessageIds).toEqual([mbId]);
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+		expect(internals._currentRunOwners).toEqual([]);
+		expect(continueSpy).not.toHaveBeenCalled();
+
+		harness.setResponses([fauxAssistantMessage("A continuation recovered")]);
+		harness.session.agent.state.messages = [continuationMessage("continue delayed A")];
 		internals._postCompactionContinuationMessages = [message];
 		expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
-		internals._schedulePostCompactionContinue();
-		harness.session.agent.state.messages = [continuationMessage("continue delayed A")];
-		const retryRecovery = createDeferred();
-		let retryRecoveryStarted = false;
-		harness.setResponses([
-			retryableError(),
-			async () => {
-				retryRecoveryStarted = true;
-				await retryRecovery.promise;
-				return fauxAssistantMessage("A continuation recovered");
-			},
-			fauxAssistantMessage("B ordinary done"),
-		]);
-		await harness.session.followUp("queued B after delayed A", undefined, { resumeIfIdle: true });
-		const ownerB = actionByText(harness, "queued B after delayed A").promptIds![0]!;
-		await vi.waitFor(() => expect(retryRecoveryStarted).toBe(true));
+		expect(internals._continuationSettlementWindow?.owners).toEqual([ownerA]);
+		aRunLease.release();
 		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
-		expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
-		retryRecovery.resolve();
-		await vi.waitFor(() => expect(harness.session.getPromptOutcome(ownerA)).toBeDefined());
-		await bGate.reached;
-		bGate.release();
-		const outcomeB = await harness.session.waitForPromptOutcome(ownerB);
-		const outcomeA = harness.session.getPromptOutcome(ownerA)!;
-		const assistantEntries = appendedAssistantEntries(harness, new Set());
-		const aRetry = assistantEntries.find((entry) => (entry.message as AssistantMessage).stopReason === "error");
-		const aRecovered = assistantEntries.find((entry) => getMessageText(entry.message) === "A continuation recovered");
-		const bDone = assistantEntries.find((entry) => getMessageText(entry.message) === "B ordinary done");
-		expect(aRetry).toBeDefined();
-		expect(aRecovered).toBeDefined();
-		expect(bDone).toBeDefined();
-		expect(outcomeB.finalMessageIds).toEqual([bDone!.id]);
-		expect(outcomeA.finalMessageIds).toEqual([aRetry!.id, aRecovered!.id]);
-		expect(outcomeA.finalMessageIds).not.toContain(bDone!.id);
-		expect(outcomeB.finalMessageIds).not.toContain(aRecovered!.id);
+		await internals._runDirectContinuation([message], internals._continuationSettlementWindow);
+		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(2);
+		expect(appended.map((entry) => getMessageText(entry.message))).toEqual([
+			"B ordinary done",
+			"A continuation recovered",
+		]);
+		expect(appended.map((entry) => entry.id)).toEqual([mbId, appended[1]!.id]);
+		const maId = appended[1]!.id;
+		expect(maId).not.toBe(mbId);
+		const outcomeA = harness.session.getPromptOutcome(ownerA);
+		expect(outcomeA).toMatchObject({
+			promptId: ownerA,
+			status: "completed",
+			finalMessageIds: [maId],
+		});
+		expect(outcomeA!.finalMessageIds).toEqual([maId]);
+		expect(outcomeA!.finalMessageIds).not.toContain(mbId);
+		expect(outcomeB!.finalMessageIds).not.toContain(maId);
+		expect(new Set([...outcomeA!.finalMessageIds, ...outcomeB!.finalMessageIds]).size).toBe(2);
 		expect(internals._currentRunOwners).toEqual([]);
+		expect(internals._lastRunPromptIds).toEqual([]);
+		continueSpy.mockRestore();
 	});
 
 	it("installs captured operation owners on the matching-retry path and restores prior scope", async () => {
@@ -10325,6 +10353,436 @@ describe("finalMessageIds attribution (group 7)", () => {
 		expect(cached!.finalMessageIds).not.toContain(refinementEntries[0]!.id);
 		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(eventsBefore);
 		expect(customSessionEntryIds(harness).filter((id) => !customBefore.has(id))).toEqual([refinementEntries[0]!.id]);
+	});
+
+	it("attributes an in-memory assistant id before a public message_end dispose", async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("public dispose")]);
+
+		let acceptedId: string | undefined;
+		let publicMessageEndCalls = 0;
+		let observedPublicId: string | undefined;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			publicMessageEndCalls += 1;
+			const appended = appendedAssistantEntries(harness, before);
+			expect(appended).toHaveLength(1);
+			observedPublicId = appended[0]!.id;
+			expect(harness.session.getPromptOutcome(acceptedId!)).toBeUndefined();
+			harness.session.dispose();
+		});
+
+		const outcome = await harness.session.promptAndSettle("public message_end dispose", {
+			settlementAdmission: (info) => {
+				acceptedId = info.promptId;
+			},
+		});
+		unsubscribe();
+
+		expect(acceptedId).toEqual(expect.any(String));
+		expect(publicMessageEndCalls).toBe(1);
+		expect(observedPublicId).toEqual(expect.any(String));
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]!.id).toBe(observedPublicId);
+		expect(outcome).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			finalMessageIds: [observedPublicId],
+		});
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome!.finalMessageIds).toEqual([observedPublicId]);
+		expect(harness.session.getPromptOutcome(acceptedId!)).toBe(outcome);
+		expect(terminalSnapshot(harness, acceptedId!)).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+			finalMessageIds: [observedPublicId],
+		});
+		expect(terminalSnapshot(harness, acceptedId!)?.failureReason).toBeUndefined();
+		expect(outcomeCount(harness)).toBe(1);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+		expect(harness.eventsOfType("prompt_outcome")[0]!.outcome).toBe(outcome);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("defers extension shutdown dispose until after replacement, attribution, and public message_end", async () => {
+		const order: string[] = [];
+		let acceptedId: string | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", (event, ctx) => {
+						if (event.message.role !== "assistant") return;
+						order.push("extension");
+						ctx.shutdown();
+						return {
+							message: {
+								...event.message,
+								usage: {
+									...event.message.usage,
+									cost: {
+										...event.message.usage.cost,
+										total: 0.321,
+									},
+								},
+							},
+						};
+					});
+				},
+			],
+		});
+		group7Harnesses.push(harness);
+		await harness.session.bindExtensions({
+			shutdownHandler: () => {
+				order.push("shutdown");
+				harness.session.dispose();
+			},
+		});
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("shutdown fence")]);
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "assistant") return;
+			order.push("public");
+			expect(event.message.role).toBe("assistant");
+			if (event.message.role === "assistant") {
+				expect(event.message.usage.cost.total).toBe(0.321);
+			}
+			expect(appendedAssistantEntries(harness, before)).toHaveLength(1);
+			expect(harness.session.getPromptOutcome(acceptedId!)).toBeUndefined();
+		});
+
+		const outcome = await harness.session.promptAndSettle("extension shutdown dispose", {
+			settlementAdmission: (info) => {
+				acceptedId = info.promptId;
+			},
+		});
+		unsubscribe();
+
+		expect(acceptedId).toEqual(expect.any(String));
+		expect(order).toEqual(["extension", "public", "shutdown"]);
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]!.message.role).toBe("assistant");
+		if (appended[0]!.message.role === "assistant") {
+			expect(appended[0]!.message.usage.cost.total).toBe(0.321);
+		}
+		const assistantId = appended[0]!.id;
+		expect(outcome).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			finalMessageIds: [assistantId],
+		});
+		expect(outcome!.failure).toBeUndefined();
+		expect(harness.session.getPromptOutcome(acceptedId!)).toBe(outcome);
+		expect(terminalSnapshot(harness, acceptedId!)).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+			finalMessageIds: [assistantId],
+		});
+		expect(outcomeCount(harness)).toBe(1);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("keeps a successfully appended assistant id when an extension message_end aborts", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", (event, ctx) => {
+						if (event.message.role !== "assistant") return;
+						ctx.abort();
+					});
+				},
+			],
+		});
+		group7Harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("aborted after append")]);
+		const outcome = await harness.session.promptAndSettle("extension abort keeps id");
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(outcome).toMatchObject({
+			status: "cancelled",
+			finalMessageIds: [appended[0]!.id],
+		});
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome!.finalMessageIds).toEqual([appended[0]!.id]);
+		expect(harness.session.getPromptOutcome(outcome!.promptId)).toBe(outcome);
+		expect(outcomeCount(harness)).toBe(1);
+	});
+
+	it("still emits extension then public message_end when assistant persistence throws, without attributing", async () => {
+		const order: string[] = [];
+		const harness = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", (event) => {
+						if (event.message.role !== "assistant") return;
+						order.push("extension");
+					});
+				},
+			],
+		});
+		group7Harnesses.push(harness);
+		const manager = harness.sessionManager as unknown as {
+			_persist(entry: { id: string; type?: string; message?: { role?: string } }): void;
+			onPersist(listener: (sessionFile: string) => void): () => void;
+		};
+		const originalPersist = manager._persist.bind(harness.sessionManager);
+		manager._persist = ((entry) => {
+			if (entry.message?.role === "assistant") {
+				throw new Error("assistant persist exploded");
+			}
+			originalPersist(entry);
+		}) as typeof manager._persist;
+		const persistListener = vi.fn();
+		const unsubscribePersist = manager.onPersist(persistListener);
+		const before = new Set(assistantSessionEntryIds(harness));
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				order.push("public");
+			}
+		});
+		const assistant = fauxAssistantMessage("lost persist");
+		await expect(
+			(
+				harness.session as unknown as {
+					_processAgentEvent(event: { type: string; message: unknown }): Promise<void>;
+				}
+			)._processAgentEvent({ type: "message_end", message: assistant }),
+		).rejects.toThrow("assistant persist exploded");
+		unsubscribe();
+		unsubscribePersist();
+		expect(order).toEqual(["extension", "public"]);
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(persistListener).not.toHaveBeenCalled();
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+	});
+
+	it("emits public assistant message_end once when an appendMessage wrapper throws after a successful commit", async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const manager = harness.sessionManager;
+		const originalAppend = manager.appendMessage.bind(manager);
+		manager.appendMessage = ((message) => {
+			const id = originalAppend(message);
+			if (message.role === "assistant") {
+				throw new Error("appendMessage wrapper exploded");
+			}
+			return id;
+		}) as typeof manager.appendMessage;
+
+		const persistListener = vi.fn();
+		const unsubscribePersist = manager.onPersist(persistListener);
+		const before = new Set(assistantSessionEntryIds(harness));
+		let publicMessageEndCalls = 0;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				publicMessageEndCalls += 1;
+			}
+		});
+		const assistant = fauxAssistantMessage("post-commit append wrapper");
+		await expect(
+			(
+				harness.session as unknown as {
+					_processAgentEvent(event: { type: string; message: unknown }): Promise<void>;
+				}
+			)._processAgentEvent({ type: "message_end", message: assistant }),
+		).rejects.toThrow("appendMessage wrapper exploded");
+		unsubscribe();
+		unsubscribePersist();
+
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(publicMessageEndCalls).toBe(1);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+		expect(persistListener).not.toHaveBeenCalled();
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+	});
+
+	it("emits public assistant message_end once when a _persist wrapper throws after a successful commit", async () => {
+		const harness = await createHarness({ persistSession: true });
+		group7Harnesses.push(harness);
+		const manager = harness.sessionManager as unknown as {
+			_persist(entry: { id: string; message?: { role?: string } }): void;
+			onPersist(listener: (sessionFile: string) => void): () => void;
+		};
+		const originalPersist = manager._persist.bind(harness.sessionManager);
+		manager._persist = ((entry) => {
+			originalPersist(entry);
+			if (entry.message?.role === "assistant") {
+				throw new Error("persist wrapper exploded");
+			}
+		}) as typeof manager._persist;
+		const persistListener = vi.fn();
+		const unsubscribePersist = manager.onPersist(persistListener);
+		const before = new Set(assistantSessionEntryIds(harness));
+		let publicMessageEndCalls = 0;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				publicMessageEndCalls += 1;
+			}
+		});
+		const assistant = fauxAssistantMessage("post-commit persist wrapper");
+		await expect(
+			(
+				harness.session as unknown as {
+					_processAgentEvent(event: { type: string; message: unknown }): Promise<void>;
+				}
+			)._processAgentEvent({ type: "message_end", message: assistant }),
+		).rejects.toThrow("persist wrapper exploded");
+		unsubscribe();
+		unsubscribePersist();
+
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(publicMessageEndCalls).toBe(1);
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+		expect(persistListener).toHaveBeenCalledTimes(1);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+	});
+
+	it("isolates a deferred extension shutdown throw and does not fail a successful assistant finalization", async () => {
+		const extensionErrors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", (event, ctx) => {
+						if (event.message.role !== "assistant") return;
+						ctx.shutdown();
+					});
+				},
+			],
+		});
+		group7Harnesses.push(harness);
+		await harness.session.bindExtensions({
+			onError: (error) => extensionErrors.push(error.error),
+			shutdownHandler: () => {
+				throw new Error("deferred shutdown exploded");
+			},
+		});
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("shutdown throw isolated")]);
+		const outcome = await harness.session.promptAndSettle("deferred shutdown throw");
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(outcome).toMatchObject({
+			status: "completed",
+			finalMessageIds: [appended[0]!.id],
+		});
+		expect(harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant")).toHaveLength(1);
+		expect(outcomeCount(harness)).toBe(1);
+		expect(extensionErrors).toEqual([]);
+	});
+
+	it("keeps the original persist error when a deferred shutdown handler also throws", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", (event, ctx) => {
+						if (event.message.role !== "assistant") return;
+						ctx.shutdown();
+					});
+				},
+			],
+		});
+		group7Harnesses.push(harness);
+		await harness.session.bindExtensions({
+			shutdownHandler: () => {
+				throw new Error("deferred shutdown exploded");
+			},
+		});
+		const manager = harness.sessionManager as unknown as {
+			_persist(entry: { id: string; message?: { role?: string } }): void;
+			onPersist(listener: (sessionFile: string) => void): () => void;
+		};
+		const originalPersist = manager._persist.bind(harness.sessionManager);
+		manager._persist = ((entry) => {
+			if (entry.message?.role === "assistant") {
+				throw new Error("assistant persist exploded");
+			}
+			originalPersist(entry);
+		}) as typeof manager._persist;
+		const persistListener = vi.fn();
+		const unsubscribePersist = manager.onPersist(persistListener);
+		const before = new Set(assistantSessionEntryIds(harness));
+		let publicMessageEndCalls = 0;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				publicMessageEndCalls += 1;
+			}
+		});
+		const assistant = fauxAssistantMessage("persist plus shutdown throw");
+		await expect(
+			(
+				harness.session as unknown as {
+					_processAgentEvent(event: { type: string; message: unknown }): Promise<void>;
+				}
+			)._processAgentEvent({ type: "message_end", message: assistant }),
+		).rejects.toThrow("assistant persist exploded");
+		unsubscribe();
+		unsubscribePersist();
+		expect(publicMessageEndCalls).toBe(1);
+		expect(appendedAssistantEntries(harness, before)).toHaveLength(1);
+		expect(persistListener).not.toHaveBeenCalled();
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(0);
+	});
+
+	it("attributes the actual id through supplied SessionManager appendMessage and _persist wrappers", async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const manager = harness.sessionManager;
+		const appendSeen: Array<{ role: string; id: string }> = [];
+		const persistSeen: string[] = [];
+		const originalAppend = manager.appendMessage.bind(manager);
+		const originalPersist = (manager as unknown as { _persist(entry: { id: string }): void })._persist.bind(manager);
+		let nestedUnrelatedId: string | undefined;
+		manager.appendMessage = ((message) => {
+			if (message.role === "assistant" && nestedUnrelatedId === undefined) {
+				nestedUnrelatedId = originalAppend({
+					role: "user",
+					content: "nested unrelated append",
+					timestamp: Date.now(),
+				});
+			}
+			const id = originalAppend(message);
+			appendSeen.push({ role: message.role, id });
+			return id;
+		}) as typeof manager.appendMessage;
+		(manager as unknown as { _persist(entry: { id: string }): void })._persist = (entry) => {
+			persistSeen.push(entry.id);
+			originalPersist(entry);
+		};
+
+		expect(manager.appendMessage.length).toBe(1);
+		expect((manager as unknown as { _persist(entry: unknown): void })._persist.length).toBe(1);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("wrapped persist")]);
+		const outcome = await harness.session.promptAndSettle("supplied manager wrappers");
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		const assistantId = appended[0]!.id;
+		expect(nestedUnrelatedId).toEqual(expect.any(String));
+		expect(nestedUnrelatedId).not.toBe(assistantId);
+		expect(appendSeen.some((entry) => entry.role === "assistant" && entry.id === assistantId)).toBe(true);
+		expect(appendSeen.filter((entry) => entry.role === "assistant")).toHaveLength(1);
+		expect(persistSeen).toContain(assistantId);
+		expect(persistSeen).toContain(nestedUnrelatedId);
+		expect(outcome).toMatchObject({
+			status: "completed",
+			finalMessageIds: [assistantId],
+		});
+		expect(outcome!.finalMessageIds).not.toContain(nestedUnrelatedId);
+		expect(manager.getEntry(assistantId)?.id).toBe(assistantId);
+		expect(manager.getEntry(nestedUnrelatedId!)?.id).toBe(nestedUnrelatedId);
 	});
 
 	it("attributes a persisted assistant entry before a synchronous onPersist dispose", async () => {

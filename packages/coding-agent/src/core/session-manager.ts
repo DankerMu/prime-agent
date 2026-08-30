@@ -96,6 +96,33 @@ export type SessionPersistListener = (sessionFile: string) => void;
 /** Observer invoked after a successful append commit and before persist listeners. */
 type SessionAppendCommitHook = (entryId: string) => void;
 
+type PendingAppendCommitHook = {
+	message: Message | CustomMessage | BashExecutionMessage;
+	onCommitted: SessionAppendCommitHook;
+	boundEntryId?: string;
+	invoked: boolean;
+};
+
+const pendingAppendCommitHooks = new WeakMap<SessionManager, PendingAppendCommitHook[]>();
+
+function installPendingAppendCommitHook(
+	sessionManager: SessionManager,
+	message: Message | CustomMessage | BashExecutionMessage,
+	onCommitted: SessionAppendCommitHook,
+): () => void {
+	const stack = pendingAppendCommitHooks.get(sessionManager) ?? [];
+	const hook: PendingAppendCommitHook = { message, onCommitted, invoked: false };
+	stack.push(hook);
+	pendingAppendCommitHooks.set(sessionManager, stack);
+	return () => {
+		const current = pendingAppendCommitHooks.get(sessionManager);
+		if (!current) return;
+		const index = current.lastIndexOf(hook);
+		if (index >= 0) current.splice(index, 1);
+		if (current.length === 0) pendingAppendCommitHooks.delete(sessionManager);
+	};
+}
+
 export interface SessionEntryBase {
 	type: string;
 	id: string;
@@ -1458,7 +1485,32 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
-		this._persistEntry(entry);
+		this._persistEntry(entry, this._takeAppendCommitHook(entry));
+	}
+
+	private _bindAppendCommitHook(message: Message | CustomMessage | BashExecutionMessage, entryId: string): void {
+		const stack = pendingAppendCommitHooks.get(this);
+		if (!stack) return;
+		for (let index = stack.length - 1; index >= 0; index -= 1) {
+			const hook = stack[index]!;
+			if (hook.message === message && hook.boundEntryId === undefined) {
+				hook.boundEntryId = entryId;
+				return;
+			}
+		}
+	}
+
+	private _takeAppendCommitHook(entry: SessionEntry): SessionAppendCommitHook | undefined {
+		const stack = pendingAppendCommitHooks.get(this);
+		if (!stack) return undefined;
+		for (let index = stack.length - 1; index >= 0; index -= 1) {
+			const hook = stack[index]!;
+			if (hook.boundEntryId === entry.id && !hook.invoked) {
+				hook.invoked = true;
+				return hook.onCommitted;
+			}
+		}
+		return undefined;
 	}
 
 	private _persistEntry(entry: SessionEntry, onCommitted?: SessionAppendCommitHook): void {
@@ -1495,22 +1547,15 @@ export class SessionManager {
 		}
 	}
 
-	private _appendEntry(entry: SessionEntry, onCommitted?: SessionAppendCommitHook): void {
+	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		if (onCommitted) {
-			this._persistEntry(entry, onCommitted);
-		} else {
-			this._persist(entry);
-		}
+		this._persist(entry);
 	}
 
 	/** Module-internal: public appendMessage stays single-argument. */
-	private _appendMessage(
-		message: Message | CustomMessage | BashExecutionMessage,
-		onCommitted?: SessionAppendCommitHook,
-	): string {
+	private _appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1518,7 +1563,8 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
-		this._appendEntry(entry, onCommitted);
+		this._bindAppendCommitHook(message, entry.id);
+		this._appendEntry(entry);
 		return entry.id;
 	}
 
@@ -2365,12 +2411,10 @@ export function appendSessionMessageWithCommitHook(
 	message: Message | CustomMessage | BashExecutionMessage,
 	onCommitted: (entryId: string) => void,
 ): string {
-	return (
-		sessionManager as unknown as {
-			_appendMessage(
-				message: Message | CustomMessage | BashExecutionMessage,
-				onCommitted?: SessionAppendCommitHook,
-			): string;
-		}
-	)._appendMessage(message, onCommitted);
+	const restore = installPendingAppendCommitHook(sessionManager, message, onCommitted);
+	try {
+		return sessionManager.appendMessage(message);
+	} finally {
+		restore();
+	}
 }

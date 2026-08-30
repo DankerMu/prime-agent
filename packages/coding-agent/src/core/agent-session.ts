@@ -1268,6 +1268,8 @@ export class AgentSession {
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionShutdownHandler?: ShutdownHandler;
+	private _assistantFinalizationShutdownFence = 0;
+	private _pendingAssistantFinalizationShutdown = false;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
@@ -3775,144 +3777,191 @@ export class AgentSession {
 			this._overflowRecovery = "idle";
 		}
 
-		// Emit to extensions first
-		await this._emitExtensionEvent(event);
-		if (event.type === "message_start" || event.type === "message_end") {
-			const cleared = this._capturingCancelledAction(event.message);
-			if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
-				const captured = cleared.payload.captureRunMessages;
-				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
-				return;
+		const fenceAssistantFinalization =
+			event.type === "message_end" && event.message.role === "assistant" && !clearedDispatchEnded;
+		if (fenceAssistantFinalization) this._beginAssistantFinalizationShutdownFence();
+		let emittedPublicEvent = false;
+		try {
+			// Emit to extensions first
+			await this._emitExtensionEvent(event);
+			if (event.type === "message_start" || event.type === "message_end") {
+				const cleared = this._capturingCancelledAction(event.message);
+				if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
+					const captured = cleared.payload.captureRunMessages;
+					this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
+					return;
+				}
 			}
-		}
 
-		this._addLoginGuidanceToAuthError(event);
+			this._addLoginGuidanceToAuthError(event);
+			if (!fenceAssistantFinalization && !emittedPublicEvent) {
+				emittedPublicEvent = true;
+				this._emit(event);
+			}
 
-		// Notify all listeners
-		this._emit(event);
+			// Handle session persistence
+			if (event.type === "message_end") {
+				// Check if this is a custom message from extensions
+				if (event.message.role === "custom") {
+					// Persist as CustomMessageEntry
+					this.sessionManager.appendCustomMessageEntry(
+						event.message.customType,
+						event.message.content,
+						event.message.display,
+						event.message.details,
+					);
+				} else if (
+					event.message.role === "user" ||
+					event.message.role === "assistant" ||
+					event.message.role === "toolResult"
+				) {
+					// Regular LLM message - persist as SessionMessageEntry.
+					// Assistant ids must be attributed after a successful write and before persist listeners.
+					if (event.message.role === "assistant") {
+						appendSessionMessageWithCommitHook(this.sessionManager, event.message, (entryId) => {
+							this._recordAssistantFinalMessage(entryId);
+							if (!emittedPublicEvent) {
+								emittedPublicEvent = true;
+								this._emit(event);
+							}
+						});
+					} else {
+						this.sessionManager.appendMessage(event.message);
+					}
+				}
+				// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-		// Handle session persistence
-		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry.
-				// Assistant ids must be attributed after a successful write and
-				// before synchronous persist listeners can dispose/abort the owner.
+				// Track assistant message for auto-compaction (checked on agent_end)
 				if (event.message.role === "assistant") {
-					appendSessionMessageWithCommitHook(this.sessionManager, event.message, (entryId) => {
-						this._recordAssistantFinalMessage(entryId);
-					});
-				} else {
-					this.sessionManager.appendMessage(event.message);
-				}
-			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+					this._lastAssistantMessage = event.message;
 
-			// Track assistant message for auto-compaction (checked on agent_end)
-			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
+					const assistantMsg = event.message as AssistantMessage;
+					if (assistantMsg.stopReason !== "error") {
+						addAutonomousUsage(this._autonomousState, assistantMsg.usage);
+					}
+					if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+						this._assistantTurnsSinceAutoRefine++;
+						// In serialized mode, kick off background refinement planning
+						// immediately after the primary stream finishes, while tools
+						// are still executing. The plan is awaited at shouldStopAfterTurn
+						// before applying, so planning overlaps tools only — never another
+						// model request.
+						this._maybeStartSerializedBackgroundPlan();
+					}
+					if (assistantMsg.stopReason !== "error") {
+						this._overflowRecovery = "idle";
+					}
+					if (this._isConcreteProviderAuthFailure(assistantMsg)) {
+						this._captureRetryAuthFailureSource(assistantMsg);
+					}
 
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					addAutonomousUsage(this._autonomousState, assistantMsg.usage);
-				}
-				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
-					this._assistantTurnsSinceAutoRefine++;
-					// In serialized mode, kick off background refinement planning
-					// immediately after the primary stream finishes, while tools
-					// are still executing. The plan is awaited at shouldStopAfterTurn
-					// before applying, so planning overlaps tools only — never another
-					// model request.
-					this._maybeStartSerializedBackgroundPlan();
-				}
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecovery = "idle";
-				}
-				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
-					this._captureRetryAuthFailureSource(assistantMsg);
-				}
-
-				// Reset retry counter immediately on successful assistant response
-				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this._retryAttempt,
-					});
-					this._retryAttempt = 0;
-					this._retryAuthFailureSources = [];
-				}
-				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
-					const message = createGoalContextMessage(this._goalState, "budget_limit");
-					const normalized = normalizeMessageContent(message.content);
-					await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
-						message,
-						resumeIfIdle: true,
-					});
-				}
-			}
-		}
-
-		if (clearedDispatchEnded) {
-			return;
-		}
-
-		// Check auto-retry and auto-compaction after agent completes
-		if (event.type === "agent_end") {
-			const msg =
-				this._lastAssistantMessage ??
-				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
-			this._lastAssistantMessage = undefined;
-			if (!msg) {
-				this._resolveRetry();
-				return;
-			}
-
-			// Check for retryable errors first (overloaded, rate limit, server errors)
-			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
-			const retryConcreteAuthFailure =
-				concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
-			if (this._isRetryableError(msg) || retryConcreteAuthFailure) {
-				if (retryConcreteAuthFailure) {
-					this._captureRetryAuthFailureSource(msg);
-				}
-				const didRetry = await this._handleRetryableError(msg, {
-					markAuthStaleOnFailure: retryConcreteAuthFailure,
-					authSourceTokens: retryConcreteAuthFailure ? this._retryAuthFailureSources : undefined,
-				});
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
-			}
-
-			const compactionWillRetry = await this._checkCompaction(msg);
-			if (compactionWillRetry && this._retryAttempt > 0) {
-				return;
-			}
-			this._finishActiveRetryWithFailure(msg);
-			this._resolveRetry();
-			if (!compactionWillRetry) {
-				this._finishGoalForTerminalAssistantMessage(msg);
-				// In serialized mode, agent-callable refine.run is serviced
-				// at the shouldStopAfterTurn boundary, not here at agent_end.
-				if (!this._serializedRefine) {
-					const consumedRequestedRefine = this._consumePendingRequestedRefine();
-					if (!consumedRequestedRefine) {
-						this._scheduleAutoRefineAfterAgentEnd();
+					// Reset retry counter immediately on successful assistant response
+					// This prevents accumulation across multiple LLM calls within a turn
+					if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+						this._emit({
+							type: "auto_retry_end",
+							success: true,
+							attempt: this._retryAttempt,
+						});
+						this._retryAttempt = 0;
+						this._retryAuthFailureSources = [];
+					}
+					if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
+						const message = createGoalContextMessage(this._goalState, "budget_limit");
+						const normalized = normalizeMessageContent(message.content);
+						await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
+							message,
+							resumeIfIdle: true,
+						});
 					}
 				}
 			}
+
+			if (clearedDispatchEnded) {
+				return;
+			}
+
+			// Check auto-retry and auto-compaction after agent completes
+			if (event.type === "agent_end") {
+				const msg =
+					this._lastAssistantMessage ??
+					(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
+				this._lastAssistantMessage = undefined;
+				if (!msg) {
+					this._resolveRetry();
+					return;
+				}
+
+				// Check for retryable errors first (overloaded, rate limit, server errors)
+				const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
+				const retryConcreteAuthFailure =
+					concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
+				if (this._isRetryableError(msg) || retryConcreteAuthFailure) {
+					if (retryConcreteAuthFailure) {
+						this._captureRetryAuthFailureSource(msg);
+					}
+					const didRetry = await this._handleRetryableError(msg, {
+						markAuthStaleOnFailure: retryConcreteAuthFailure,
+						authSourceTokens: retryConcreteAuthFailure ? this._retryAuthFailureSources : undefined,
+					});
+					if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				}
+
+				const compactionWillRetry = await this._checkCompaction(msg);
+				if (compactionWillRetry && this._retryAttempt > 0) {
+					return;
+				}
+				this._finishActiveRetryWithFailure(msg);
+				this._resolveRetry();
+				if (!compactionWillRetry) {
+					this._finishGoalForTerminalAssistantMessage(msg);
+					// In serialized mode, agent-callable refine.run is serviced
+					// at the shouldStopAfterTurn boundary, not here at agent_end.
+					if (!this._serializedRefine) {
+						const consumedRequestedRefine = this._consumePendingRequestedRefine();
+						if (!consumedRequestedRefine) {
+							this._scheduleAutoRefineAfterAgentEnd();
+						}
+					}
+				}
+			}
+		} catch (error) {
+			if (fenceAssistantFinalization && !emittedPublicEvent) {
+				emittedPublicEvent = true;
+				this._emit(event);
+			}
+			throw error;
+		} finally {
+			if (fenceAssistantFinalization) this._endAssistantFinalizationShutdownFence();
+		}
+	}
+
+	private _beginAssistantFinalizationShutdownFence(): void {
+		this._assistantFinalizationShutdownFence += 1;
+	}
+
+	private _requestExtensionShutdown(): void {
+		if (this._assistantFinalizationShutdownFence > 0) {
+			this._pendingAssistantFinalizationShutdown = true;
+			return;
+		}
+		this._extensionShutdownHandler?.();
+	}
+
+	private _endAssistantFinalizationShutdownFence(): void {
+		if (this._assistantFinalizationShutdownFence > 0) {
+			this._assistantFinalizationShutdownFence -= 1;
+		}
+		if (this._assistantFinalizationShutdownFence > 0 || !this._pendingAssistantFinalizationShutdown) {
+			return;
+		}
+		this._pendingAssistantFinalizationShutdown = false;
+		try {
+			this._extensionShutdownHandler?.();
+		} catch {
+			// Deferred host shutdown is an observer. It must not replace a persistence
+			// or wrapper error, and a successful assistant finalization must not fail
+			// merely because the host callback threw.
 		}
 	}
 
@@ -10389,7 +10438,7 @@ export class AgentSession {
 				abort: () => this.abort(),
 				hasPendingMessages: () => this.queuedActionCount > 0,
 				shutdown: () => {
-					this._extensionShutdownHandler?.();
+					this._requestExtensionShutdown();
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
