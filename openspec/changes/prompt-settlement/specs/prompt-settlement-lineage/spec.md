@@ -261,7 +261,32 @@ prompt 的结算 MUST 等待：accepted turn从 admission/enqueue起持有的 ru
 #### Scenario: finalMessageIds 只含 lineage 内 assistant 消息
 
 - WHEN 一个 prompt 的 lineage 经历 run → retry → compaction continuation 共追加 3 条 assistant message entry
-- THEN `finalMessageIds` 恰为这 3 个 entry id 且按追加顺序
+- THEN `finalMessageIds` 恰为这 3 个真实session entry id且按append顺序；user/tool/custom、run外background refine与未持久化的cancelled-dispatch消息不得出现
+
+#### Scenario: shared run 的单一 assistant entry 归全部独立 owner
+
+- WHEN `"all"` batching的A/B共享一次Agent run并持久化一个assistant entry M
+- THEN session只append一次M，A/B保持独立prompt identity与outcome，但两者的`finalMessageIds`都exact包含同一个`M.id`且不重复
+
+#### Scenario: 重排的 continuation 使用捕获 owner 而非相邻 run
+
+- WHEN A的direct post-compaction continuation被重排到独立prompt B的ordinary run之后执行，或在matching retry中完成
+- THEN B的assistant entry只记录给B；direct runner在调用continue或等待matching retry前安装schedule-time captured operation owners，使continuation entry只记录给A的exact owner tuple；任一normal、throw、rearm、park/replacement返回都恢复prior owner scope，不得把A entry串给B或清掉后来合法run的scope
+
+#### Scenario: assistant entry 在同步 persist reentry 前归属
+
+- WHEN persisted session为A append assistant entry M，且同步`onPersist` listener在public append返回前调用session dispose或其他会terminal A的reentrant路径
+- THEN M先以真实id安装到session tree并成功完成原file write，module-internal attribution callback再把`M.id`加入A的`finalMessageIds`，之后listener才可触发terminal seal；最终cancelled+released outcome必须含`M.id`，session append、persist notification与outcome各一次
+
+#### Scenario: internal append bridge 保持 public 与 failure 兼容
+
+- WHEN public caller直接调用`SessionManager.appendMessage(message)`，或internal bridge分别遇到file write throw、attribution callback throw、persist listener throw
+- THEN root-exported public method的runtime/type签名仍为单参数并返回原entry id，normal no-hook path的tree/file entry count和listener顺序不变；file write throw沿用原错误且不调用callback/listener，callback throw被隔离且不rollback/duplicate已写entry，listener throw仍沿既有隔离语义；internal bridge不得从package root导出
+
+#### Scenario: terminal 与 excluded late message 不改变 finalMessageIds
+
+- WHEN A已以completed、failed或cancelled终态固定其已实际append的assistant entry ids，随后auto-refine、cron/heartbeat、detached work或其他run外路径产生消息
+- THEN A的cached outcome对象、`finalMessageIds`和唯一`prompt_outcome`事件均不变；不得补扫transcript或重开terminal record
 
 ### Requirement: traceGeneration 计数
 

@@ -105,11 +105,38 @@ Risk packs:
 
 ## 7. finalMessageIds 记录
 
-- [ ] 7.1 消费组2已建立的 `_currentRunOwners: string[]` owner snapshot：普通 dispatch 延续本次所有 turn action 的去重 promptIds、dispatch completion settle 时清空（retry 续跑期间不清空）；`_runScheduledPostCompactionContinue` 调用 `agent.continue()` 前设为调度时捕获的 continuation owners、返回/抛出后清空；主 agent `message_end` 写入 assistant entry 处对每个 current owner `recordFinalMessage(owner, entryId)`；run 之外 owners 为空，不记录
-- [ ] 7.2 行为测试：run → retry → compaction continuation 三条 assistant entry 按序出现在对应 `finalMessageIds`；`"all"` 共享 run 的 entry 同时归每个 owner；A 的 continuation 在 B 后执行时，B 消息只归 B、continuation 消息只归 A 的捕获 owners；后台 refine 消息不出现
+- [x] 7.1 消费组2已建立的 `_currentRunOwners: string[]` owner snapshot：ordinary dispatch在本次所有turn actions的去重promptIds上保持scope，等待retry chain与agent event queue后才于dispatch completion清空；`_runDirectContinuation`与matching-retry direct path在调用`agent.continue()`或等待已运行retry前save/install captured operation owners，并在任一return/throw/rearm后于`finally`恢复prior scope；主agent `message_end`使用不从root export的SessionManager internal bridge保持public `appendMessage(message): string`签名，将真实entry id在memory install且persisted path成功file write后、任一同步persist listener前交给observer-isolated callback，对当时去重owners逐个`recordFinalMessage(owner, entryId)`，session仍只append一次。run外/非assistant/cancelled-dispatch消息不记录，不扫描transcript补记，不新增ledger write
+- [x] 7.2 行为测试使用actual `SessionMessageEntry.id`：single run只含其assistant id；run → retry → successful threshold compaction → direct continuation的三条assistant entries按append顺序exact出现在同owner `finalMessageIds`；`"all"`共享run只append一个entry且A/B outcome均含同一id；A continuation在B后执行时B entry只归B、continuation entry只归captured A（含matching-retry path）；background auto-refine/run外append及terminal后late mutation不出现、不重开outcome；failed/cancelled只保留已成功append的partial trace；persisted assistant append同步触发`onPersist`并在listener中dispose时，cancelled+released outcome仍含该entry id且append/notify/event exact-once；SessionManager public no-hook path、file-write throw、callback throw与listener throw锁定原签名、return id、tree/file count、通知顺序和failure shape
 
-Suggested fixture level: compact - 含 continuation 重排下的归属竞态场景
-Minimal mergeable slice: atomic - 单挂点 + 断言，依赖组 4，独立合并保绿
+Suggested fixture level: compact（overridden）- `PromptOutcome.finalMessageIds`由空数组变为公开真实ids，并跨ordinary/retry/timer-owned direct continuation切换shared owner scope，命中public contract与shared-state ordering mandatory expanded triggers
+Fixture level: expanded
+Repair intensity: high - stale/nested owner scope会把不可重开的entry identity串到另一prompt或永久漏记最终trace
+Minimal mergeable slice: atomic - 单assistant append挂点 + 两条direct continuation scope + focused assertions，依赖组4，独立合并保绿
+
+Required evidence:
+- actual session entries + single owner -> outcome ids exact assistant-only append order，user/tool/custom均排除
+- run/retry/compaction/direct continuation -> exact three real ids，terminal发生在最后entry记录后，traceGeneration契约不变
+- `"all"` A/B -> one persisted shared assistant entry，two independent outcomes each exact same id
+- delayed A continuation + ordinary B / matching retry / rearm-throw controls -> captured owner attribution exact且scope restored，无cross-owner/duplicate/phantom id
+- persisted assistant append + synchronous onPersist dispose/reentry -> successful write + attribution precede terminal seal，one append/notify/outcome，no missing/duplicate id
+- SessionManager no-hook / file-write throw / callback throw / listener throw -> public signature与return/tree/file counts/order不变；write throw callback/listener=0，observer throws不duplicate/rollback entry
+- background auto-refine、cancelled-dispatch与terminal late message -> zero excluded ids，cached outcome/event unchanged
+- focused settlement/tracker/compaction/retry/action-race/serialized-refine tests、root check、workspace build、strict OpenSpec均exit 0
+
+Risk packs:
+- Public API / CLI / script entry: selected - public outcome field now carries real ids；no signature/CLI change
+- Config / project setup: not selected - no config/default change
+- File IO / path safety / overwrite: not selected - consume existing append return only；no new path/write/overwrite
+- Schema / columns / units / field names: selected - id source、assistant-only/order semantics locked；shape unchanged
+- Auth / permissions / secrets: not selected - no auth boundary
+- Concurrency / shared state / ordering: selected - event queue、ordinary/retry/direct scopes and nested restoration
+- Resource limits / large input / discovery: not selected - bounded dedup owner list per assistant entry
+- Legacy compatibility / examples: selected - transcript/event/prompt/retry/compaction/queue timing unchanged
+- Error handling / rollback / partial outputs: selected - throw/rearm/replacement/cancelled-dispatch/terminal no-op、partial trace与append-time persist-listener reentry
+- Release / packaging / dependency compatibility: not selected - no exports/dependencies
+- Documentation / migration notes: not selected - group17 owns final docs
+- TUI focus/render lifecycle: not selected - no TUI consumption/change
+- Session/extension teardown lifecycle: not selected - group6 owns teardown；only unchanged terminal behavior is regressed
 
 ## 8. ledger 写入
 

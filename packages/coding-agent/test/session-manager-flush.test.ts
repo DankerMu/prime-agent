@@ -46,7 +46,8 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-import { SessionManager } from "../src/core/session-manager.js";
+import { appendSessionMessageWithCommitHook, SessionManager } from "../src/core/session-manager.js";
+import { assistantMsg, userMsg } from "./utilities.js";
 
 const tempDirs: string[] = [];
 
@@ -435,5 +436,169 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 
 		mgr.flushNow();
 		expect(readFileSync(file)).toEqual(before);
+	});
+});
+
+function persistedFileEntries(file: string): unknown[] {
+	return readFileSync(file, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line) as unknown);
+}
+
+describe("SessionManager append commit hook", () => {
+	it("keeps public no-hook appendMessage return id, tree/file counts, and listener order", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		const userId = mgr.appendMessage(userMsg("hello"));
+		const order: string[] = [];
+		const unsubscribe = mgr.onPersist(() => {
+			order.push("listener");
+		});
+
+		expect(mgr.appendMessage.length).toBe(1);
+		expect((mgr as unknown as { _persist(entry: unknown): void })._persist.length).toBe(1);
+		const assistantId = mgr.appendMessage(assistantMsg("world"));
+		expect(assistantId).toEqual(expect.any(String));
+		expect(assistantId).not.toBe(userId);
+		expect(mgr.getEntries().map((entry) => entry.id)).toEqual([userId, assistantId]);
+		expect(mgr.getEntry(assistantId)?.type).toBe("message");
+		const fileEntries = persistedFileEntries(mgr.getSessionFile()!);
+		expect(fileEntries).toHaveLength(3);
+		expect(fileEntries.at(-1)).toMatchObject({ id: assistantId, type: "message" });
+		expect(order).toEqual(["listener"]);
+		unsubscribe();
+	});
+
+	it("runs the internal callback after a successful file write and before persist listeners", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const file = mgr.getSessionFile()!;
+		const order: string[] = [];
+		const unsubscribe = mgr.onPersist(() => {
+			order.push("listener");
+		});
+
+		const id = appendSessionMessageWithCommitHook(mgr, assistantMsg("hooked"), (entryId) => {
+			expect(entryId).toBe(mgr.getLeafId());
+			expect(mgr.getEntry(entryId)?.type).toBe("message");
+			expect(existsSync(file)).toBe(true);
+			expect(persistedFileEntries(file).at(-1)).toMatchObject({ id: entryId, type: "message" });
+			expect(order).toEqual([]);
+			order.push("callback");
+		});
+
+		expect(id).toBe(mgr.getLeafId());
+		expect(mgr.getEntries()).toHaveLength(2);
+		expect(persistedFileEntries(file)).toHaveLength(3);
+		expect(order).toEqual(["callback", "listener"]);
+		unsubscribe();
+	});
+
+	it("does not call the callback or persist listeners when file write/rename throws", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const file = mgr.getSessionFile()!;
+		expect(existsSync(file)).toBe(false);
+		const memoryBefore = mgr.getEntries().length;
+		const fileBefore = existsSync(file) ? readFileSync(file) : undefined;
+		const callback = vi.fn();
+		const listener = vi.fn();
+		const unsubscribe = mgr.onPersist(listener);
+		fsMocks.writeFileSync.mockImplementationOnce(() => {
+			throw new Error("disk full");
+		});
+
+		expect(() => appendSessionMessageWithCommitHook(mgr, assistantMsg("lost"), callback)).toThrow("disk full");
+		expect(callback).not.toHaveBeenCalled();
+		expect(listener).not.toHaveBeenCalled();
+		expect(mgr.getEntries()).toHaveLength(memoryBefore + 1);
+		expect(mgr.getLeafId()).toBe(mgr.getEntries().at(-1)?.id);
+		if (fileBefore === undefined) {
+			expect(existsSync(file)).toBe(false);
+		} else {
+			expect(readFileSync(file)).toEqual(fileBefore);
+		}
+		unsubscribe();
+
+		const renameDir = createTempDir();
+		const renameMgr = SessionManager.create(renameDir, join(renameDir, "sessions"));
+		renameMgr.appendMessage(userMsg("hello"));
+		const renameCallback = vi.fn();
+		const renameListener = vi.fn();
+		const unsubscribeRename = renameMgr.onPersist(renameListener);
+		const renameMemoryBefore = renameMgr.getEntries().length;
+		fsMocks.renameSync.mockImplementationOnce(() => {
+			throw new Error("rename failed");
+		});
+		expect(() => appendSessionMessageWithCommitHook(renameMgr, assistantMsg("lost-rename"), renameCallback)).toThrow(
+			"rename failed",
+		);
+		expect(renameCallback).not.toHaveBeenCalled();
+		expect(renameListener).not.toHaveBeenCalled();
+		expect(renameMgr.getEntries()).toHaveLength(renameMemoryBefore + 1);
+		unsubscribeRename();
+	});
+
+	it("isolates a throwing callback and still writes once, notifies once, and returns a stable id", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const file = mgr.getSessionFile()!;
+		const listener = vi.fn();
+		const unsubscribe = mgr.onPersist(listener);
+		const callback = vi.fn(() => {
+			throw new Error("observer exploded");
+		});
+
+		const id = appendSessionMessageWithCommitHook(mgr, assistantMsg("kept"), callback);
+		expect(id).toBe(mgr.getLeafId());
+		expect(callback).toHaveBeenCalledTimes(1);
+		expect(callback).toHaveBeenCalledWith(id);
+		expect(listener).toHaveBeenCalledTimes(1);
+		expect(mgr.getEntries().filter((entry) => entry.type === "message")).toHaveLength(2);
+		expect(
+			persistedFileEntries(file).filter((entry) => (entry as { type?: string }).type === "message"),
+		).toHaveLength(2);
+		unsubscribe();
+	});
+
+	it("isolates a throwing persist listener after the callback runs once", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendMessage(userMsg("hello"));
+		const file = mgr.getSessionFile()!;
+		const callback = vi.fn();
+		const unsubscribe = mgr.onPersist(() => {
+			throw new Error("listener exploded");
+		});
+
+		const id = appendSessionMessageWithCommitHook(mgr, assistantMsg("notified"), callback);
+		expect(id).toBe(mgr.getLeafId());
+		expect(callback).toHaveBeenCalledTimes(1);
+		expect(callback).toHaveBeenCalledWith(id);
+		expect(mgr.getEntries()).toHaveLength(2);
+		expect(persistedFileEntries(file)).toHaveLength(3);
+		unsubscribe();
+	});
+
+	it("runs the in-memory commit hook immediately after installing the entry", () => {
+		const mgr = SessionManager.inMemory();
+		const userId = mgr.appendMessage(userMsg("hello"));
+		const order: string[] = [];
+		const unsubscribe = mgr.onPersist(() => {
+			order.push("listener");
+		});
+		const id = appendSessionMessageWithCommitHook(mgr, assistantMsg("memory"), (entryId) => {
+			expect(mgr.getEntry(entryId)?.id).toBe(entryId);
+			expect(mgr.getEntries().map((entry) => entry.id)).toEqual([userId, entryId]);
+			order.push("callback");
+		});
+		expect(id).toBe(mgr.getLeafId());
+		expect(order).toEqual(["callback"]);
+		expect(mgr.getSessionFile()).toBeUndefined();
+		unsubscribe();
 	});
 });

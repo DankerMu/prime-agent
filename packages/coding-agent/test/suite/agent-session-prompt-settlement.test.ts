@@ -1,5 +1,5 @@
 /**
- * OpenSpec prompt-settlement, groups 2-6, shared session-level suite.
+ * OpenSpec prompt-settlement, groups 2-7, shared session-level suite.
  *
  * Group 2 (issue #27): action promptId + main run lease + promptAndSettle
  * API. These tests use the retry-disabled faux provider so each error is
@@ -22,10 +22,14 @@
  * release counts, bookkeeping, records/outcomes, and order — not
  * final-state-only.
  *
+ * Group 7 (issue #32): `finalMessageIds` attribution. Tests map actual
+ * `SessionMessageEntry.id` values from `sessionManager.getEntries()` onto
+ * each cached `PromptOutcome`; they never invent ids, guess by text/index,
+ * or spy a fake append return.
+ *
  * Seam 2: in-process AgentSession + faux provider. Tests observe behavior
  * through the public callback / query / event APIs and read-only action-store
- * inspection. The tracker's private persist count is never observed;
- * `finalMessageIds` stays empty (group 7 records them).
+ * inspection. The tracker's private persist count is never observed.
  */
 
 import { existsSync, writeFileSync } from "node:fs";
@@ -43,7 +47,9 @@ import type {
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { createHeartbeatPromptMessage, createRlmChildFailureMessage } from "../../src/core/messages.js";
 import type { PromptLease, PromptLeaseKind, PromptSettlementRecord } from "../../src/core/prompt-settlement.js";
+import { REFINEMENT_CUSTOM_TYPE } from "../../src/core/refinement/index.js";
 import type { SessionAction } from "../../src/core/session-action-store.js";
+import type { CustomEntry, SessionEntry, SessionMessageEntry } from "../../src/core/session-manager.js";
 import type { ExtensionFactory } from "../../src/index.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
@@ -264,6 +270,15 @@ interface ContinuationInternals {
 	_schedulePostCompactionContinue(): void;
 	_scheduleContinuationForObligation(owners: string[], obligationMessages: AgentMessage[]): boolean;
 	_cancelPostCompactionContinue(options?: { owners?: "release" | "cancel" | "fail" }): boolean;
+	_parkContinuationSettlementForManualCompact():
+		| {
+				window: ContinuationInternals["_continuationSettlementWindow"];
+				revision: number;
+				token: symbol;
+		  }
+		| undefined;
+	_continuationSettlementAbortToken: symbol | undefined;
+	_requestAbort(continuationSettlementToken?: symbol): void;
 	_resumeContinuationSettlementAfterManualCompact(): void;
 	_runScheduledPostCompactionContinue(): Promise<void>;
 	_runDirectContinuation(
@@ -281,9 +296,12 @@ interface ContinuationInternals {
 	_retryAttempt: number;
 	_promptSettlementTracker: {
 		acquire(promptId: string, kind: PromptLeaseKind): PromptLease;
+		requestCancel(promptId: string): void;
 		recordFailure(promptId: string, reason: string): void;
+		recordFinalMessage(promptId: string, entryId: string): void;
 		bumpTraceGeneration(promptId: string): void;
 		isSettling(promptId: string): boolean;
+		snapshot(): PromptSettlementRecord[];
 	};
 }
 
@@ -486,6 +504,7 @@ interface Group6Internals {
 		acquire(promptId: string, kind: PromptLeaseKind): PromptLease;
 		requestCancel(promptId: string): void;
 		recordFailure(promptId: string, reason: string): void;
+		recordFinalMessage(promptId: string, entryId: string): void;
 		release(promptId: string): void;
 		settleAll(status: "cancelled" | "failed", reason: string, options?: { released?: boolean }): void;
 		snapshot(): PromptSettlementRecord[];
@@ -831,6 +850,58 @@ function retryableError(): AssistantMessage {
 	return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
 }
 
+function isSessionMessageEntry(entry: SessionEntry): entry is SessionMessageEntry {
+	return entry.type === "message";
+}
+
+/** Actual persisted LLM message entries, in SessionManager append order. */
+function sessionMessageEntries(harness: Harness): SessionMessageEntry[] {
+	return harness.sessionManager.getEntries().filter(isSessionMessageEntry);
+}
+
+function assistantSessionEntries(harness: Harness): SessionMessageEntry[] {
+	return sessionMessageEntries(harness).filter((entry) => entry.message.role === "assistant");
+}
+
+function assistantSessionEntryIds(harness: Harness): string[] {
+	return assistantSessionEntries(harness).map((entry) => entry.id);
+}
+
+function appendedAssistantEntries(harness: Harness, beforeIds: ReadonlySet<string>): SessionMessageEntry[] {
+	return assistantSessionEntries(harness).filter((entry) => !beforeIds.has(entry.id));
+}
+
+function userSessionEntryIds(harness: Harness): string[] {
+	return sessionMessageEntries(harness)
+		.filter((entry) => entry.message.role === "user")
+		.map((entry) => entry.id);
+}
+
+function toolResultSessionEntryIds(harness: Harness): string[] {
+	return sessionMessageEntries(harness)
+		.filter((entry) => entry.message.role === "toolResult")
+		.map((entry) => entry.id);
+}
+
+function customSessionEntryIds(harness: Harness): string[] {
+	return harness.sessionManager
+		.getEntries()
+		.filter((entry) => entry.type === "custom" || entry.type === "custom_message")
+		.map((entry) => entry.id);
+}
+
+function customEntriesOfType(harness: Harness, customType: string): CustomEntry[] {
+	return harness.sessionManager
+		.getEntries()
+		.filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === customType);
+}
+
+function bashSessionEntryIds(harness: Harness): string[] {
+	return sessionMessageEntries(harness)
+		.filter((entry) => entry.message.role === "bashExecution")
+		.map((entry) => entry.id);
+}
+
 function createHeartbeatJob() {
 	return {
 		id: "hb-1",
@@ -864,6 +935,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 		let unsubscribe = () => {};
 		const harness = await createHarness();
 		harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
 		harness.setResponses([fauxAssistantMessage("done")]);
 		unsubscribe = harness.session.agent.subscribe(async (event) => {
 			if (event.type !== "agent_start") return;
@@ -889,11 +961,13 @@ describe("AgentSession prompt settlement (group 2)", () => {
 
 		releaseStart?.();
 		const outcome = await settled;
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
 		expect(outcome).toEqual({
 			promptId,
 			status: "completed",
 			advisor: "disabled",
-			finalMessageIds: [],
+			finalMessageIds: [appended[0]!.id],
 			sessionEpoch: expect.any(Number),
 			traceGeneration: 0,
 		});
@@ -910,13 +984,16 @@ describe("AgentSession prompt settlement (group 2)", () => {
 	it("records run_error and settles failed on a terminal provider error", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: false } } });
 		harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
 		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider failed" })]);
 
 		const outcome = await harness.session.promptAndSettle("boom");
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
 		expect(outcome).toMatchObject({
 			status: "failed",
 			advisor: "disabled",
-			finalMessageIds: [],
+			finalMessageIds: [appended[0]!.id],
 			failure: { reason: "run_error" },
 		});
 		const events = harness.eventsOfType("prompt_outcome");
@@ -1069,6 +1146,7 @@ describe("AgentSession prompt settlement (group 2)", () => {
 		let unsubscribe = () => {};
 		const harness = await createHarness();
 		harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
 		harness.session.setFollowUpMode("all");
 		harness.setResponses([fauxAssistantMessage("shared run done")]);
 		unsubscribe = harness.session.agent.subscribe(async (event) => {
@@ -1102,8 +1180,13 @@ describe("AgentSession prompt settlement (group 2)", () => {
 		releaseStart?.();
 		await harness.session.waitForIdle();
 		expect(outcomeCount(harness)).toBe(2);
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
 		for (const id of ids) {
-			expect(harness.session.getPromptOutcome(id)).toMatchObject({ status: "completed", finalMessageIds: [] });
+			expect(harness.session.getPromptOutcome(id)).toMatchObject({
+				status: "completed",
+				finalMessageIds: [appended[0]!.id],
+			});
 		}
 		expect(internals._lastRunPromptIds).toEqual([]);
 		expect(internals._currentRunOwners).toEqual([]);
@@ -1129,7 +1212,12 @@ describe("AgentSession prompt settlement (group 2)", () => {
 		await promptPromise;
 		await harness.session.waitForIdle();
 		expect(outcomeCount(harness)).toBe(1);
-		expect(harness.session.getPromptOutcome(promptId)).toMatchObject({ status: "completed", finalMessageIds: [] });
+		const ids = assistantSessionEntryIds(harness);
+		expect(ids).toHaveLength(2);
+		expect(harness.session.getPromptOutcome(promptId)).toMatchObject({
+			status: "completed",
+			finalMessageIds: ids,
+		});
 	});
 
 	it("gives steer and followUp inputs fresh distinct identities that never merge into the running prompt", async () => {
@@ -9746,5 +9834,689 @@ describe("abort and dispose ownership (group 6)", () => {
 
 		emitSpy.mockRestore();
 		observer.restore();
+	});
+});
+
+describe("finalMessageIds attribution (group 7)", () => {
+	const group7Harnesses: Harness[] = [];
+
+	afterEach(() => {
+		vi.useRealTimers();
+		while (group7Harnesses.length > 0) group7Harnesses.pop()?.cleanup();
+	});
+
+	it("records the actual assistant SessionMessageEntry.id once and excludes user/tool/custom/bash entries", async () => {
+		const { harness, waitForToolStart, releaseToolExecution } = await createWaitingHarness();
+		group7Harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("final"),
+		]);
+		await waitForToolStart;
+		const promptId = actionByText(harness, "start").promptIds![0]!;
+		expect(harness.session.getPromptOutcome(promptId)).toBeUndefined();
+		releaseToolExecution();
+		await harness.session.waitForIdle();
+		harness.session.recordBashResult("echo hi", {
+			output: "hi",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+		});
+		await harness.session.sendCustomMessage(
+			{ customType: "group7-custom", content: "custom note", display: true, details: {} },
+			{ triggerTurn: false },
+		);
+		const assistantEntries = appendedAssistantEntries(harness, before);
+		expect(assistantEntries).toHaveLength(2);
+		const assistantIds = assistantEntries.map((entry) => entry.id);
+		const outcome = harness.session.getPromptOutcome(promptId);
+		expect(outcome).toMatchObject({ status: "completed", finalMessageIds: assistantIds });
+		expect(outcome!.finalMessageIds).toEqual(assistantIds);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+		expect(harness.eventsOfType("prompt_outcome")[0]!.outcome).toBe(outcome);
+		expect(harness.session.getPromptOutcome(promptId)).toBe(outcome);
+		const excluded = [
+			...userSessionEntryIds(harness),
+			...toolResultSessionEntryIds(harness),
+			...customSessionEntryIds(harness),
+			...bashSessionEntryIds(harness),
+		];
+		expect(userSessionEntryIds(harness).length).toBeGreaterThan(0);
+		expect(toolResultSessionEntryIds(harness).length).toBeGreaterThan(0);
+		expect(customSessionEntryIds(harness).length).toBeGreaterThan(0);
+		expect(bashSessionEntryIds(harness).length).toBeGreaterThan(0);
+		expect(assistantIds.some((id) => excluded.includes(id))).toBe(false);
+		expect(outcome!.finalMessageIds.some((id) => excluded.includes(id))).toBe(false);
+	});
+
+	it("records one ordinary-run assistant id from the actual session entry", async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("ordinary done")]);
+		const beforeAppends = sessionMessageEntries(harness).length;
+		const outcome = await harness.session.promptAndSettle("ordinary run");
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]!.message.role).toBe("assistant");
+		expect(outcome).toMatchObject({
+			status: "completed",
+			finalMessageIds: [appended[0]!.id],
+		});
+		expect(outcome!.finalMessageIds).toEqual([appended[0]!.id]);
+		expect(userSessionEntryIds(harness).includes(appended[0]!.id)).toBe(false);
+		expect(sessionMessageEntries(harness).length - beforeAppends).toBeGreaterThanOrEqual(2);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+		expect(harness.eventsOfType("prompt_outcome")[0]!.outcome).toBe(outcome);
+	});
+
+	it("keeps run → retry → threshold compaction → direct continuation ids in append order", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			tools: [largeContextThresholdTool()],
+			autonomous: {
+				enabled: true,
+				maxContinuations: 1,
+				maxTurns: 100,
+				gates: { commands: [], maxRetries: 1 },
+			},
+			settings: {
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+				compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 200_001 },
+			},
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+			extensionFactories: [compactSummaryExtension("group-7 retry-compaction summary")],
+		});
+		group7Harnesses.push(harness);
+		seedSessionForCompaction(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([
+			retryableError(),
+			fauxAssistantMessage(fauxToolCall("large-context", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("post-compaction continuation completed"),
+		]);
+		const ownerIds: string[] = [];
+		const settled = harness.session.promptAndSettle("retry then compact then continue", {
+			settlementAdmission: (info) => ownerIds.push(info.promptId!),
+		});
+		await vi.waitFor(() => expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1));
+		await vi.waitFor(() => expect(harness.eventsOfType("compaction_end")).toHaveLength(1));
+		expect(ownerIds).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(100);
+		const outcome = await settled;
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(3);
+		expect(appended.map((entry) => getMessageText(entry.message))).toEqual([
+			"",
+			"",
+			"post-compaction continuation completed",
+		]);
+		const ids = appended.map((entry) => entry.id);
+		expect(ids).not.toContain(
+			assistantSessionEntries(harness).find((entry) => getMessageText(entry.message) === "older response")?.id,
+		);
+		expect(outcome).toMatchObject({
+			promptId: ownerIds[0],
+			status: "completed",
+			finalMessageIds: ids,
+			traceGeneration: 1,
+		});
+		expect(outcome!.finalMessageIds).toEqual(ids);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+		expect(harness.eventsOfType("agent_end").length).toBeGreaterThanOrEqual(3);
+	});
+
+	it('shares one persisted assistant entry across independent "all" A/B outcomes', async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("shared run done")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("batch A", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("batch B", undefined, { resumeIfIdle: true });
+		const ids = [actionByText(harness, "batch A").promptIds![0]!, actionByText(harness, "batch B").promptIds![0]!];
+		expect(new Set(ids).size).toBe(2);
+		pause.release();
+		const [outcomeA, outcomeB] = await Promise.all([
+			harness.session.waitForPromptOutcome(ids[0]!),
+			harness.session.waitForPromptOutcome(ids[1]!),
+		]);
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		const sharedId = appended[0]!.id;
+		expect(outcomeA.promptId).toBe(ids[0]);
+		expect(outcomeB.promptId).toBe(ids[1]);
+		expect(outcomeA.promptId).not.toBe(outcomeB.promptId);
+		expect(outcomeA.finalMessageIds).toEqual([sharedId]);
+		expect(outcomeB.finalMessageIds).toEqual([sharedId]);
+		expect(outcomeA.finalMessageIds).toEqual(outcomeB.finalMessageIds);
+		expect(new Set(outcomeA.finalMessageIds).size).toBe(1);
+		expect(outcomeCount(harness)).toBe(2);
+	});
+
+	it("attributes a delayed A continuation only to captured A after B's ordinary run", async () => {
+		vi.useRealTimers();
+		const bGate = gatedHook({ prompt: "queued B after delayed A" });
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			extensionFactories: [bGate.factory],
+		});
+		group7Harnesses.push(harness);
+		const internals = continuationInternals(harness);
+		const ownerA = "group7-delayed-a";
+		admitOwners(harness, ownerA);
+		const message = continuationMessage("delayed A continuation");
+		internals._postCompactionContinuationMessages = [message];
+		expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+		internals._schedulePostCompactionContinue();
+		harness.session.agent.state.messages = [continuationMessage("continue delayed A")];
+		const retryRecovery = createDeferred();
+		let retryRecoveryStarted = false;
+		harness.setResponses([
+			retryableError(),
+			async () => {
+				retryRecoveryStarted = true;
+				await retryRecovery.promise;
+				return fauxAssistantMessage("A continuation recovered");
+			},
+			fauxAssistantMessage("B ordinary done"),
+		]);
+		await harness.session.followUp("queued B after delayed A", undefined, { resumeIfIdle: true });
+		const ownerB = actionByText(harness, "queued B after delayed A").promptIds![0]!;
+		await vi.waitFor(() => expect(retryRecoveryStarted).toBe(true));
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+		expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+		retryRecovery.resolve();
+		await vi.waitFor(() => expect(harness.session.getPromptOutcome(ownerA)).toBeDefined());
+		await bGate.reached;
+		bGate.release();
+		const outcomeB = await harness.session.waitForPromptOutcome(ownerB);
+		const outcomeA = harness.session.getPromptOutcome(ownerA)!;
+		const assistantEntries = appendedAssistantEntries(harness, new Set());
+		const aRetry = assistantEntries.find((entry) => (entry.message as AssistantMessage).stopReason === "error");
+		const aRecovered = assistantEntries.find((entry) => getMessageText(entry.message) === "A continuation recovered");
+		const bDone = assistantEntries.find((entry) => getMessageText(entry.message) === "B ordinary done");
+		expect(aRetry).toBeDefined();
+		expect(aRecovered).toBeDefined();
+		expect(bDone).toBeDefined();
+		expect(outcomeB.finalMessageIds).toEqual([bDone!.id]);
+		expect(outcomeA.finalMessageIds).toEqual([aRetry!.id, aRecovered!.id]);
+		expect(outcomeA.finalMessageIds).not.toContain(bDone!.id);
+		expect(outcomeB.finalMessageIds).not.toContain(aRecovered!.id);
+		expect(internals._currentRunOwners).toEqual([]);
+	});
+
+	it("installs captured operation owners on the matching-retry path and restores prior scope", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		group7Harnesses.push(harness);
+		const observer = installContinuationObserver(harness);
+		const internals = continuationInternals(harness);
+		const ownerA = "group7-matching-retry-a";
+		const ownerPriorLast = "group7-matching-retry-prior-last";
+		const ownerPriorCurrent = "group7-matching-retry-prior-current";
+		admitOwners(harness, ownerA, ownerPriorLast, ownerPriorCurrent);
+		const priorLastLease = internals._promptSettlementTracker.acquire(ownerPriorLast, "run");
+		const priorCurrentLease = internals._promptSettlementTracker.acquire(ownerPriorCurrent, "run");
+		const message = continuationMessage("matching retry attribution");
+		internals._postCompactionContinuationMessages = [message];
+		expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+		internals._continuationSettlementWindow!.overflowRecoveryOwners = [ownerA];
+		internals._schedulePostCompactionContinue();
+		internals._lastRunPromptIds = [ownerA];
+		const retry = internals as unknown as RetryInternals;
+		expect(retry._createRetryWindow()).toBe(true);
+		internals._lastRunPromptIds = [ownerPriorLast];
+		internals._currentRunOwners = [ownerPriorCurrent];
+		harness.session.agent.state.messages = [continuationMessage("continue matching retry")];
+		const retryRecovery = createDeferred();
+		const retryRecoveryStarted = createDeferred();
+		harness.setResponses([
+			async () => {
+				retryRecoveryStarted.resolve();
+				await retryRecovery.promise;
+				return fauxAssistantMessage("matching retry recovered");
+			},
+		]);
+		const inFlightContinue = harness.session.agent.continue();
+		await vi.advanceTimersByTimeAsync(0);
+		await retryRecoveryStarted.promise;
+		expect(harness.session.agent.state.isStreaming).toBe(true);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		const before = new Set(assistantSessionEntryIds(harness));
+		const scheduledRun = internals._runDirectContinuationUnderMatchingRetry(
+			[message],
+			internals._continuationSettlementWindow,
+		);
+		await Promise.resolve();
+		expect(internals._lastRunPromptIds).toEqual([ownerA]);
+		expect(internals._currentRunOwners).toEqual([ownerA]);
+		expect(continueSpy).not.toHaveBeenCalled();
+		retryRecovery.resolve();
+		await inFlightContinue;
+		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]!.type).toBe("message");
+		expect(appended[0]!.message.role).toBe("assistant");
+		expect(getMessageText(appended[0]!.message)).toBe("matching retry recovered");
+		const recoveredId = appended[0]!.id;
+		await scheduledRun;
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(appendedAssistantEntries(harness, before)).toHaveLength(1);
+		expect(internals._lastRunPromptIds).toEqual([ownerPriorLast]);
+		expect(internals._currentRunOwners).toEqual([ownerPriorCurrent]);
+		expect(observer.continuationLeases[0]!.releaseCalls).toBe(1);
+		expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+			status: "completed",
+			finalMessageIds: [recoveredId],
+		});
+		expect(harness.session.getPromptOutcome(ownerA)!.finalMessageIds).toEqual([recoveredId]);
+		expect(
+			internals._promptSettlementTracker.snapshot().find((record) => record.promptId === ownerPriorLast),
+		).toMatchObject({
+			promptId: ownerPriorLast,
+			status: "settling",
+			finalMessageIds: [],
+		});
+		expect(
+			internals._promptSettlementTracker.snapshot().find((record) => record.promptId === ownerPriorCurrent),
+		).toMatchObject({
+			promptId: ownerPriorCurrent,
+			status: "settling",
+			finalMessageIds: [],
+		});
+		expect(harness.session.getPromptOutcome(ownerPriorLast)).toBeUndefined();
+		expect(harness.session.getPromptOutcome(ownerPriorCurrent)).toBeUndefined();
+		priorLastLease.release();
+		priorCurrentLease.release();
+		continueSpy.mockRestore();
+		observer.restore();
+	});
+
+	it("restores prior owner scope after a direct continuation throw/rearm", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const internals = continuationInternals(harness);
+		const ownerA = "group7-throw-restore-a";
+		admitOwners(harness, ownerA);
+		const message = continuationMessage("throw restore");
+		expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+		internals._schedulePostCompactionContinue();
+		internals._lastRunPromptIds = ["prior-last"];
+		internals._currentRunOwners = ["prior-current"];
+		const scopes: Array<{ last: string[]; current: string[] }> = [];
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockImplementationOnce(async () => {
+			scopes.push({ last: [...internals._lastRunPromptIds], current: [...internals._currentRunOwners] });
+			throw new Error("provider exploded");
+		});
+		await internals._runDirectContinuation([message], internals._continuationSettlementWindow);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(scopes).toEqual([{ last: [ownerA], current: [ownerA] }]);
+		expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({
+			status: "failed",
+			failure: { reason: "run_error" },
+			finalMessageIds: [],
+		});
+		expect(internals._lastRunPromptIds).toEqual(["prior-last"]);
+		expect(internals._currentRunOwners).toEqual(["prior-current"]);
+		continueSpy.mockRestore();
+
+		const ownerRearm = "group7-rearm-restore";
+		admitOwners(harness, ownerRearm);
+		const rearmMessage = continuationMessage("rearm restore");
+		internals._postCompactionContinuationMessages = [rearmMessage];
+		expect(internals._scheduleContinuationForObligation([ownerRearm], [rearmMessage])).toBe(true);
+		const window = internals._continuationSettlementWindow!;
+		internals._lastRunPromptIds = ["rearm-prior-last"];
+		internals._currentRunOwners = ["rearm-prior-current"];
+		let releaseBusyRun = () => {};
+		const busyGate = new Promise<void>((resolve) => {
+			releaseBusyRun = resolve;
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "existing run" }], timestamp: Date.now() },
+		] as AgentMessage[];
+		harness.setResponses([
+			async () => {
+				await busyGate;
+				return fauxAssistantMessage("existing run completed");
+			},
+		]);
+		const busyRun = harness.session.agent.continue();
+		await vi.waitFor(() => expect(harness.session.agent.state.isStreaming).toBe(true));
+		await internals._runDirectContinuation([rearmMessage], window);
+		expect(internals._lastRunPromptIds).toEqual(["rearm-prior-last"]);
+		expect(internals._currentRunOwners).toEqual(["rearm-prior-current"]);
+		expect(harness.session.getPromptOutcome(ownerRearm)).toBeUndefined();
+		releaseBusyRun();
+		await busyRun;
+		internals._cancelPostCompactionContinue();
+	});
+
+	it("does not double-record a pump-owned tracked continuation", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [compactSummaryExtension()],
+		});
+		group7Harnesses.push(harness);
+		const internals = continuationInternals(harness);
+		const ownerId = "group7-pump-tracked";
+		admitOwners(harness, ownerId);
+		const continuationMsg = continuationMessage("tracked continuation");
+		internals._postCompactionContinuationMessages = [continuationMsg];
+		expect(internals._scheduleContinuationForObligation([ownerId], [continuationMsg])).toBe(true);
+		const session = harness.session as unknown as {
+			_createPreparedTurnAction(
+				schedule: "followUp",
+				text: string,
+				images: undefined,
+				options: { message: AgentMessage; resumeIfIdle: boolean; lineage: { inherit: string[] } },
+			): unknown;
+			_admitSessionInput(action: unknown, options: { wake: boolean }): { accepted: boolean };
+		};
+		expect(
+			session._admitSessionInput(
+				session._createPreparedTurnAction("followUp", getMessageText(continuationMsg), undefined, {
+					message: continuationMsg,
+					resumeIfIdle: true,
+					lineage: { inherit: [ownerId] },
+				}),
+				{ wake: true },
+			),
+		).toMatchObject({ accepted: true });
+		internals._schedulePostCompactionContinue();
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("tracked done")]);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		await vi.advanceTimersByTimeAsync(100);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(continueSpy).not.toHaveBeenCalled();
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(harness.session.getPromptOutcome(ownerId)).toMatchObject({
+			status: "completed",
+			finalMessageIds: [appended[0]!.id],
+		});
+		expect(harness.session.getPromptOutcome(ownerId)!.finalMessageIds).toHaveLength(1);
+		continueSpy.mockRestore();
+	});
+
+	it("excludes background auto-refine and run-outside assistant appends from the settled outcome", async () => {
+		const reviewer = vi.fn(async () => ({
+			shouldRefine: true,
+			rationale: "test",
+			instructions: "capture a lesson",
+		}));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		group7Harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
+			_handleAgentEvent: (event: { type: string; message?: AgentMessage }) => void;
+		};
+		const planSpy = vi.spyOn(internals, "_planRefine").mockResolvedValue({
+			id: "p",
+			proposal: {
+				summary: "group7 auto-refine",
+				rationale: "test",
+				expectedOutcome: "lesson captured",
+				edits: [],
+			},
+		});
+		const applySpy = vi.spyOn(internals, "_applyRefine");
+		const before = new Set(assistantSessionEntryIds(harness));
+		const customBefore = new Set(customSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("main run done")]);
+		const outcome = await harness.session.promptAndSettle("auto-refine exclusion");
+		const mainEntries = appendedAssistantEntries(harness, before);
+		expect(mainEntries).toHaveLength(1);
+		const mainIds = mainEntries.map((entry) => entry.id);
+		expect(outcome).toMatchObject({ status: "completed", finalMessageIds: mainIds });
+		const cached = harness.session.getPromptOutcome(outcome!.promptId);
+		expect(cached).toBe(outcome);
+		const eventsBefore = harness.eventsOfType("prompt_outcome").length;
+
+		await vi.waitFor(() => expect(applySpy).toHaveBeenCalledTimes(1));
+		expect(reviewer).toHaveBeenCalledTimes(1);
+		expect(planSpy).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(customEntriesOfType(harness, REFINEMENT_CUSTOM_TYPE).length).toBe(1));
+		const refinementEntries = customEntriesOfType(harness, REFINEMENT_CUSTOM_TYPE);
+		expect(refinementEntries).toHaveLength(1);
+		expect(refinementEntries[0]!.type).toBe("custom");
+		expect(refinementEntries[0]!.customType).toBe(REFINEMENT_CUSTOM_TYPE);
+		expect(refinementEntries[0]!.id).not.toBe(mainIds[0]);
+		expect(appendedAssistantEntries(harness, before)).toHaveLength(1);
+		expect(harness.eventsOfType("refine_complete")).toHaveLength(1);
+		expect(cached!.finalMessageIds).toEqual(mainIds);
+		expect(cached!.finalMessageIds).not.toContain(refinementEntries[0]!.id);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(eventsBefore);
+
+		const outsideBefore = sessionMessageEntries(harness).length;
+		const outside = {
+			...fauxAssistantMessage("run-outside late assistant"),
+			timestamp: Date.now(),
+		};
+		// Event-path append is the exclusion control: do not pre-append the same
+		// assistant object, or the later message_end would persist a second copy.
+		internals._handleAgentEvent({ type: "message_end", message: outside as AgentMessage });
+		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
+		expect(sessionMessageEntries(harness).length).toBe(outsideBefore + 1);
+		expect(appendedAssistantEntries(harness, before)).toHaveLength(2);
+		const outsideEntry = appendedAssistantEntries(harness, before).find(
+			(entry) => getMessageText(entry.message) === "run-outside late assistant",
+		);
+		expect(outsideEntry).toBeDefined();
+		group6Internals(harness)._promptSettlementTracker.recordFinalMessage(outcome!.promptId, "phantom-late");
+		expect(harness.session.getPromptOutcome(outcome!.promptId)).toBe(cached);
+		expect(cached!.finalMessageIds).toEqual(mainIds);
+		expect(cached!.finalMessageIds).not.toContain(outsideEntry!.id);
+		expect(cached!.finalMessageIds).not.toContain(refinementEntries[0]!.id);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(eventsBefore);
+		expect(customSessionEntryIds(harness).filter((id) => !customBefore.has(id))).toEqual([refinementEntries[0]!.id]);
+	});
+
+	it("attributes a persisted assistant entry before a synchronous onPersist dispose", async () => {
+		const harness = await createHarness({ persistSession: true });
+		group7Harnesses.push(harness);
+		const before = new Set(assistantSessionEntryIds(harness));
+		harness.setResponses([fauxAssistantMessage("persist reentry")]);
+
+		let acceptedId: string | undefined;
+		let observedEntryId: string | undefined;
+		let persistListenerCalls = 0;
+		let unsubscribePersist: (() => void) | undefined;
+		const outcomePromise = harness.session.promptAndSettle("append-reentry persist dispose", {
+			settlementAdmission: (info) => {
+				acceptedId = info.promptId;
+				unsubscribePersist = harness.sessionManager.onPersist((sessionFile) => {
+					const appended = appendedAssistantEntries(harness, before);
+					if (appended.length === 0) return;
+					persistListenerCalls += 1;
+					const entry = appended[0]!;
+					observedEntryId = entry.id;
+					expect(harness.sessionManager.getEntry(entry.id)).toBe(entry);
+					expect(existsSync(sessionFile)).toBe(true);
+					unsubscribePersist?.();
+					unsubscribePersist = undefined;
+					expect(harness.session.getPromptOutcome(acceptedId!)).toBeUndefined();
+					harness.session.dispose();
+				});
+			},
+		});
+
+		const outcome = await outcomePromise;
+		expect(acceptedId).toEqual(expect.any(String));
+		expect(persistListenerCalls).toBe(1);
+		expect(observedEntryId).toEqual(expect.any(String));
+		const appended = appendedAssistantEntries(harness, before);
+		expect(appended).toHaveLength(1);
+		expect(appended[0]!.id).toBe(observedEntryId);
+		expect(appended[0]!.message.role).toBe("assistant");
+		expect(outcome).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			finalMessageIds: [observedEntryId],
+		});
+		expect(outcome!.failure).toBeUndefined();
+		expect(outcome!.finalMessageIds).toEqual([observedEntryId]);
+		expect(harness.session.getPromptOutcome(acceptedId!)).toBe(outcome);
+		expect(terminalSnapshot(harness, acceptedId!)).toMatchObject({
+			promptId: acceptedId,
+			status: "cancelled",
+			released: true,
+			settleReason: "session_disposed",
+			finalMessageIds: [observedEntryId],
+		});
+		expect(terminalSnapshot(harness, acceptedId!)?.failureReason).toBeUndefined();
+		expect(outcomeCount(harness)).toBe(1);
+		expect(harness.eventsOfType("prompt_outcome")).toHaveLength(1);
+		expect(harness.eventsOfType("prompt_outcome")[0]!.outcome).toBe(outcome);
+	});
+
+	it("keeps failed and cancelled partial traces and drops cancelled-dispatch phantoms", async () => {
+		const failedHarness = await createHarness({ settings: { retry: { enabled: false } } });
+		group7Harnesses.push(failedHarness);
+		const failedBefore = new Set(assistantSessionEntryIds(failedHarness));
+		failedHarness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "provider failed" })]);
+		const failed = await failedHarness.session.promptAndSettle("failed partial");
+		const failedIds = appendedAssistantEntries(failedHarness, failedBefore).map((entry) => entry.id);
+		expect(failedIds).toHaveLength(1);
+		expect(failed).toMatchObject({ status: "failed", finalMessageIds: failedIds, failure: { reason: "run_error" } });
+
+		const cancelledHarness = await createHarness();
+		group7Harnesses.push(cancelledHarness);
+		const cancelledBefore = new Set(assistantSessionEntryIds(cancelledHarness));
+		let releaseStart: (() => void) | undefined;
+		const startGate = new Promise<void>((resolve) => {
+			releaseStart = resolve;
+		});
+		cancelledHarness.setResponses([
+			async () => {
+				await startGate;
+				return fauxAssistantMessage("never delivered");
+			},
+		]);
+		const settled = cancelledHarness.session.promptAndSettle("cancelled dispatch");
+		await vi.waitFor(() => expect(cancelledHarness.session.isStreaming).toBe(true));
+		const cancelledId = actionByText(cancelledHarness, "cancelled dispatch").promptIds![0]!;
+		cancelledHarness.session.requestAbort();
+		releaseStart?.();
+		const cancelledOutcome = await settled;
+		expect(cancelledOutcome).toMatchObject({ promptId: cancelledId, status: "cancelled" });
+		const cancelledAppended = appendedAssistantEntries(cancelledHarness, cancelledBefore);
+		expect(cancelledOutcome!.finalMessageIds).toEqual(cancelledAppended.map((entry) => entry.id));
+		expect(cancelledAppended.map((entry) => getMessageText(entry.message))).not.toContain("never delivered");
+	});
+
+	it("does not let a validated compact token exempt an unrelated current owner", async () => {
+		const harness = await createHarness();
+		group7Harnesses.push(harness);
+		const internals = continuationInternals(harness);
+		const parkedOwner = "group7-parked-owner";
+		const overflowOwner = "group7-overflow-owner";
+		const unrelatedOwner = "group7-unrelated-owner";
+		admitOwners(harness, parkedOwner, overflowOwner, unrelatedOwner);
+		const parkedMessage = continuationMessage("parked mixed continuation");
+		expect(internals._scheduleContinuationForObligation([parkedOwner, overflowOwner], [parkedMessage])).toBe(true);
+		internals._continuationSettlementWindow!.overflowRecoveryOwners = [overflowOwner];
+		const parked = internals._parkContinuationSettlementForManualCompact();
+		expect(parked).toBeDefined();
+		expect(internals._continuationSettlementWindow?.state).toBe("parked");
+		expect(internals._continuationSettlementAbortToken).toBe(parked!.token);
+		internals._currentRunOwners = [parkedOwner, overflowOwner, unrelatedOwner];
+		const requestCancelSpy = vi.spyOn(internals._promptSettlementTracker, "requestCancel");
+
+		internals._requestAbort(parked!.token);
+
+		expect(requestCancelSpy).toHaveBeenCalledTimes(1);
+		expect(requestCancelSpy).toHaveBeenCalledWith(unrelatedOwner);
+		expect(requestCancelSpy).not.toHaveBeenCalledWith(parkedOwner);
+		expect(requestCancelSpy).not.toHaveBeenCalledWith(overflowOwner);
+		expect(
+			internals._promptSettlementTracker.snapshot().find((record) => record.promptId === parkedOwner),
+		).toMatchObject({
+			promptId: parkedOwner,
+			cancelRequested: false,
+		});
+		expect(
+			internals._promptSettlementTracker.snapshot().find((record) => record.promptId === overflowOwner),
+		).toMatchObject({
+			promptId: overflowOwner,
+			cancelRequested: false,
+		});
+		expect(
+			internals._promptSettlementTracker.snapshot().find((record) => record.promptId === unrelatedOwner),
+		).toMatchObject({
+			promptId: unrelatedOwner,
+			cancelRequested: true,
+		});
+		expect(internals._continuationSettlementWindow).toBeDefined();
+		expect(internals._continuationSettlementWindow?.state).toBe("parked");
+		expect(harness.session.getPromptOutcome(parkedOwner)).toBeUndefined();
+		expect(harness.session.getPromptOutcome(overflowOwner)).toBeUndefined();
+		requestCancelSpy.mockRestore();
+		internals._cancelPostCompactionContinue();
+	});
+
+	it("scheduler idle invariant: an unrelated ordinary run cannot occupy _currentRunOwners while a continuation is running", async () => {
+		vi.useRealTimers();
+		const bGate = gatedHook({ prompt: "queued B after delayed A" });
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			extensionFactories: [bGate.factory],
+		});
+		group7Harnesses.push(harness);
+		const internals = continuationInternals(harness);
+		const ownerA = "group7-invariant-a";
+		admitOwners(harness, ownerA);
+		const message = continuationMessage("invariant delayed A");
+		internals._postCompactionContinuationMessages = [message];
+		expect(internals._scheduleContinuationForObligation([ownerA], [message])).toBe(true);
+		internals._schedulePostCompactionContinue();
+		harness.session.agent.state.messages = [continuationMessage("continue delayed A")];
+		const retryRecovery = createDeferred();
+		let retryRecoveryStarted = false;
+		const observedScopes: Array<{ streaming: boolean; current: string[]; windowState?: string }> = [];
+		harness.setResponses([
+			retryableError(),
+			async () => {
+				retryRecoveryStarted = true;
+				observedScopes.push({
+					streaming: harness.session.isStreaming,
+					current: [...internals._currentRunOwners],
+					windowState: internals._continuationSettlementWindow?.state,
+				});
+				await retryRecovery.promise;
+				return fauxAssistantMessage("A continuation recovered");
+			},
+			fauxAssistantMessage("B ordinary done"),
+		]);
+		await harness.session.followUp("queued B after delayed A", undefined, { resumeIfIdle: true });
+		const ownerB = actionByText(harness, "queued B after delayed A").promptIds![0]!;
+		await vi.waitFor(() => expect(retryRecoveryStarted).toBe(true));
+		expect(observedScopes.some((scope) => scope.current.includes(ownerA))).toBe(true);
+		expect(observedScopes.every((scope) => !scope.current.includes(ownerB))).toBe(true);
+		expect(internals._currentRunOwners).not.toContain(ownerB);
+		expect(harness.session.getPromptOutcome(ownerA)).toBeUndefined();
+		expect(harness.session.getPromptOutcome(ownerB)).toBeUndefined();
+		retryRecovery.resolve();
+		await vi.waitFor(() => expect(harness.session.getPromptOutcome(ownerA)).toBeDefined());
+		await bGate.reached;
+		bGate.release();
+		await harness.session.waitForPromptOutcome(ownerB);
+		expect(harness.session.getPromptOutcome(ownerA)).toMatchObject({ status: "completed" });
+		expect(harness.session.getPromptOutcome(ownerB)).toMatchObject({ status: "completed" });
 	});
 });

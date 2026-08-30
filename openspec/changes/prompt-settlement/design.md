@@ -658,3 +658,88 @@ Project profile: Prime Agent TypeScript monorepo (Generic-derived)
 
 - 不实现JSONL persist/recovery、finalMessageIds、AgentConnection/daemon/RPC/Print/ACP wire，不改tracker API或action recovery schema。
 - 不改变abort是否终止bash/refine/RLM/goal、update restart manifest格式、clearQueue返回文本、autonomous usage回滚策略、retry/compaction eligibility；范围外发现只报告。
+
+## Issue #32 implementation fixture
+
+Fixture level: expanded（上游建议compact；本切片开始填充公开`PromptOutcome.finalMessageIds`，并在ordinary dispatch、provider retry与timer-owned direct continuation之间切换共享owner scope，命中public contract与shared-state ordering mandatory expanded triggers）
+Repair intensity: high（错误或迟到的owner snapshot会把不可变assistant entry id串到另一prompt、漏记最终trace或在同步terminal前丢失；终态outcome不会重开纠正）
+Project profile: Prime Agent TypeScript monorepo (Generic-derived)
+
+### Change surface and preservation boundary
+
+- Change surface: `packages/coding-agent/src/core/agent-session.ts` 的main-agent `message_end`持久化挂点、ordinary dispatch现有`_currentRunOwners` lifetime，以及`_runDirectContinuation`/matching-retry direct continuation owner scope；`packages/coding-agent/src/core/session-manager.ts` 提供不从package root re-export的module-internal append bridge，在保持public `SessionManager.appendMessage(message): string`签名不变的前提下插入entry-commit/persist-listener-before callback；focused settlement/SessionManager harness tests。tracker API、SessionManager entry shape与wire不改。
+- Must preserve: 每个main Agent `message_end`仍恰写一个原`SessionMessageEntry`且extension/listener/event顺序不变；`prompt`/`promptAndWait`、retry、compaction window/rearm、queued-work pause、abort/dispose、auto-refine、queue batching与terminal fence时序不变。
+- Must add: `appendMessage(assistant)`返回的真实stable entry id在owner terminal前按追加顺序写入当时全部去重`_currentRunOwners`；ordinary dispatch覆盖同一dispatch内全部retry runs；direct continuation仅在其captured operation-owner scope内记录并在任一return/throw/rearm后恢复此前scope。
+- Attribution boundary: 只记录经main agent event queue实际持久化的assistant `SessionMessageEntry`，包括最终成为failed/cancelled trace的已追加部分；user/tool/custom/Bash、run外append、background auto-refine/cron/heartbeat/detached work不记录。未知或已terminal owner由tracker保持no-op，迟到消息不重开outcome。
+- Staged boundary: #33才把settlement record接到session JSONL，#34恢复，#35+接connection/wire/modes。本切片只消费已存在的session message entry id，不新增custom ledger entry、schema/version、public method或event type。
+- Seam under test: in-process `AgentSession` + faux provider/fake timers，实际读取session entries并与`PromptOutcome.finalMessageIds`比较；不以assistant文本、array length或spy生成的伪id代替真实entry id。
+
+### Owner-scope and append contract
+
+- Ordinary pump在选择本batch全部turn actions后安装其`promptIds`去重并集为`_currentRunOwners`；该scope必须跨`agent.prompt`、同步tool、所有provider retry run及`_agentEventQueue` drain持续存在，只在dispatch completion finally清空。retry window继续捕获`_lastRunPromptIds`，不得为message attribution读取retry lease或后续mutable snapshot。
+- `_processAgentEvent(message_end)`沿existing single append逻辑取得真实entry id；assistant append使用module-internal bridge传入owner-record callback。SessionManager先安装entry到内存tree/index；persisted session成功完成原文件write/rename后、调用任一同步`onPersist` listener前运行callback，in-memory/no-write session则在entry安装后立即运行；callback复制当下去重current owners并逐owner调用一次`recordFinalMessage(owner, entryId)`。同一`"all"` shared run的一个entry因此写入每个独立identity，但session仍只append一次；non-assistant及public `appendMessage`不传callback。
+- Internal callback是observer-isolated、package-private seam：它不从`src/index.ts` re-export，也不改变root-exported `SessionManager.appendMessage(message): string`的runtime/type签名；callback throw被吞掉且不得回滚/复制entry或阻止已成功write后的persist notification。production callback只调用contractually no-throw的tracker mutation。若file write/rename本身抛错，callback与persist listener均不运行、原异常继续抛出，维持SessionManager既有“memory entry已安装但append未成功返回”的failure shape；不得在该失败下虚报durable finalMessage id。
+- 正常记录必须发生在entry id创建并安装/成功write之后、同步persist listener可调用`dispose`/abort令owner terminal之前；不得在public `appendMessage`返回后留下reentry空窗、在`agent_end`扫描transcript补记（会重复、丢顺序或纳入被cancelled-dispatch过滤的消息），也不得从message object生成id。
+- Direct continuation以window entry时已固定的`operationOwners`为唯一归属来源（mixed overflow window只用exact subset）。调用`agent.continue()`或等待已matching retry前，以嵌套save/install/restore scope设置`_currentRunOwners=operationOwners`；所有normal、throw、already-processing rearm、park/replacement与late-completion返回都在`finally`恢复先前scope，不能无条件清空一个后来run安装的owners。
+- queued-work pause与existing window identity/revision guards仍是跨run隔离权威：A continuation延迟到B之后时，B dispatch先以B owners记录；A direct runner随后只安装captured A tuple。pump-owned tracked continuation沿ordinary action batch记录，无需第二套挂点或重复record。
+- `recordFinalMessage`继续是append-only且terminal/busy no-op；本切片不在每条message时persist settlement record。terminal outcome复制当时完整有序数组，failed/cancelled携带已实际append的partial trace。
+
+### Risk packs considered
+
+- Public API / CLI / script entry: selected - 已公开`PromptOutcome.finalMessageIds`从固定空数组变为真实entry ids；无签名或CLI变化。
+- Config / project setup: not selected - 无配置/default/toolchain变化。
+- File IO / path safety / overwrite: not selected - 复用同一次既有`appendMessage`，不新增路径、文件、overwrite或额外session write。
+- Schema / columns / units / field names: selected - `finalMessageIds`语义必须是stable `SessionMessageEntry.id`、assistant-only且有序；entry/outcome shape不变。
+- Auth / permissions / secrets: not selected - 无auth、permission或secret边界。
+- Concurrency / shared state / ordering: selected - ordinary/retry/direct continuation共享mutable owner scopes、event queue drain、queued-work pause与nested try/finally restoration是核心。
+- Resource limits / large input / discovery: not selected - 每条assistant仅按当前有界去重owner集合append一个id；不新增polling、discovery或buffer。
+- Legacy compatibility / examples: selected - session entries、event/listener顺序、`agent_end`、prompt timing、queue/all batching、retry/compaction/auto-refine行为不得改变。
+- Error handling / rollback / partial outputs: selected - continuation throw/rearm/replacement、failed/cancelled partial trace、unknown/terminal owner、cancelled-dispatch过滤与append-time persist-listener reentry不得串scope、漏记或重复记录。
+- Release / packaging / dependency compatibility: not selected - 无export、dependency或build shape变化。
+- Documentation / migration notes: not selected - #42统一更新runtime状态文档；本fixture定义阶段契约。
+- TUI focus/render lifecycle: not selected - TUI不消费outcome且无render/focus变化。
+- Session/extension teardown lifecycle: not selected - abort/dispose语义已由#31封口；本切片只回归terminal/late-message no-op，不修改teardown。
+
+### Required evidence
+
+- single ordinary run：session新增exact one assistant `SessionMessageEntry` M；outcome `finalMessageIds === [M.id]`，query/event返回同一outcome对象；user/tool/custom entry ids均不出现，既有event与entry数量不变。
+- run→retry→successful threshold compaction→direct continuation：三条实际assistant entries（retry error、recovered/compacting run、continuation）按session append顺序得到`[M1.id,M2.id,M3.id]`；同一owner的outcome只在continuation terminal后产生且数组exact相等，generation仍按#29契约。
+- `"all"` A/B shared run：session只append一条shared assistant entry M；A与B的outcome都exact包含`[M.id]`，prompt ids/outcomes仍独立且无duplicate id。
+- reorder：A continuation window pending时B ordinary run先实际append MB，随后A direct continuation append MA；B outcome只含MB，A只在其既有A trace后append MA且不含MB。mutable `_lastRunPromptIds`或prior `_currentRunOwners`不得改变captured attribution；matching-retry direct path同样归exact operation owners。
+- background/late exclusion：在A run前后执行真实background auto-refine（以及一个run外assistant append control如现有seam允许）-> A outcome只含main-run entries；A terminal后调用record/追加excluded work不改变cached object、不增加event。
+- failure/cleanup controls：retry error entry可出现在最终completed trace；terminal failed/cancelled outcome只含此前成功append的assistant ids；cancelled-dispatch未持久化消息、continuation throw/rearm与duplicate cleanup不产生phantom/duplicate id，owner scope最终恢复为空或此前合法scope。persisted session的assistant append同步触发`onPersist` listener并在listener内`dispose()` -> listener观察到file write与owner attribution均完成，最终cancelled+released outcome包含该entry id且append/notify/outcome各一次。SessionManager no-hook/public path的return id、tree/file entry count与listener order不变；file-write throw时callback/listener均为0且原error/既有memory-entry shape保留；injected callback throw被隔离，write/notify仍各一次，但fixture不要求该人工故障下的finalMessageIds完整性。
+- focused commands: settlement Group 7 tests + tracker recordFinalMessage tests + compaction/retry/action-race/serialized-refine siblings；root`npm run check`、workspace build与strict OpenSpec均exit 0。
+
+### Invariant Matrix
+
+- Governing invariant: 每个main-agent assistant session entry在其唯一append时，必须以该append发生时的immutable run/continuation owner scope按owner exact-once加入对应active prompt的有序finalMessageIds，永不跨prompt、补扫、重开或重复。
+- Source-of-truth identity/contract: `SessionManager.appendMessage`返回的`SessionMessageEntry.id`与scope-local去重`_currentRunOwners`；direct continuation来源为captured window `operationOwners`。
+- Producers: ordinary action pump安装batch owners；direct/matching-retry continuation安装captured operation owners；SessionManager产生并先安装entry id，persisted path成功write后（in-memory path安装后）执行module-internal callback，再通知persist listeners。
+- Validators/preflight: assistant role gate、cancelled-dispatch early return、file-write success boundary、append callback observer isolation、tracker active/busy/terminal no-op、window identity/revision与queued-work pause guards。
+- Storage/cache/query: existing session message entry + tracker in-memory `record.finalMessageIds` + cached terminal outcome；settlement JSONL persist/recovery deferred。
+- Public routes/entrypoints: prompt family、retry与compaction continuation间接生产；无新entrypoint。
+- Frontend/downstream consumers: `promptAndSettle`/query/event现可读真实ids；TUI/AgentConnection/daemon/RPC尚不新增消费，existing session transcript保持。
+- Failure paths/rollback/stale state: retry error、aborted/error assistant、cancelled-dispatch filter、already-processing rearm、continue throw、matching retry、mixed owner subset、replacement/park、terminal后late message与nested scope restoration。
+- Evidence/audit/readiness: actual session-entry-id assertions、faux-provider/fake-timer production paths、focused compatibility suites、check/build/OpenSpec。
+- Regression rows:
+  - ordinary/retry/shared-all assistant append -> one real entry、exact ordered owner lists、zero non-assistant ids。
+  - A continuation reordered behind B or mixed owner subset -> each entry only in captured exact lineage，无cross-owner contamination。
+  - direct continuation normal/throw/rearm/matching retry -> scope always restored and later B remains authoritative。
+  - persisted assistant append + synchronous persist-listener dispose/reentry -> file write and attribution precede listener terminal seal；one append/notify/outcome，无missing/duplicate id。
+  - SessionManager no-hook、file-write throw、callback throw与listener throw -> public signature/return/tree-file counts/order不变；write throw不调用callback/listener，callback/listener observer failures不复制entry或阻断彼此规定的后续步骤。
+  - failed/cancelled/terminal owner or excluded background append -> partial active trace only；terminal cached outcome/event不变。
+  - unchanged session transcript/event/prompt/retry/compaction consumers -> prior append count、ordering、timing与scheduler behavior稳定。
+
+### Boundary-surface checklist
+
+- Shared helper roots: one module-internal assistant append bridge consumes returned entry id；ordinary pump与两条direct continuation共享`_currentRunOwners` contract，不复制record loop。
+- Public entrypoints: existing PromptOutcome/query/event与`SessionManager.appendMessage(message): string`保持exact runtime/type shape；internal bridge不从package root导出，无new public API/wire。
+- Write surfaces: existing one-time session message append/file write remains authoritative；callback位于successful write与persist listener之间，不新增second append、ledger write或path change。
+- Producer/consumer evidence boundary: tests map actual session entry object ids to outcomes，never infer from text/index or mocked ids。
+- Stale/idempotency boundary: save/install/restore nested scopes、window revision、event queue drain、terminal no-op and cancelled-dispatch early return。
+- Unchanged downstream consumers: AgentMessageOutcome/promptAndWait、queue/abort/dispose、retry/compaction/autonomous/auto-refine、AgentConnection/daemon/RPC/TUI。
+
+### Non-goals for #32
+
+- 不接settlement custom-entry persistence/restart recovery，不改SessionManager schema、action recovery、AgentConnection/daemon/RPC/Print/ACP/TUI或docs状态行。
+- 不改变哪些messages写入session、retry/compaction eligibility、scheduler/queue ordering、terminal推导或tracker API；范围外flaky kernel与其他append路径只报告。

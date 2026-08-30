@@ -255,6 +255,7 @@ import {
 } from "./session-action-store.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
+	appendSessionMessageWithCommitHook,
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
 	type SessionHeader,
@@ -1901,18 +1902,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear the current run's owner snapshot at dispatch completion. Reads both
-	 * owner fields so the shared-run ownership contract is observable and group
-	 * 7 can extend this seam to attribute final message ids per owner.
+	 * Clear the current run's owner snapshot at dispatch completion. Ordinary
+	 * dispatch keeps this scope across `agent.prompt`, sync tools, provider
+	 * retry, and the agent event queue; assistant `message_end` consumes it
+	 * before this finally runs.
 	 */
 	private _clearRunOwnerSnapshot(): void {
-		// Read the snapshot before clearing: group 7 will consume the owners
-		// here to record final message ids at message_end.
-		const consumedOwners = this._currentRunOwners;
-		const consumedRunIds = this._lastRunPromptIds;
-		if (consumedOwners.length > 0 || consumedRunIds.length > 0) {
+		if (this._currentRunOwners.length > 0 || this._lastRunPromptIds.length > 0) {
 			this._lastRunPromptIds = [];
 			this._currentRunOwners = [];
+		}
+	}
+
+	/** Record one persisted assistant entry against the current run's deduped owners. */
+	private _recordAssistantFinalMessage(entryId: string): void {
+		for (const owner of [...new Set(this._currentRunOwners)]) {
+			this._promptSettlementTracker.recordFinalMessage(owner, entryId);
 		}
 	}
 
@@ -3802,8 +3807,16 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				// Regular LLM message - persist as SessionMessageEntry.
+				// Assistant ids must be attributed after a successful write and
+				// before synchronous persist listeners can dispose/abort the owner.
+				if (event.message.role === "assistant") {
+					appendSessionMessageWithCommitHook(this.sessionManager, event.message, (entryId) => {
+						this._recordAssistantFinalMessage(entryId);
+					});
+				} else {
+					this.sessionManager.appendMessage(event.message);
+				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -7403,7 +7416,14 @@ export class AgentSession {
 			this._cancelPostCompactionContinue({ owners: "cancel" });
 		}
 		this._abortRetry(preserveContinuationSettlement);
+		// The operation-local compact token preserves only owners of the exact
+		// parked window/revision. Unrelated current owners still get a cancel fence.
+		const preservedOwners =
+			preserveContinuationSettlement && this._parkedContinuationSettlement
+				? new Set(this._parkedContinuationSettlement.window.owners)
+				: undefined;
 		for (const owner of currentOwners) {
+			if (preservedOwners?.has(owner)) continue;
 			this._promptSettlementTracker.requestCancel(owner);
 		}
 	}
@@ -8711,12 +8731,14 @@ export class AgentSession {
 				windowAtEntry !== undefined && windowAtEntry.overflowRecoveryOwners.length > 0
 					? [...windowAtEntry.overflowRecoveryOwners]
 					: [...(windowAtEntry?.owners ?? [])];
-			// Install the operation owners into `_lastRunPromptIds` so a group-3
-			// retry window created by this continuation's agent_end inherits
-			// exactly those owners, never a sibling prompt's or a zero-owner
-			// snapshot; restore below.
-			const previousOwners = this._lastRunPromptIds;
+			// Install the captured operation owners into both owner snapshots so
+			// a group-3 retry inherits them and assistant `message_end` records
+			// against this continuation, never a sibling prompt or a later run.
+			// Restore the prior scope in `finally` on every return/throw/rearm.
+			const previousLastRunOwners = this._lastRunPromptIds;
+			const previousCurrentRunOwners = this._currentRunOwners;
 			this._lastRunPromptIds = operationOwners;
+			this._currentRunOwners = operationOwners;
 			// Clear any stale terminal stop reason before the run: the continuation
 			// run's own message_end sets the authoritative reason, and a stale
 			// prior signal must never fence this run.
@@ -8786,7 +8808,8 @@ export class AgentSession {
 					return;
 				}
 			} finally {
-				this._lastRunPromptIds = previousOwners;
+				this._lastRunPromptIds = previousLastRunOwners;
+				this._currentRunOwners = previousCurrentRunOwners;
 			}
 			// Close only if this window is still the SAME window at the SAME
 			// revision: a newer successful threshold/requested compaction during
@@ -9173,12 +9196,16 @@ export class AgentSession {
 			) {
 				windowAtEntry.state = "running";
 			}
-			const previousOwners = this._lastRunPromptIds;
+			const previousLastRunOwners = this._lastRunPromptIds;
+			const previousCurrentRunOwners = this._currentRunOwners;
+			this._lastRunPromptIds = operationOwners;
+			this._currentRunOwners = operationOwners;
 			try {
 				await this.waitForRetry();
 				await this._agentEventQueue;
 			} finally {
-				this._lastRunPromptIds = previousOwners;
+				this._lastRunPromptIds = previousLastRunOwners;
+				this._currentRunOwners = previousCurrentRunOwners;
 			}
 			const windowNow = this._continuationSettlementWindow;
 			const sameWindow =
